@@ -57,13 +57,3 @@ Single task:
 ```bash
 pier run -p deep-swe/tasks/<task-id> --agent mini-swe-agent
 ```
-
-## What does not ship
-
-- Internal-only datasets (paths, names, slugs, rollouts, references).
-- Full critique prompts and trajectories.
-- Heavy regeneratable artifacts (raw rollouts, per-trial JSONs).
-
-## License
-
-Per-task content inherits the upstream repository's license; see each `tasks/<task-id>/`.
