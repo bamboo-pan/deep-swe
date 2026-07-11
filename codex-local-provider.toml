@@ -1,0 +1,8 @@
+model_provider = "local_proxy"
+
+[model_providers.local_proxy]
+name = "Local Proxy"
+base_url = "http://host.docker.internal:9887/v1"
+wire_api = "responses"
+requires_openai_auth = true
+supports_websockets = false
