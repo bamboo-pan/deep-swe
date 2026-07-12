@@ -1,9 +1,12 @@
-import json, uuid
+import json, subprocess, uuid
+import ipaddress
 from pathlib import Path
 from app.database import SessionLocal, init_db
 from app.models import Run
 from app import runner
 from app import results
+from app.pier_retry_patch.transient import is_transient_agent_failure
+from app.pier_retry_patch.networking import DEFAULT_NETWORK_POOL, trial_network_subnets
 from app.schemas import RunDraft
 
 def make_run(job_name: str, **extra) -> int:
@@ -73,6 +76,9 @@ def test_codex_run_passes_reasoning_effort(tmp_path: Path):
     text=config.read_text(encoding="utf-8")
     assert 'model_reasoning_effort = "low"' in text and 'model = "gpt-5.6-sol"' in text
     assert "host.docker.internal" in text
+    assert "request_max_retries = 6" in text
+    assert "stream_max_retries = 6" in text
+    assert "stream_idle_timeout_ms = 600000" in text
 
 def test_mini_limits_config_sets_step_limit(tmp_path: Path):
     # cost_limit 对自建网关模型算不出成本，step_limit 是唯一确定性护栏
@@ -80,6 +86,141 @@ def test_mini_limits_config_sets_step_limit(tmp_path: Path):
     text=path.read_text(encoding="utf-8")
     assert f"step_limit: {runner.MINI_STEP_LIMIT}" in text and text.startswith("agent:")
     assert "prompt_cache_key: deepswe-" in text and "prompt_cache_retention: 24h" in text
+
+def test_infrastructure_retry_args_are_bounded_and_typed():
+    assert runner.INFRASTRUCTURE_RETRY_DELAYS_SEC == (2, 5, 15, 45, 135, 405)
+    enabled=runner._pier_retry_args(True, 3)
+    assert enabled[:2] == ["--max-retries", "3"]
+    assert enabled.count("--retry-include") == 1
+    assert "TransientAgentInfrastructureError" in enabled
+    assert runner._pier_retry_args(False, 3) == ["--max-retries", "0"]
+    assert runner._pier_retry_args(True, 0) == ["--max-retries", "0"]
+
+def test_trial_docker_networks_avoid_lan_and_are_stable():
+    first=trial_network_subnets("run-1/task-a__abc")
+    second=trial_network_subnets("run-1/task-a__abc")
+    other=trial_network_subnets("run-1/task-b__xyz")
+    pool=ipaddress.ip_network(DEFAULT_NETWORK_POOL)
+    assert first == second and first != other
+    assert first[0] != first[1]
+    assert all(ipaddress.ip_network(value).subnet_of(pool) for value in first)
+    assert all(ipaddress.ip_address("192.168.0.108") not in ipaddress.ip_network(value)
+               for value in first)
+
+def test_docker_proxy_connectivity_checks_from_container(monkeypatch):
+    calls = []
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, "", "")
+    monkeypatch.setattr(runner.shutil, "which", lambda name: "C:/docker.exe")
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    runner._docker_proxy_connectivity("http://127.0.0.1:9887/v1")
+    command_args=[args for args, _ in calls]
+    assert any(args[1:4] == ["network", "create", "--internal"] for args in command_args)
+    assert any(args[1:3] == ["network", "create"] and "--internal" not in args
+               for args in command_args)
+    create=next(args for args in command_args if len(args)>1 and args[1] == "create")
+    assert "host.docker.internal" in create and "9887" in create
+    assert any(len(args)>2 and args[1:3] == ["start", "-a"] for args in command_args)
+
+def test_docker_proxy_connectivity_reports_target_and_reason(monkeypatch):
+    monkeypatch.setattr(runner.shutil, "which", lambda name: "docker")
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(
+            args, 1 if args[1:3] == ["start", "-a"] else 0,
+            "", "nc: timed out" if args[1:3] == ["start", "-a"] else "",
+        )
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    try:
+        runner._docker_proxy_connectivity("http://192.168.0.108:9887/v1")
+        assert False, "unreachable proxy must fail preflight"
+    except RuntimeError as exc:
+        assert "192.168.0.108:9887" in str(exc)
+        assert "timed out" in str(exc)
+
+def test_sync_nonzero_exit_prefers_agent_network_failure(tmp_path: Path, monkeypatch):
+    job="test-"+uuid.uuid4().hex; run_id=make_run(job)
+    folder=tmp_path/job
+    write_result(folder, {"stats":{"n_running_trials":1,"evals":{}}})
+    agent=folder/"task-a__x"/"agent"; agent.mkdir(parents=True)
+    (agent/"codex.txt").write_text(
+        'Reconnecting... 1/10 (unexpected status 503 Service Unavailable)',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runner.settings,"jobs_dir",tmp_path)
+    runner._sync_result(run_id,1)
+    error=runner.get_run(run_id)["error"] or ""
+    assert "HTTP 503 Service Unavailable" in error
+    assert "Pier 进程退出码" not in error
+
+def test_squid_connect_failure_summary_is_actionable():
+    message = """
+    <body id=ERR_CONNECT_FAIL>
+    <p><b>Connection to 192.168.0.108 failed.</b></p>
+    <p>The system returned: <i>(110) Connection timed out</i></p>
+    """
+    summary=runner._network_failure_summary(message)
+    assert summary == "模型代理连接失败：192.168.0.108（Docker/Squid：Connection timed out）"
+
+def test_transient_agent_failure_classification_is_selective():
+    assert is_transient_agent_failure(
+        "NonZeroAgentExitCodeError", "unexpected status 503 Service Unavailable"
+    )
+    assert is_transient_agent_failure(
+        "NonZeroAgentExitCodeError", "API Error: The operation timed out."
+    )
+    assert is_transient_agent_failure("ConnectionError", "socket closed")
+    assert not is_transient_agent_failure(
+        "NonZeroAgentExitCodeError", 'terminal_reason":"max_turns"'
+    )
+    assert not is_transient_agent_failure(
+        "NonZeroAgentExitCodeError", "tests failed with exit code 1"
+    )
+
+def test_run_draft_exposes_retry_and_agent_limits():
+    draft=RunDraft(agent="claude-code", tasks=["actionlint-action-pinning-lint"],
+                   infrastructure_max_retries=4, claude_max_turns=150,
+                   codex_request_max_retries=7, codex_stream_max_retries=8,
+                   codex_stream_idle_timeout_seconds=900)
+    assert draft.infrastructure_max_retries == 4
+    assert draft.claude_max_turns == 150
+    assert draft.codex_request_max_retries == 7
+    assert draft.codex_stream_max_retries == 8
+    assert draft.codex_stream_idle_timeout_seconds == 900
+
+def test_trial_classifies_transient_repository_failure(tmp_path: Path):
+    folder=tmp_path/"task-a__x"; folder.mkdir()
+    write_result(folder, {"task_name":"task-a","exception_info":{
+        "exception_type":"RuntimeError",
+        "exception_message":"apt-get update failed: 502 Bad Gateway; Failed to fetch repository metadata",
+    }})
+    trial=results._trial(folder)
+    assert trial["failure_type"] == "InfrastructureNetworkError"
+
+def test_trial_classifies_transient_error_from_agent_log_tail(tmp_path: Path):
+    folder=tmp_path/"task-a__x"; (folder/"agent").mkdir(parents=True)
+    write_result(folder, {"task_name":"task-a","exception_info":{
+        "exception_type":"NonZeroAgentExitCodeError",
+        "exception_message":"Command failed (exit 1); stdout truncated",
+    }})
+    (folder/"agent"/"claude-code.txt").write_text(
+        '{"type":"result","result":"API Error: The operation timed out."}',
+        encoding="utf-8",
+    )
+    assert results._trial(folder)["failure_type"] == "InfrastructureNetworkError"
+
+def test_official_regression_contains_baseline_values(monkeypatch):
+    current={"trials":[{"task":"task-a","reward":1,"duration_seconds":80.0}]}
+    monkeypatch.setattr(results, "load_official_stats", lambda:{"task-a":{
+        "pass_rate":.75,"avg_duration_seconds":100.0,"trials":40,
+    }})
+    regression=results.regression_for(None, current)
+    assert regression["current_pass_rate"] == 1
+    assert regression["baseline_pass_rate"] == .75
+    assert regression["pass_rate_delta"] == .25
+    assert regression["current_duration_seconds"] == 80
+    assert regression["baseline_duration_seconds"] == 100
+    assert regression["baseline_trials"] == 40
 
 def test_preflight_rejects_crlf_scripts(tmp_path: Path, monkeypatch):
     # CRLF 的 shebang 在容器内无法执行，verifier 必然失败，agent 费用全部报废（2026-07-12 事故）
@@ -132,10 +273,20 @@ def test_new_pier_job_name_uses_public_run_identity(monkeypatch):
         def __init__(self, *args, **kwargs): pass
         def start(self): pass
     monkeypatch.setattr(runner.threading, "Thread", NoopThread)
-    row = runner.create_run(RunDraft(agent="codex", tasks=["actionlint-action-pinning-lint"]))
+    row = runner.create_run(RunDraft(
+        agent="codex", tasks=["actionlint-action-pinning-lint"],
+        infrastructure_max_retries=3, claude_max_turns=140,
+        codex_request_max_retries=7, codex_stream_max_retries=8,
+        codex_stream_idle_timeout_seconds=900,
+    ))
     try:
         assert row.job_name == f"run-{row.id:06d}-codex"
         assert runner.serialize(row)["run_code"] == f"RUN-{row.id:06d}"
+        assert row.infrastructure_max_retries == 3
+        assert row.claude_max_turns == 140
+        assert row.codex_request_max_retries == 7
+        assert row.codex_stream_max_retries == 8
+        assert row.codex_stream_idle_timeout_seconds == 900
     finally:
         with SessionLocal() as db:
             saved = db.get(Run, row.id)

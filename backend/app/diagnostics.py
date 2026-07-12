@@ -8,6 +8,8 @@ from .docker_cleanup import docker_storage_summary
 from .preferences import credential_path, get_preferences, jobs_path
 from .security import mask_token, read_credential
 
+COMMAND_CHECK_TIMEOUT_SEC = 30
+
 def _container_agent_versions() -> list[dict]:
     latest: dict[str, str] = {}
     try:
@@ -32,9 +34,11 @@ def command_check(name: str, args: list[str]) -> dict:
     if not executable:
         return {"name": name, "status": "error", "message": "未找到命令"}
     try:
-        result = subprocess.run([executable, *args], capture_output=True, text=True, timeout=8)
+        result = subprocess.run([executable, *args], capture_output=True, text=True, timeout=COMMAND_CHECK_TIMEOUT_SEC)
         text = (result.stdout or result.stderr).strip().splitlines()
         return {"name": name, "status": "ok" if result.returncode == 0 else "error", "message": text[0] if text else "可用"}
+    except subprocess.TimeoutExpired:
+        return {"name": name, "status": "warning", "message": f"版本检查超过 {COMMAND_CHECK_TIMEOUT_SEC} 秒；命令可能仍可用"}
     except Exception as exc:
         return {"name": name, "status": "error", "message": str(exc)}
 

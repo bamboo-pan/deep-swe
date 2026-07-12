@@ -119,12 +119,17 @@ h1 {
   width: 18px;
 }
 .notice {
+  position: fixed;
+  z-index: 1000;
+  top: 20px;
+  right: 24px;
+  max-width: min(560px, calc(100vw - 48px));
   background: #18372d;
   border: 1px solid #2a6a52;
   color: #7ff0c1;
   padding: 11px 16px;
   border-radius: 7px;
-  margin-bottom: 16px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
   font-size: 13px;
   cursor: pointer;
 }
@@ -232,6 +237,42 @@ h2 {
 }
 .compact .metric {
   padding: 12px;
+}
+.runmeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 24px;
+  margin: -2px 0 16px;
+  padding: 11px 15px;
+  border: 1px solid #173b30;
+  border-radius: 7px;
+  background: #0b1d18;
+  color: #c2d4cd;
+  font: 12px "IBM Plex Mono";
+}
+.runmeta span {
+  display: flex;
+  gap: 8px;
+}
+.runmeta b {
+  color: #718f84;
+  font-weight: 500;
+}
+.runerror {
+  display: grid;
+  gap: 6px;
+  margin: 14px 0 16px;
+  padding: 13px 15px;
+  border: 1px solid #7c2b30;
+  border-radius: 7px;
+  background: #331516;
+  color: #f19a9f;
+  font: 12px/1.55 "IBM Plex Mono";
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.runerror b {
+  color: #ffc0c4;
 }
 .checks {
   display: grid;
@@ -566,6 +607,8 @@ select {
   display: flex;
   gap: 18px;
   font-size: 12px;
+  align-items: baseline;
+  flex-wrap: wrap;
 }
 .regression.warning {
   background: #322815;

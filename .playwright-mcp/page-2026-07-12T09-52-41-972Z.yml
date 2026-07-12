@@ -1,0 +1,150 @@
+- generic [ref=e4]:
+  - complementary [ref=e5]:
+    - generic [ref=e10]:
+      - text: DeepSWE
+      - generic [ref=e11]: REGRESSION LAB
+    - navigation [ref=e12]:
+      - button "dashboard" [ref=e13] [cursor=pointer]
+      - button "new run" [active] [ref=e17] [cursor=pointer]
+      - button "live" [ref=e20] [cursor=pointer]
+      - button "results" [ref=e25] [cursor=pointer]
+      - button "compare" [ref=e29] [cursor=pointer]
+      - button "tasks" [ref=e32] [cursor=pointer]
+      - button "settings" [ref=e38] [cursor=pointer]
+      - button "diagnostics" [ref=e42] [cursor=pointer]
+    - generic [ref=e46]: 仅本机访问127.0.0.1:8765
+  - main [ref=e50]:
+    - generic [ref=e51]:
+      - generic [ref=e52]:
+        - paragraph [ref=e53]: DEEPSWE / NEW RUN
+        - heading "创建真实运行" [level=1] [ref=e146]
+      - button [ref=e55] [cursor=pointer]
+    - generic [ref=e147]:
+      - generic [ref=e148]:
+        - heading "Agent 运行方式" [level=2] [ref=e149]
+        - paragraph [ref=e150]: “并发数”是每个 Agent 的 worker 数；三 Agent 同跑会创建三条可独立查看和取消的运行。
+      - generic [ref=e151]:
+        - radio "单 Agent" [checked] [ref=e152]
+        - text: 单 Agent
+      - generic [ref=e153]:
+        - radio "三 Agent 同时跑" [ref=e154]
+        - text: 三 Agent 同时跑
+      - generic [ref=e155]: 2 workers
+    - generic [ref=e156]:
+      - generic [ref=e157]:
+        - generic [ref=e158]:
+          - heading "运行配置" [level=2] [ref=e159]
+          - paragraph [ref=e160]: 所有选择都会记录在本次运行中，便于严格复现。
+        - generic [ref=e161]: 0 TRIALS
+      - generic [ref=e162]:
+        - generic [ref=e163]:
+          - text: Agent
+          - combobox "Agent" [ref=e164]:
+            - option "mini-swe-agent" [selected]
+            - option "codex"
+            - option "claude-code"
+        - generic [ref=e165]:
+          - text: 模型
+          - combobox "模型" [ref=e166]:
+            - option "gpt-5.6-sol" [selected]
+        - generic [ref=e167]:
+          - text: Reasoning effort
+          - combobox "Reasoning effort" [ref=e168]:
+            - option "none"
+            - option "low"
+            - option "medium"
+            - option "high"
+            - option "xhigh" [selected]
+            - option "max"
+        - generic [ref=e169]:
+          - text: Service tier
+          - combobox "Service tier" [ref=e170]:
+            - option "standard" [selected]
+            - option "batch"
+            - option "priority"
+        - generic [ref=e171]:
+          - text: 每题次数
+          - spinbutton "每题次数" [ref=e172]: "1"
+        - generic [ref=e173]:
+          - text: 并发数
+          - combobox "并发数 安全" [ref=e174]:
+            - option "1"
+            - option "2" [selected]
+            - option "3"
+            - option "4"
+          - generic [ref=e175]: 安全
+        - generic [ref=e176]:
+          - text: Agent 超时（秒）
+          - spinbutton "Agent 超时（秒）" [ref=e177]: "5400"
+        - generic [ref=e178]:
+          - text: Verifier 超时（秒）
+          - spinbutton "Verifier 超时（秒）" [ref=e179]: "1800"
+        - generic [ref=e180]:
+          - text: 基础设施重试次数
+          - spinbutton "基础设施重试次数" [ref=e181]: "2"
+      - generic [ref=e182]:
+        - generic [ref=e183]:
+          - checkbox "基础设施错误自动重试（仅限已识别的 429/5xx/连接中断/API 超时）" [checked] [ref=e184]
+          - text: 基础设施错误自动重试（仅限已识别的 429/5xx/连接中断/API 超时）
+        - generic [ref=e185]:
+          - checkbox "启用 Verifier" [checked] [ref=e186]
+          - text: 启用 Verifier
+      - generic [ref=e187]:
+        - generic [ref=e188]:
+          - heading "regression-standard-7" [level=3] [ref=e189]
+          - generic [ref=e190]: 0 selected
+        - button "清空" [disabled] [ref=e191] [cursor=pointer]
+      - generic [ref=e192]:
+        - text: 未选择任务。
+        - button "前往任务目录选择" [ref=e193] [cursor=pointer]
+      - generic [ref=e194]:
+        - generic [ref=e195] [cursor=pointer]:
+          - checkbox "TASK-020 Add HTML document format handling to Dasel 目录：dasel-html-document-format · 数据集 ID：kh7c7rrg3zke74w7068nawak9x82t6am · 官方 43% · 15m 58s READY" [ref=e196]
+          - generic [ref=e197]:
+            - generic [ref=e198]: TASK-020
+            - generic [ref=e199]: Add HTML document format handling to Dasel
+            - generic [ref=e200]: 目录：dasel-html-document-format · 数据集 ID：kh7c7rrg3zke74w7068nawak9x82t6am · 官方 43% · 15m 58s
+          - generic [ref=e201]: READY
+        - generic [ref=e202] [cursor=pointer]:
+          - checkbox "TASK-045 Persist the fitted feature schema across evaluate, predict, serve, and export 目录：igel-persist-feature-schema · 数据集 ID：kh7brwh7cv23ggeshkz85ac5fx831x5k · 官方 49% · 14m 26s READY" [ref=e203]
+          - generic [ref=e204]:
+            - generic [ref=e205]: TASK-045
+            - generic [ref=e206]: Persist the fitted feature schema across evaluate, predict, serve, and export
+            - generic [ref=e207]: 目录：igel-persist-feature-schema · 数据集 ID：kh7brwh7cv23ggeshkz85ac5fx831x5k · 官方 49% · 14m 26s
+          - generic [ref=e208]: READY
+        - generic [ref=e209] [cursor=pointer]:
+          - checkbox "TASK-019 Add shorthand expansion and compression to the lexer 目录：csstree-shorthand-expansion-compression · 数据集 ID：kh72qraccnjwdet6ynagsccr4x82y65c · 官方 29% · 15m 33s READY" [ref=e210]
+          - generic [ref=e211]:
+            - generic [ref=e212]: TASK-019
+            - generic [ref=e213]: Add shorthand expansion and compression to the lexer
+            - generic [ref=e214]: 目录：csstree-shorthand-expansion-compression · 数据集 ID：kh72qraccnjwdet6ynagsccr4x82y65c · 官方 29% · 15m 33s
+          - generic [ref=e215]: READY
+        - generic [ref=e216] [cursor=pointer]:
+          - checkbox "TASK-039 Implement a deterministic IntersectionObserver in Happy DOM 目录：happy-dom-deterministic-intersectionobserver · 数据集 ID：kh75ggdejhnymjbhkbtkxvhz758352br · 官方 30% · 18m 27s READY" [ref=e217]
+          - generic [ref=e218]:
+            - generic [ref=e219]: TASK-039
+            - generic [ref=e220]: Implement a deterministic IntersectionObserver in Happy DOM
+            - generic [ref=e221]: 目录：happy-dom-deterministic-intersectionobserver · 数据集 ID：kh75ggdejhnymjbhkbtkxvhz758352br · 官方 30% · 18m 27s
+          - generic [ref=e222]: READY
+        - generic [ref=e223] [cursor=pointer]:
+          - checkbox "TASK-093 Add error stack serialization to SuperJSON 目录：superjson-error-stack-serialization · 数据集 ID：kh701jywhzgddknqwzsq6npjv98226tq · 官方 34% · 28m 19s READY" [ref=e224]
+          - generic [ref=e225]:
+            - generic [ref=e226]: TASK-093
+            - generic [ref=e227]: Add error stack serialization to SuperJSON
+            - generic [ref=e228]: 目录：superjson-error-stack-serialization · 数据集 ID：kh701jywhzgddknqwzsq6npjv98226tq · 官方 34% · 28m 19s
+          - generic [ref=e229]: READY
+        - generic [ref=e230] [cursor=pointer]:
+          - checkbox "TASK-021 Add RFC 5545 timezone interoperability to dateutil recurrence parsing 目录：dateutil-rfc5545-timezone-interop · 数据集 ID：kh7czqrrmrm1vnwfx1nhtjh9as833esn · 官方 36% · 15m 43s READY" [ref=e231]
+          - generic [ref=e232]:
+            - generic [ref=e233]: TASK-021
+            - generic [ref=e234]: Add RFC 5545 timezone interoperability to dateutil recurrence parsing
+            - generic [ref=e235]: 目录：dateutil-rfc5545-timezone-interop · 数据集 ID：kh7czqrrmrm1vnwfx1nhtjh9as833esn · 官方 36% · 15m 43s
+          - generic [ref=e236]: READY
+        - generic [ref=e237] [cursor=pointer]:
+          - checkbox "TASK-003 Add action pinning linting for actions and reusable workflows 目录：actionlint-action-pinning-lint · 数据集 ID：kh79dnvkvq8j9bs22ededmsc79823akj · 官方 80% · 16m 26s READY" [ref=e238]
+          - generic [ref=e239]:
+            - generic [ref=e240]: TASK-003
+            - generic [ref=e241]: Add action pinning linting for actions and reusable workflows
+            - generic [ref=e242]: 目录：actionlint-action-pinning-lint · 数据集 ID：kh79dnvkvq8j9bs22ededmsc79823akj · 官方 80% · 16m 26s
+          - generic [ref=e243]: READY
+      - button "创建真实运行" [disabled] [ref=e244]

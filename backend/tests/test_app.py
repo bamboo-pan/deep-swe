@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 from fastapi.testclient import TestClient
 from sqlalchemy import select
@@ -6,6 +7,17 @@ from app.main import app
 from app.database import SessionLocal
 from app.models import Run, Setting
 from app.security import is_safe_job_name, read_credential, redact
+
+def test_command_check_timeout_is_non_blocking_warning(monkeypatch):
+    from app import diagnostics
+    monkeypatch.setattr(diagnostics.shutil, "which", lambda name: f"C:/bin/{name}.exe")
+    def timeout(*args, **kwargs):
+        assert kwargs["timeout"] == diagnostics.COMMAND_CHECK_TIMEOUT_SEC == 30
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+    monkeypatch.setattr(diagnostics.subprocess, "run", timeout)
+    result = diagnostics.command_check("pier", ["--version"])
+    assert result["status"] == "warning"
+    assert "30 秒" in result["message"]
 
 def test_health():
     with TestClient(app) as client:
@@ -56,6 +68,16 @@ def test_run_detail_404_and_cancel_inactive():
     with TestClient(app) as client:
         assert client.get("/api/runs/999999").status_code==404
         assert client.post("/api/runs/999999/cancel").json()=={"cancelled":False}
+
+def test_compare_accepts_independent_run_task_items():
+    with TestClient(app) as client:
+        response=client.get("/api/compare", params=[("items", "1:task-a"), ("items", "1:task-b")])
+        assert response.status_code == 200
+        assert response.json()["selections"] == ["1:task-a", "1:task-b"]
+
+def test_compare_rejects_invalid_item_key():
+    with TestClient(app) as client:
+        assert client.get("/api/compare", params={"items":"not-a-pair"}).status_code == 422
 
 def test_delete_terminal_run_and_reject_active_run():
     with TestClient(app) as client:

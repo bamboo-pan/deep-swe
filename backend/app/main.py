@@ -211,9 +211,15 @@ async def run_events(run_id:int):
     return StreamingResponse(stream(),media_type="text/event-stream",headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
 @app.get("/api/compare")
-def compare(ids:list[int]=Query(default=[])):
-    if len(ids)>8: raise HTTPException(422,"最多比较 8 次运行")
-    return compare_runs(ids)
+def compare(ids:list[int]=Query(default=[]), items:list[str]=Query(default=[])):
+    if len(items)>8 or (not items and len(ids)>8): raise HTTPException(422,"最多比较 8 个结果")
+    selections=[]
+    for item in items:
+        run_id, separator, task = item.partition(":")
+        if not separator or not run_id.isdigit() or not task:
+            raise HTTPException(422,"无效的比较结果标识")
+        selections.append((int(run_id), task))
+    return compare_runs(ids, selections or None)
 
 @app.get("/api/baselines")
 def baselines():

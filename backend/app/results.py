@@ -9,11 +9,11 @@ from .config import settings
 from .models import Baseline, Run
 from .official_stats import load_official_stats
 from .preferences import current_secrets, jobs_path
+from .pier_retry_patch.transient import is_transient_agent_failure
 from .security import redact
 
 TIER_MULTIPLIER = {"standard": 1.0, "batch": 0.5, "priority": 2.0}
 CONTROL_TASK = "actionlint-action-pinning-lint"
-
 def run_code(run_id: int) -> str:
     return f"RUN-{run_id:06d}"
 
@@ -121,6 +121,23 @@ def _trial(folder: Path, include_patch: bool = True, expected_tasks: list[str] |
     exception = data.get("exception_info") or {}
     agent_execution = data.get("agent_execution") or {}
     failure_message = exception.get("exception_message")
+    failure_type = exception.get("exception_type")
+    agent_log_tail = ""
+    if failure_type:
+        chunks = []
+        for path in (folder / "agent").glob("*.txt"):
+            try:
+                with path.open("rb") as handle:
+                    handle.seek(0, 2)
+                    handle.seek(max(handle.tell() - 200_000, 0))
+                    chunks.append(handle.read().decode("utf-8", errors="replace"))
+            except OSError:
+                continue
+        agent_log_tail = "\n".join(chunks)
+    if is_transient_agent_failure(
+        failure_type, f"{failure_message or ''}\n{agent_log_tail}"
+    ):
+        failure_type = "InfrastructureNetworkError"
     return {
         "id": folder.name,
         **task_identity(task_name),
@@ -143,7 +160,7 @@ def _trial(folder: Path, include_patch: bool = True, expected_tasks: list[str] |
         "reported_cost_usd": agent.get("cost_usd"),
         "steps": data.get("n_agent_steps") or agent.get("n_agent_steps"),
         "agent_version": info.get("version"),
-        "failure_type": exception.get("exception_type"),
+        "failure_type": failure_type,
         "failure_message": (redact(str(failure_message), current_secrets())[:4000] if failure_message else None),
         "patch": patch[-100000:],
         "patch_bytes": patch_path.stat().st_size if patch_path.exists() else 0,
@@ -231,7 +248,13 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
         "pier_version": run.pier_version,
         "tasks": expected_tasks, "attempts_per_task": run.attempts_per_task, "concurrency": run.concurrency,
         "agent_timeout_seconds": run.agent_timeout_seconds, "verifier_timeout_seconds": run.verifier_timeout_seconds,
-        "verification": run.verification, "retry_infrastructure_errors": run.retry_infrastructure_errors, "service_tier": run.service_tier,
+        "verification": run.verification, "retry_infrastructure_errors": run.retry_infrastructure_errors,
+        "infrastructure_max_retries": run.infrastructure_max_retries,
+        "claude_max_turns": run.claude_max_turns,
+        "codex_request_max_retries": run.codex_request_max_retries,
+        "codex_stream_max_retries": run.codex_stream_max_retries,
+        "codex_stream_idle_timeout_seconds": run.codex_stream_idle_timeout_seconds,
+        "service_tier": run.service_tier,
         "created_at": run.created_at, "finished_at": run.finished_at, "passed": run.passed, "reward": run.reward,
         "input_tokens": input_tokens, "cached_tokens": cached_tokens, "uncached_input_tokens": max((input_tokens or 0) - (cached_tokens or 0), 0),
         "cache_write_tokens": None,  # Pier 未返回该字段，按约定存 null
@@ -247,21 +270,27 @@ def list_details() -> list[dict]:
         rows = db.scalars(select(Run).order_by(Run.id.desc())).all()
         return [run_detail(row, include_patches=False) for row in rows]
 
-def compare_runs(run_ids: list[int]) -> dict:
+def compare_runs(run_ids: list[int], selections: list[tuple[int, str]] | None = None) -> dict:
+    selected_pairs = set(selections or [])
+    if selected_pairs:
+        run_ids = list(dict.fromkeys(run_id for run_id, _ in selections or []))
     with SessionLocal() as db:
         rows = [db.get(Run, run_id) for run_id in run_ids]
     details = [run_detail(row, include_patches=False) for row in rows if row]
-    task_names = sorted(set.intersection(*[set(detail["tasks"]) for detail in details])) if details else []
+    task_names = (sorted({task for _, task in selected_pairs}) if selected_pairs
+                  else sorted(set.intersection(*[set(detail["tasks"]) for detail in details])) if details else [])
     official = load_official_stats()
     matrix = []
     for task in task_names:
         item = {**task_identity(task), "runs": {}, "official": official.get(task) or None}
         for detail in details:
+            if selected_pairs and (detail["id"], task) not in selected_pairs:
+                continue
             values = [t for t in detail["trials"] if t["task"] == task and t.get("reward") is not None]
             durations = [t["duration_seconds"] for t in values if t.get("duration_seconds") is not None]
             item["runs"][str(detail["id"])] = {"pass_rate": mean(t["reward"] == 1 for t in values) if values else None, "reward": mean(t["reward"] for t in values) if values else None, "duration_seconds": mean(durations) if durations else None, "input_tokens": sum(t.get("input_tokens") or 0 for t in values) or None, "cached_tokens": sum(t.get("cached_tokens") or 0 for t in values) or None, "output_tokens": sum(t.get("output_tokens") or 0 for t in values) or None, "cost_usd": sum(t.get("reported_cost_usd") or 0 for t in values) or None, "steps": sum(t.get("steps") or 0 for t in values) or None}
         matrix.append(item)
-    return {"runs": details, "tasks": matrix}
+    return {"runs": details, "tasks": matrix, "selections": [f"{run_id}:{task}" for run_id, task in selections or []]}
 
 def _pass_rate(detail: dict) -> float:
     total = detail["progress"]["total"]
@@ -311,7 +340,21 @@ def regression_for(run: Run, current: dict | None = None) -> dict | None:
     official_rate = mean(s["pass_rate"] for _, s in comparable)
     delta = local_rate - official_rate
     reasons = [] if delta >= 0 else [f"通过率低于 DeepSWE 官方基线 {-delta * 100:.1f} 个百分点"]
-    return {"baseline_run_id": None, "baseline_name": "DeepSWE 官方基线", "baseline_type": "official", "level": "warning" if reasons else "ok", "reasons": reasons, "pass_rate_delta": delta}
+    current_durations = [trial["duration_seconds"] for trial, _ in comparable if trial.get("duration_seconds") is not None]
+    official_durations = [stats.get("avg_duration_seconds") for _, stats in comparable if stats.get("avg_duration_seconds") is not None]
+    return {
+        "baseline_run_id": None,
+        "baseline_name": "DeepSWE 官方基线",
+        "baseline_type": "official",
+        "level": "warning" if reasons else "ok",
+        "reasons": reasons,
+        "pass_rate_delta": delta,
+        "current_pass_rate": local_rate,
+        "baseline_pass_rate": official_rate,
+        "current_duration_seconds": mean(current_durations) if current_durations else None,
+        "baseline_duration_seconds": mean(official_durations) if official_durations else None,
+        "baseline_trials": sum(stats.get("trials") or 0 for _, stats in comparable),
+    }
 
 def task_catalog(tasks_dir: Path) -> list[dict]:
     history = list_details()

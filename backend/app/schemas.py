@@ -15,6 +15,11 @@ class RunDraft(BaseModel):
     agent_timeout_seconds: int = Field(5400, ge=60, le=21600)
     verifier_timeout_seconds: int = Field(1800, ge=60, le=7200)
     retry_infrastructure_errors: bool = True
+    infrastructure_max_retries: int = Field(2, ge=0, le=6)
+    claude_max_turns: int = Field(120, ge=20, le=200)
+    codex_request_max_retries: int = Field(6, ge=0, le=10)
+    codex_stream_max_retries: int = Field(6, ge=0, le=10)
+    codex_stream_idle_timeout_seconds: int = Field(600, ge=30, le=1800)
     verification: bool = True
     service_tier: Literal["standard", "batch", "priority"] = "standard"
 

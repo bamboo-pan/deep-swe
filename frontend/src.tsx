@@ -97,6 +97,11 @@ type Run = {
   tasks: string[];
   attempts_per_task: number;
   concurrency: number;
+  infrastructure_max_retries?: number;
+  claude_max_turns?: number;
+  codex_request_max_retries?: number;
+  codex_stream_max_retries?: number;
+  codex_stream_idle_timeout_seconds?: number;
   progress?: {
     completed: number;
     total: number;
@@ -111,6 +116,11 @@ type Run = {
     reasons: string[];
     baseline_name: string;
     pass_rate_delta: number;
+    current_pass_rate?: number | null;
+    baseline_pass_rate?: number | null;
+    current_duration_seconds?: number | null;
+    baseline_duration_seconds?: number | null;
+    baseline_trials?: number | null;
     baseline_type?: "official" | "custom";
   } | null;
   input_tokens?: number;
@@ -189,6 +199,8 @@ const money = (value: number | null | undefined) =>
   value == null ? "—" : `$${value.toFixed(4)}`;
 const number = (value: number | null | undefined) =>
   value == null ? "—" : value.toLocaleString();
+const percent = (value: number | null | undefined) =>
+  value == null ? "—" : `${(value * 100).toFixed(2)}%`;
 const duration = (seconds: number | null | undefined) =>
   seconds == null
     ? "—"
@@ -230,11 +242,12 @@ function App() {
   const [trialLog, setTrialLog] = useState("");
   const [activeTrial, setActiveTrial] = useState<Trial | null>(null);
   const [selectedResults, setSelectedResults] = useState<number[]>([]);
-  const [compareIds, setCompareIds] = useState<number[]>([]);
+  const [compareIds, setCompareIds] = useState<string[]>([]);
   const [comparison, setComparison] = useState<any>();
   const [tasks, setTasks] = useState<TaskInfo[]>([]);
   const [prefs, setPrefs] = useState<Prefs>();
   const [notice, setNotice] = useState("");
+  const [starting, setStarting] = useState(false);
   const [agent, setAgent] = useState("mini-swe-agent");
   const [allAgents, setAllAgents] = useState(false);
   const [model, setModel] = useState("gpt-5.6-sol");
@@ -245,6 +258,11 @@ function App() {
   const [selectedTasks, setSelectedTasks] = useState<string[]>([]);
   const [agentTimeout, setAgentTimeout] = useState("5400");
   const [verifierTimeout, setVerifierTimeout] = useState("1800");
+  const [infrastructureMaxRetries, setInfrastructureMaxRetries] = useState("2");
+  const [claudeMaxTurns, setClaudeMaxTurns] = useState("120");
+  const [codexRequestMaxRetries, setCodexRequestMaxRetries] = useState("6");
+  const [codexStreamMaxRetries, setCodexStreamMaxRetries] = useState("6");
+  const [codexStreamIdleTimeout, setCodexStreamIdleTimeout] = useState("600");
   const [retry, setRetry] = useState(true);
   const [verification, setVerification] = useState(true);
   const [tier, setTier] = useState("standard");
@@ -330,16 +348,22 @@ function App() {
   useEffect(() => {
     if (compareIds.length)
       request(
-        `/api/compare?${compareIds.map((id) => `ids=${id}`).join("&")}`,
+        `/api/compare?${compareIds.map((id) => `items=${encodeURIComponent(id)}`).join("&")}`,
       ).then(setComparison);
     else setComparison(undefined);
   }, [compareIds]);
   const latest = runs[0];
   const attemptsNum = parseInt(attempts, 10);
   const start = async () => {
+    if (starting) return;
     if (!selectedTasks.length) return setNotice("至少选择一个任务");
     const agentTimeoutNum = parseInt(agentTimeout, 10);
     const verifierTimeoutNum = parseInt(verifierTimeout, 10);
+    const infrastructureMaxRetriesNum = parseInt(infrastructureMaxRetries, 10);
+    const claudeMaxTurnsNum = parseInt(claudeMaxTurns, 10);
+    const codexRequestMaxRetriesNum = parseInt(codexRequestMaxRetries, 10);
+    const codexStreamMaxRetriesNum = parseInt(codexStreamMaxRetries, 10);
+    const codexStreamIdleTimeoutNum = parseInt(codexStreamIdleTimeout, 10);
     if (!Number.isFinite(attemptsNum) || attemptsNum < 1 || attemptsNum > 10)
       return setNotice("每题次数需为 1-10 的整数");
     if (
@@ -354,6 +378,16 @@ function App() {
       verifierTimeoutNum > 7200
     )
       return setNotice("Verifier 超时需为 60-7200 秒");
+    if (!Number.isFinite(infrastructureMaxRetriesNum) || infrastructureMaxRetriesNum < 0 || infrastructureMaxRetriesNum > 6)
+      return setNotice("基础设施重试次数需为 0-6 的整数");
+    if (!Number.isFinite(claudeMaxTurnsNum) || claudeMaxTurnsNum < 20 || claudeMaxTurnsNum > 200)
+      return setNotice("Claude 最大轮数需为 20-200 的整数");
+    if (!Number.isFinite(codexRequestMaxRetriesNum) || codexRequestMaxRetriesNum < 0 || codexRequestMaxRetriesNum > 10)
+      return setNotice("Codex HTTP 重试次数需为 0-10 的整数");
+    if (!Number.isFinite(codexStreamMaxRetriesNum) || codexStreamMaxRetriesNum < 0 || codexStreamMaxRetriesNum > 10)
+      return setNotice("Codex 流重试次数需为 0-10 的整数");
+    if (!Number.isFinite(codexStreamIdleTimeoutNum) || codexStreamIdleTimeoutNum < 30 || codexStreamIdleTimeoutNum > 1800)
+      return setNotice("Codex 流空闲超时需为 30-1800 秒");
     if (
       concurrency >= 4 &&
       !confirm(
@@ -361,6 +395,8 @@ function App() {
       )
     )
       return;
+    setStarting(true);
+    setNotice("正在创建运行…");
     const agents = allAgents ? boot!.agents : [agent];
     const results = await Promise.allSettled(
       agents.map((current) =>
@@ -378,12 +414,18 @@ function App() {
             agent_timeout_seconds: agentTimeoutNum,
             verifier_timeout_seconds: verifierTimeoutNum,
             retry_infrastructure_errors: retry,
+            infrastructure_max_retries: infrastructureMaxRetriesNum,
+            claude_max_turns: claudeMaxTurnsNum,
+            codex_request_max_retries: codexRequestMaxRetriesNum,
+            codex_stream_max_retries: codexStreamMaxRetriesNum,
+            codex_stream_idle_timeout_seconds: codexStreamIdleTimeoutNum,
             verification,
             service_tier: tier,
           }),
         }),
       ),
     );
+    setStarting(false);
     const created = results
       .filter(
         (r): r is PromiseFulfilledResult<Run> => r.status === "fulfilled",
@@ -766,6 +808,62 @@ function App() {
                   onChange={(e) => setVerifierTimeout(e.target.value)}
                 />
               </label>
+              <label>
+                基础设施重试次数
+                <input
+                  type="number"
+                  min="0"
+                  max="6"
+                  value={infrastructureMaxRetries}
+                  onChange={(e) => setInfrastructureMaxRetries(e.target.value)}
+                />
+              </label>
+              {(agent === "claude-code" || allAgents) && (
+                <label>
+                  Claude 最大轮数
+                  <input
+                    type="number"
+                    min="20"
+                    max="200"
+                    value={claudeMaxTurns}
+                    onChange={(e) => setClaudeMaxTurns(e.target.value)}
+                  />
+                </label>
+              )}
+              {(agent === "codex" || allAgents) && (
+                <>
+                  <label>
+                    Codex HTTP 重试次数
+                    <input
+                      type="number"
+                      min="0"
+                      max="10"
+                      value={codexRequestMaxRetries}
+                      onChange={(e) => setCodexRequestMaxRetries(e.target.value)}
+                    />
+                  </label>
+                  <label>
+                    Codex 流重试次数
+                    <input
+                      type="number"
+                      min="0"
+                      max="10"
+                      value={codexStreamMaxRetries}
+                      onChange={(e) => setCodexStreamMaxRetries(e.target.value)}
+                    />
+                  </label>
+                  <label>
+                    Codex 流空闲超时（秒）
+                    <input
+                      type="number"
+                      min="30"
+                      max="1800"
+                      value={codexStreamIdleTimeout}
+                      onChange={(e) => setCodexStreamIdleTimeout(e.target.value)}
+                    />
+                  </label>
+                </>
+              )}
             </div>
             <div className="toggles">
               <label>
@@ -774,7 +872,7 @@ function App() {
                   checked={retry}
                   onChange={(e) => setRetry(e.target.checked)}
                 />
-                基础设施错误自动重试一次
+                基础设施错误自动重试（仅限已识别的 429/5xx/连接中断/API 超时）
               </label>
               <label>
                 <input
@@ -847,10 +945,10 @@ function App() {
             </div>
             <button
               className="primary"
-              disabled={!selectedTasks.length}
+              disabled={!selectedTasks.length || starting}
               onClick={start}
             >
-              <Play /> 创建真实运行
+              <Play /> {starting ? "正在创建…" : "创建真实运行"}
             </button>
           </section>
         )}
@@ -1019,6 +1117,12 @@ function Live({
             </button>
           )}
         </div>
+        {detail.error && (
+          <div className="runerror" role="alert">
+            <b>失败原因</b>
+            <span>{detail.error}</span>
+          </div>
+        )}
         <div className="progress">
           <span style={{ width: `${detail.progress?.percent || 0}%` }} />
         </div>
@@ -1150,11 +1254,28 @@ function Results({
                 value={money(detail.estimated_cost_usd)}
               />
             </section>
+            <section className="runmeta">
+              <span><b>Agent</b>{detail.agent}</span>
+              <span><b>模型</b>{detail.model}</span>
+              <span><b>思考强度</b>{detail.reasoning_effort}</span>
+              <span><b>并发</b>{detail.concurrency}</span>
+            </section>
+            {detail.error && (
+              <div className="runerror" role="alert">
+                <b>失败原因</b>
+                <span>{detail.error}</span>
+              </div>
+            )}
             {detail.regression && (
               <div className={`regression ${detail.regression.level}`}>
                 <b>基线：{detail.regression.baseline_name}</b>
                 <span>
-                  {detail.regression.reasons.join("；") || "未检测到回归"}
+                  通过率 {percent(detail.regression.current_pass_rate)} vs {percent(detail.regression.baseline_pass_rate)}
+                  {detail.regression.pass_rate_delta != null && `（${detail.regression.pass_rate_delta >= 0 ? "+" : ""}${(detail.regression.pass_rate_delta * 100).toFixed(2)}pp）`}
+                  {detail.regression.current_duration_seconds != null && detail.regression.baseline_duration_seconds != null &&
+                    ` · 耗时 ${duration(detail.regression.current_duration_seconds)} vs ${duration(detail.regression.baseline_duration_seconds)}`}
+                  {detail.regression.baseline_trials ? ` · 官方 ${detail.regression.baseline_trials} 次 Trial` : ""}
+                  {detail.regression.reasons.length ? ` · ${detail.regression.reasons.join("；")}` : " · 未检测到回归"}
                 </span>
               </div>
             )}
@@ -1242,8 +1363,8 @@ function Compare({
   comparison,
 }: {
   runs: Run[];
-  selected: number[];
-  setSelected: (x: number[]) => void;
+  selected: string[];
+  setSelected: (x: string[]) => void;
   comparison: any;
 }) {
   const [taskFilter, setTaskFilter] = useState("all");
@@ -1257,18 +1378,13 @@ function Compare({
     (modelFilter === "all" || run.model === modelFilter) &&
     (effortFilter === "all" || run.reasoning_effort === effortFilter));
   const groupedRuns = taskNames.filter((task) => taskFilter === "all" || task === taskFilter).map((task) => ({task, runs: filteredRuns.filter((run) => run.tasks.includes(task))})).filter((group) => group.runs.length);
-  const selectedRuns = runs.filter((run) => selected.includes(run.id));
-  const compatible = (candidate: Run) => {
-    const peers = selectedRuns.filter((run) => run.id !== candidate.id);
-    return !peers.length || peers.some((run) => run.tasks.some((task) => candidate.tasks.includes(task)));
-  };
   return (
     <>
       <section className="panel">
         <div className="panelhead">
           <div>
-            <h2>选择运行</h2>
-            <p>最多 8 次，仅允许选择至少包含一个相同任务的运行；Agent、模型和思考强度可以不同。</p>
+            <h2>选择结果</h2>
+            <p>最多选择 8 个 Run × Task 结果；同一个 Run 中的不同任务可以独立勾选。</p>
           </div>
           <b>{selected.length}/8</b>
         </div>
@@ -1279,17 +1395,17 @@ function Compare({
           <label>思考强度<select value={effortFilter} onChange={(e)=>setEffortFilter(e.target.value)}><option value="all">全部强度</option>{[...new Set(runs.map(x=>x.reasoning_effort))].map(x=><option key={x}>{x}</option>)}</select></label>
         </div>
         {groupedRuns.map(group=><div className="comparegroup" key={group.task}><h3>{group.task}</h3><div className="comparepick">
-          {group.runs.map((r) => (
-            <label key={r.id}>
+          {group.runs.map((r) => { const selectionKey = `${r.id}:${group.task}`; return (
+            <label key={selectionKey}>
               <input
                 type="checkbox"
-                checked={selected.includes(r.id)}
-                disabled={!selected.includes(r.id) && (selected.length >= 8 || !compatible(r))}
+                checked={selected.includes(selectionKey)}
+                disabled={!selected.includes(selectionKey) && selected.length >= 8}
                 onChange={(e) =>
                   setSelected(
                     e.target.checked
-                      ? [...selected, r.id]
-                      : selected.filter((x) => x !== r.id),
+                      ? [...selected, selectionKey]
+                      : selected.filter((x) => x !== selectionKey),
                   )
                 }
               />
@@ -1302,7 +1418,7 @@ function Compare({
                 <small>{r.job_name}</small>
               </em>
             </label>
-          ))}
+          )})}
         </div></div>)}
       </section>
       {comparison?.runs?.length > 0 && (
@@ -1325,7 +1441,7 @@ function Compare({
                 <div className="comparetable">
                   <b>运行 / 基线</b><b>通过率</b><b>耗时</b><b>Input / Cache / Output</b><b>成本</b><b>步骤</b>
                   <span>DeepSWE 官方</span><span>{row.official?.pass_rate == null ? "—" : `${Math.round(row.official.pass_rate * 100)}%`}</span><span>{duration(row.official?.avg_duration_seconds)}</span><span>{number(row.official?.avg_input_tokens)} / {number(row.official?.avg_cache_tokens)} / {number(row.official?.avg_output_tokens)}</span><span>{money(row.official?.avg_cost_usd)}</span><span>{row.official?.avg_steps ?? "—"}</span>
-                  {comparison.runs.map((r: Run) => { const v=row.runs[String(r.id)] || {}; return <React.Fragment key={r.id}>
+                  {comparison.runs.filter((r: Run) => Object.hasOwn(row.runs, String(r.id))).map((r: Run) => { const v=row.runs[String(r.id)] || {}; return <React.Fragment key={r.id}>
                     <span><b>{r.agent}</b><small>{r.model} · {r.reasoning_effort}</small></span>
                     <span>{v.pass_rate == null ? "—" : `${Math.round(v.pass_rate * 100)}%`}</span><span>{duration(v.duration_seconds)}</span>
                     <span>{number(v.input_tokens)} / {number(v.cached_tokens)} / {number(v.output_tokens)}</span><span>{money(v.cost_usd)}</span><span>{v.steps ?? "—"}</span>
