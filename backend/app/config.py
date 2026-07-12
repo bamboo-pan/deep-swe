@@ -1,0 +1,22 @@
+from pathlib import Path
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+ROOT = Path(__file__).resolve().parents[2]
+
+class AppSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="DEEPSWE_UI_")
+    database_url: str = f"sqlite:///{(ROOT / 'data' / 'deepswe-ui.db').as_posix()}"
+    credential_file: Path = Path.home() / "Documents/github/codex1.txt"
+    tasks_dir: Path = ROOT / "tasks"
+    jobs_dir: Path = ROOT / "jobs"
+    default_agent: str = "mini-swe-agent"
+    default_model: str = "gpt-5.6-sol"
+    default_effort: str = "high"
+    default_concurrency: int = 2
+    docker_cleanup_after_run: bool = True
+    docker_cleanup_on_delete: bool = True
+    docker_cache_retention_hours: int = 168
+    docker_cache_warning_gb: int = 20
+    run_budget_usd: float = 10.0  # 单次 Run 的费用熔断上限，0 表示禁用（失控体量护栏不受此开关影响）
+
+settings = AppSettings()

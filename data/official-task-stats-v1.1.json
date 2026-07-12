@@ -1,0 +1,573 @@
+{
+ "version": "v1.1",
+ "source": "https://deepswe.datacurve.ai/artifacts/v1.1/trials.json",
+ "synced_at": "2026-07-11T12:35:00Z",
+ "n_trials": 18522,
+ "tasks": {
+  "abs-module-cache-flags": {
+   "trials": 164,
+   "pass_rate": 0.689,
+   "avg_duration_seconds": 977.2
+  },
+  "abs-stepped-slices": {
+   "trials": 164,
+   "pass_rate": 0.7012,
+   "avg_duration_seconds": 947.0
+  },
+  "actionlint-action-pinning-lint": {
+   "trials": 164,
+   "pass_rate": 0.7988,
+   "avg_duration_seconds": 985.7
+  },
+  "adaptix-name-mapping-aliases": {
+   "trials": 164,
+   "pass_rate": 0.6159,
+   "avg_duration_seconds": 1406.6
+  },
+  "aiomonitor-task-snapshots-diff": {
+   "trials": 163,
+   "pass_rate": 0.6319,
+   "avg_duration_seconds": 900.1
+  },
+  "anko-default-function-arguments": {
+   "trials": 164,
+   "pass_rate": 0.689,
+   "avg_duration_seconds": 1453.8
+  },
+  "anko-typed-variable-bindings": {
+   "trials": 164,
+   "pass_rate": 0.4085,
+   "avg_duration_seconds": 807.7
+  },
+  "arcane-drift-detection-baselines": {
+   "trials": 164,
+   "pass_rate": 0.6463,
+   "avg_duration_seconds": 1841.3
+  },
+  "arktype-json-schema-refs-dependencies": {
+   "trials": 164,
+   "pass_rate": 0.3659,
+   "avg_duration_seconds": 1910.4
+  },
+  "awilix-async-container-initialization": {
+   "trials": 164,
+   "pass_rate": 0.3476,
+   "avg_duration_seconds": 1349.3
+  },
+  "bandit-incremental-cache-control": {
+   "trials": 164,
+   "pass_rate": 0.5061,
+   "avg_duration_seconds": 1012.6
+  },
+  "bandit-interprocedural-taint-checks": {
+   "trials": 164,
+   "pass_rate": 0.5244,
+   "avg_duration_seconds": 977.4
+  },
+  "bandit-structured-nosec-directives": {
+   "trials": 164,
+   "pass_rate": 0.0488,
+   "avg_duration_seconds": 1306.0
+  },
+  "boa-hierarchical-evaluation-cancellation": {
+   "trials": 163,
+   "pass_rate": 0.4294,
+   "avg_duration_seconds": 2440.7
+  },
+  "cattrs-partial-structuring-recovery": {
+   "trials": 164,
+   "pass_rate": 0.5915,
+   "avg_duration_seconds": 1022.2
+  },
+  "clack-async-autocomplete-options": {
+   "trials": 164,
+   "pass_rate": 0.2683,
+   "avg_duration_seconds": 1450.1
+  },
+  "claude-code-by-agents-recursive-delegation": {
+   "trials": 163,
+   "pass_rate": 0.546,
+   "avg_duration_seconds": 1005.6
+  },
+  "cliffy-config-file-parsing": {
+   "trials": 164,
+   "pass_rate": 0.4573,
+   "avg_duration_seconds": 1027.6
+  },
+  "csstree-shorthand-expansion-compression": {
+   "trials": 164,
+   "pass_rate": 0.2927,
+   "avg_duration_seconds": 933.3
+  },
+  "dasel-html-document-format": {
+   "trials": 164,
+   "pass_rate": 0.4329,
+   "avg_duration_seconds": 958.2
+  },
+  "dateutil-rfc5545-timezone-interop": {
+   "trials": 164,
+   "pass_rate": 0.3598,
+   "avg_duration_seconds": 942.6
+  },
+  "drizzle-orm-window-function-builders": {
+   "trials": 164,
+   "pass_rate": 0.8476,
+   "avg_duration_seconds": 1151.4
+  },
+  "dynamodb-toolbox-conditional-attribute-requirements": {
+   "trials": 163,
+   "pass_rate": 0.6871,
+   "avg_duration_seconds": 2170.3
+  },
+  "dynamodb-toolbox-lazy-recursive-schemas": {
+   "trials": 160,
+   "pass_rate": 0.6438,
+   "avg_duration_seconds": 2707.6
+  },
+  "effect-sse-httpapi-streaming": {
+   "trials": 164,
+   "pass_rate": 0.1524,
+   "avg_duration_seconds": 2328.1
+  },
+  "eicrud-keyset-pagination-cursor": {
+   "trials": 164,
+   "pass_rate": 0.25,
+   "avg_duration_seconds": 1393.5
+  },
+  "etree-xml-diff-patch": {
+   "trials": 164,
+   "pass_rate": 0.5671,
+   "avg_duration_seconds": 1300.0
+  },
+  "expr-try-catch-errors": {
+   "trials": 164,
+   "pass_rate": 0.2561,
+   "avg_duration_seconds": 1686.2
+  },
+  "fastapi-deprecation-response-headers": {
+   "trials": 164,
+   "pass_rate": 0.4329,
+   "avg_duration_seconds": 1171.3
+  },
+  "fastapi-implicit-head-options": {
+   "trials": 164,
+   "pass_rate": 0.4878,
+   "avg_duration_seconds": 1631.3
+  },
+  "fd-deterministic-multi-key-sorting": {
+   "trials": 164,
+   "pass_rate": 0.5854,
+   "avg_duration_seconds": 1165.6
+  },
+  "geo-shapeindex-serialization": {
+   "trials": 164,
+   "pass_rate": 0.7073,
+   "avg_duration_seconds": 945.5
+  },
+  "go-critic-doc-link-checker": {
+   "trials": 164,
+   "pass_rate": 0.5,
+   "avg_duration_seconds": 1276.7
+  },
+  "go-genai-streamed-function-args": {
+   "trials": 164,
+   "pass_rate": 0.6768,
+   "avg_duration_seconds": 1038.2
+  },
+  "go-git-worktree-merge-conflicts": {
+   "trials": 164,
+   "pass_rate": 0.5976,
+   "avg_duration_seconds": 1492.9
+  },
+  "goreleaser-retry-publish-auditing": {
+   "trials": 164,
+   "pass_rate": 0.7805,
+   "avg_duration_seconds": 1510.1
+  },
+  "gql-incremental-graphql-delivery": {
+   "trials": 164,
+   "pass_rate": 0.0366,
+   "avg_duration_seconds": 1293.0
+  },
+  "happy-dom-abort-pending-body-reads": {
+   "trials": 164,
+   "pass_rate": 0.9146,
+   "avg_duration_seconds": 1356.5
+  },
+  "happy-dom-deterministic-intersectionobserver": {
+   "trials": 164,
+   "pass_rate": 0.3049,
+   "avg_duration_seconds": 1106.5
+  },
+  "helm-array-merge-strategies": {
+   "trials": 164,
+   "pass_rate": 0.1585,
+   "avg_duration_seconds": 1879.0
+  },
+  "helm-unified-manifest-stream": {
+   "trials": 164,
+   "pass_rate": 0.7622,
+   "avg_duration_seconds": 2211.8
+  },
+  "httpx-deterministic-cookie-store": {
+   "trials": 164,
+   "pass_rate": 0.8049,
+   "avg_duration_seconds": 1187.3
+  },
+  "httpx-multipart-response-parsing": {
+   "trials": 164,
+   "pass_rate": 0.6524,
+   "avg_duration_seconds": 1404.1
+  },
+  "httpx-streaming-json-iteration": {
+   "trials": 164,
+   "pass_rate": 0.3841,
+   "avg_duration_seconds": 935.3
+  },
+  "igel-persist-feature-schema": {
+   "trials": 164,
+   "pass_rate": 0.4878,
+   "avg_duration_seconds": 865.5
+  },
+  "ink-grid-box-layout": {
+   "trials": 164,
+   "pass_rate": 0.2988,
+   "avg_duration_seconds": 1677.2
+  },
+  "ipython-session-bundle-replay": {
+   "trials": 164,
+   "pass_rate": 0.5671,
+   "avg_duration_seconds": 963.8
+  },
+  "katex-multicolumn-array-spans": {
+   "trials": 164,
+   "pass_rate": 0.2439,
+   "avg_duration_seconds": 1471.3
+  },
+  "kcp-go-multiplexed-kcp-streams": {
+   "trials": 164,
+   "pass_rate": 0.7012,
+   "avg_duration_seconds": 1584.2
+  },
+  "kea-atomic-signal-selectors": {
+   "trials": 164,
+   "pass_rate": 0.3171,
+   "avg_duration_seconds": 2173.7
+  },
+  "kgateway-consistent-hash-policy": {
+   "trials": 164,
+   "pass_rate": 0.3659,
+   "avg_duration_seconds": 2032.2
+  },
+  "kombu-single-active-consumer-priority": {
+   "trials": 164,
+   "pass_rate": 0.5183,
+   "avg_duration_seconds": 1221.9
+  },
+  "kombu-virtual-queue-dead-lettering": {
+   "trials": 164,
+   "pass_rate": 0.1768,
+   "avg_duration_seconds": 1250.5
+  },
+  "koota-composite-trait-aspects": {
+   "trials": 164,
+   "pass_rate": 0.3049,
+   "avg_duration_seconds": 1776.2
+  },
+  "koota-deferred-mutation-buffer": {
+   "trials": 164,
+   "pass_rate": 0.25,
+   "avg_duration_seconds": 1676.7
+  },
+  "koota-entity-snapshot-rollback": {
+   "trials": 164,
+   "pass_rate": 0.7683,
+   "avg_duration_seconds": 891.8
+  },
+  "koota-pair-relation-tracking": {
+   "trials": 164,
+   "pass_rate": 0.1768,
+   "avg_duration_seconds": 1782.3
+  },
+  "koota-query-predicates": {
+   "trials": 164,
+   "pass_rate": 0.1829,
+   "avg_duration_seconds": 1610.2
+  },
+  "kysely-window-grouping-helpers": {
+   "trials": 164,
+   "pass_rate": 0.6402,
+   "avg_duration_seconds": 1231.8
+  },
+  "langchain-request-coalescing": {
+   "trials": 164,
+   "pass_rate": 0.3537,
+   "avg_duration_seconds": 1288.1
+  },
+  "mashumaro-flattened-dataclass-fields": {
+   "trials": 164,
+   "pass_rate": 0.4695,
+   "avg_duration_seconds": 1457.0
+  },
+  "meriyah-explicit-resource-declarations": {
+   "trials": 164,
+   "pass_rate": 0.2439,
+   "avg_duration_seconds": 1714.2
+  },
+  "mnamer-daemon-watch-lifecycle": {
+   "trials": 164,
+   "pass_rate": 0.5183,
+   "avg_duration_seconds": 1065.6
+  },
+  "mobly-grouped-test-barriers": {
+   "trials": 164,
+   "pass_rate": 0.5732,
+   "avg_duration_seconds": 1242.7
+  },
+  "narwhals-rolling-window-suite": {
+   "trials": 164,
+   "pass_rate": 0.872,
+   "avg_duration_seconds": 1480.6
+  },
+  "numba-stencil-boundary-modes": {
+   "trials": 164,
+   "pass_rate": 0.5915,
+   "avg_duration_seconds": 2039.6
+  },
+  "obsidian-linter-auto-table-of-contents": {
+   "trials": 164,
+   "pass_rate": 0.0061,
+   "avg_duration_seconds": 1169.3
+  },
+  "obsidian-linter-link-format-conversion": {
+   "trials": 164,
+   "pass_rate": 0.2927,
+   "avg_duration_seconds": 1204.3
+  },
+  "obsidian-linter-scoped-ignore-markers": {
+   "trials": 164,
+   "pass_rate": 0.6341,
+   "avg_duration_seconds": 1468.9
+  },
+  "ofetch-per-origin-circuit-breaker": {
+   "trials": 164,
+   "pass_rate": 0.7622,
+   "avg_duration_seconds": 1394.8
+  },
+  "onedump-dump-encryption-pipeline": {
+   "trials": 164,
+   "pass_rate": 0.2683,
+   "avg_duration_seconds": 1092.6
+  },
+  "opa-rego-rule-profiling": {
+   "trials": 164,
+   "pass_rate": 0.5915,
+   "avg_duration_seconds": 1237.0
+  },
+  "opa-template-string-reconstruction": {
+   "trials": 164,
+   "pass_rate": 0.5488,
+   "avg_duration_seconds": 2204.4
+  },
+  "optique-conditional-option-dependencies": {
+   "trials": 164,
+   "pass_rate": 0.2683,
+   "avg_duration_seconds": 1464.3
+  },
+  "oxvg-structural-selector-preservation": {
+   "trials": 163,
+   "pass_rate": 0.1043,
+   "avg_duration_seconds": 2493.9
+  },
+  "participle-grammar-conflict-analysis": {
+   "trials": 164,
+   "pass_rate": 0.2134,
+   "avg_duration_seconds": 1305.3
+  },
+  "pebble-durability-wait-apis": {
+   "trials": 164,
+   "pass_rate": 0.5488,
+   "avg_duration_seconds": 2514.6
+  },
+  "pest-character-class-coalescing": {
+   "trials": 164,
+   "pass_rate": 0.128,
+   "avg_duration_seconds": 1395.7
+  },
+  "prometheus-transactional-reload-status": {
+   "trials": 164,
+   "pass_rate": 0.189,
+   "avg_duration_seconds": 1749.3
+  },
+  "prometheus-typed-label-sorting": {
+   "trials": 164,
+   "pass_rate": 0.4634,
+   "avg_duration_seconds": 1511.9
+  },
+  "psd-tools-blend-range-api": {
+   "trials": 164,
+   "pass_rate": 0.7988,
+   "avg_duration_seconds": 842.5
+  },
+  "pwntools-tube-multiplexing": {
+   "trials": 163,
+   "pass_rate": 0.319,
+   "avg_duration_seconds": 1179.8
+  },
+  "python-statemachine-state-data-scoping": {
+   "trials": 164,
+   "pass_rate": 0.2744,
+   "avg_duration_seconds": 1701.8
+  },
+  "query-persist-restored-query-state": {
+   "trials": 164,
+   "pass_rate": 0.689,
+   "avg_duration_seconds": 1377.1
+  },
+  "quill-shared-toolbar-focus": {
+   "trials": 164,
+   "pass_rate": 0.2561,
+   "avg_duration_seconds": 1435.9
+  },
+  "returns-validated-error-accumulation": {
+   "trials": 164,
+   "pass_rate": 0.7988,
+   "avg_duration_seconds": 1066.4
+  },
+  "scc-bounded-memory-spilling": {
+   "trials": 164,
+   "pass_rate": 0.5915,
+   "avg_duration_seconds": 1234.3
+  },
+  "scriggo-method-declarations": {
+   "trials": 164,
+   "pass_rate": 0.5366,
+   "avg_duration_seconds": 2682.6
+  },
+  "skrub-duration-encoding": {
+   "trials": 164,
+   "pass_rate": 0.5305,
+   "avg_duration_seconds": 1492.4
+  },
+  "sql-formatter-bigquery-pipe-formatting": {
+   "trials": 164,
+   "pass_rate": 0.7988,
+   "avg_duration_seconds": 1144.3
+  },
+  "sqlfmt-create-table-ddl-formatting": {
+   "trials": 164,
+   "pass_rate": 0.2195,
+   "avg_duration_seconds": 1780.7
+  },
+  "sqlite-utils-safe-import-checkpoints": {
+   "trials": 164,
+   "pass_rate": 0.4817,
+   "avg_duration_seconds": 1185.9
+  },
+  "superjson-error-stack-serialization": {
+   "trials": 164,
+   "pass_rate": 0.3354,
+   "avg_duration_seconds": 1699.0
+  },
+  "task-task-graph-export": {
+   "trials": 164,
+   "pass_rate": 0.7073,
+   "avg_duration_seconds": 1294.3
+  },
+  "tengo-callable-instance-isolation": {
+   "trials": 164,
+   "pass_rate": 0.5915,
+   "avg_duration_seconds": 1294.7
+  },
+  "tengo-destructuring-bindings": {
+   "trials": 164,
+   "pass_rate": 0.4817,
+   "avg_duration_seconds": 1292.9
+  },
+  "termenv-preserve-ansi-resets": {
+   "trials": 164,
+   "pass_rate": 0.1646,
+   "avg_duration_seconds": 1339.8
+  },
+  "testem-bail-on-test-failure": {
+   "trials": 164,
+   "pass_rate": 0.1341,
+   "avg_duration_seconds": 1345.3
+  },
+  "testem-per-launcher-reports": {
+   "trials": 164,
+   "pass_rate": 0.6524,
+   "avg_duration_seconds": 930.0
+  },
+  "textual-kitty-key-phases": {
+   "trials": 164,
+   "pass_rate": 0.2805,
+   "avg_duration_seconds": 1151.9
+  },
+  "textual-richlog-follow-state": {
+   "trials": 164,
+   "pass_rate": 0.6463,
+   "avg_duration_seconds": 1250.5
+  },
+  "tomlkit-toml-table-converters": {
+   "trials": 164,
+   "pass_rate": 0.5793,
+   "avg_duration_seconds": 1373.6
+  },
+  "true-myth-iterable-collection-combinators": {
+   "trials": 164,
+   "pass_rate": 0.8598,
+   "avg_duration_seconds": 918.3
+  },
+  "ts-pattern-match-each": {
+   "trials": 164,
+   "pass_rate": 0.7134,
+   "avg_duration_seconds": 691.6
+  },
+  "updo-policy-alerting": {
+   "trials": 164,
+   "pass_rate": 0.1159,
+   "avg_duration_seconds": 1066.8
+  },
+  "valibot-recursive-schema-composition": {
+   "trials": 164,
+   "pass_rate": 0.6341,
+   "avg_duration_seconds": 2400.8
+  },
+  "vitest-duration-sharding": {
+   "trials": 164,
+   "pass_rate": 0.7317,
+   "avg_duration_seconds": 1430.8
+  },
+  "vulture-persistent-analysis-cache": {
+   "trials": 164,
+   "pass_rate": 0.3232,
+   "avg_duration_seconds": 1187.1
+  },
+  "wasmi-trap-coredumps": {
+   "trials": 164,
+   "pass_rate": 0.6098,
+   "avg_duration_seconds": 1827.1
+  },
+  "wazero-multi-module-snapshots": {
+   "trials": 164,
+   "pass_rate": 0.7439,
+   "avg_duration_seconds": 982.1
+  },
+  "yaegi-go-embed-directives": {
+   "trials": 164,
+   "pass_rate": 0.5915,
+   "avg_duration_seconds": 1738.1
+  },
+  "yjs-map-conflict-detection": {
+   "trials": 164,
+   "pass_rate": 0.7317,
+   "avg_duration_seconds": 1420.3
+  },
+  "ytt-jsonpath-query-api": {
+   "trials": 164,
+   "pass_rate": 0.7378,
+   "avg_duration_seconds": 1160.9
+  }
+ }
+}

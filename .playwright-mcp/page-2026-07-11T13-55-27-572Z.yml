@@ -1,0 +1,1762 @@
+- generic [ref=e4]:
+  - complementary [ref=e5]:
+    - generic [ref=e10]:
+      - text: DeepSWE
+      - generic [ref=e11]: REGRESSION LAB
+    - navigation [ref=e12]:
+      - button "dashboard" [ref=e13] [cursor=pointer]
+      - button "new run" [ref=e17] [cursor=pointer]
+      - button "live" [ref=e20] [cursor=pointer]
+      - button "results" [ref=e25] [cursor=pointer]
+      - button "compare" [ref=e29] [cursor=pointer]
+      - button "tasks" [active] [ref=e32] [cursor=pointer]
+      - button "settings" [ref=e38] [cursor=pointer]
+      - button "diagnostics" [ref=e42] [cursor=pointer]
+    - generic [ref=e46]: 仅本机访问127.0.0.1:8765
+  - main [ref=e50]:
+    - generic [ref=e51]:
+      - generic [ref=e52]:
+        - paragraph [ref=e53]: DEEPSWE / TASKS
+        - heading "任务目录" [level=1] [ref=e143]
+      - button [ref=e55] [cursor=pointer]
+    - generic [ref=e144]:
+      - generic [ref=e145]:
+        - heading "任务库" [level=2] [ref=e146]
+        - paragraph [ref=e147]: 官方通过率与平均耗时来自 DeepSWE 全模型全档位聚合，可作为挑选任务的快速依据。
+      - textbox "搜索任务、语言或标题" [ref=e148]
+      - button "同步官方统计" [ref=e149] [cursor=pointer]
+      - button "使用已选 7 题创建运行" [ref=e155] [cursor=pointer]
+    - generic [ref=e158]:
+      - generic [ref=e159]:
+        - generic [ref=e160]: 语言
+        - combobox [ref=e161]:
+          - option "全部语言" [selected]
+          - option "go"
+          - option "javascript"
+          - option "python"
+          - option "rust"
+          - option "typescript"
+      - generic [ref=e162]:
+        - generic [ref=e163]: 任务类型
+        - combobox [ref=e164]:
+          - option "全部类型" [selected]
+          - option "bugfix"
+          - option "enhancement"
+          - option "feature_request"
+      - generic [ref=e165]:
+        - generic [ref=e166]: 数据状态
+        - combobox [ref=e167]:
+          - option "全部任务" [selected]
+          - option "有官方数据"
+          - option "有本地结果"
+          - option "仅已选择"
+      - generic [ref=e168]:
+        - generic [ref=e169]: 排序
+        - combobox [ref=e170]:
+          - option "编号升序" [selected]
+          - option "官方通过率：高到低"
+          - option "官方通过率：低到高"
+          - option "平均执行时间：短到长"
+          - option "平均执行时间：长到短"
+          - option "本地通过率：高到低"
+          - option "标题 A–Z"
+      - generic [ref=e171]:
+        - generic [ref=e172]: 显示 113 / 113
+        - button "选择当前结果" [ref=e173] [cursor=pointer]
+        - button "重置" [ref=e174] [cursor=pointer]
+    - generic [ref=e175]:
+      - article [ref=e176]:
+        - generic [ref=e177] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e178]
+          - text: 选择任务
+        - generic [ref=e179]:
+          - generic [ref=e180]:
+            - generic [ref=e181]: TASK-001
+            - text: go
+          - generic [ref=e182]: enhancement
+        - heading "Harden module loading, cache introspection, and script flags" [level=2] [ref=e183]
+        - code [ref=e184]: abs-module-cache-flags
+        - paragraph [ref=e185]: Harden ABS module resolution and caching, expose cache introspection APIs, and make module flags work correctly in script mode.
+        - generic [ref=e186]:
+          - generic [ref=e187]: 官方 69% · 16m 17s
+          - emphasis [ref=e188]: 无本地历史
+      - article [ref=e189]:
+        - generic [ref=e190] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e191]
+          - text: 选择任务
+        - generic [ref=e192]:
+          - generic [ref=e193]:
+            - generic [ref=e194]: TASK-002
+            - text: go
+          - generic [ref=e195]: feature_request
+        - heading "Add stepped slices for arrays and strings" [level=2] [ref=e196]
+        - code [ref=e197]: abs-stepped-slices
+        - paragraph [ref=e198]: Add stepped slice parsing, slicing, and assignment for arrays and strings with rune-correct indexing.
+        - generic [ref=e199]:
+          - generic [ref=e200]: 官方 70% · 15m 47s
+          - emphasis [ref=e201]: 无本地历史
+      - article [ref=e202]:
+        - generic [ref=e203] [cursor=pointer]:
+          - checkbox "已选择" [checked] [ref=e204]
+          - text: 已选择
+        - generic [ref=e205]:
+          - generic [ref=e206]:
+            - generic [ref=e207]: TASK-003
+            - text: go
+          - generic [ref=e208]: feature_request
+        - heading "Add action pinning linting for actions and reusable workflows" [level=2] [ref=e209]
+        - code [ref=e210]: actionlint-action-pinning-lint
+        - paragraph [ref=e211]: Add a configurable lint rule that enforces pinned versions for action and reusable workflow references.
+        - generic [ref=e212]:
+          - generic [ref=e213]: 官方 80% · 16m 26s
+          - emphasis [ref=e214]: 无本地历史
+      - article [ref=e215]:
+        - generic [ref=e216] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e217]
+          - text: 选择任务
+        - generic [ref=e218]:
+          - generic [ref=e219]:
+            - generic [ref=e220]: TASK-004
+            - text: python
+          - generic [ref=e221]: feature_request
+        - heading "Add input key aliases to name mapping" [level=2] [ref=e222]
+        - code [ref=e223]: adaptix-name-mapping-aliases
+        - paragraph [ref=e224]: Add load-only alias support to name mapping so fields can resolve from alternate input keys.
+        - generic [ref=e225]:
+          - generic [ref=e226]: 官方 62% · 23m 27s
+          - emphasis [ref=e227]: 无本地历史
+      - article [ref=e228]:
+        - generic [ref=e229] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e230]
+          - text: 选择任务
+        - generic [ref=e231]:
+          - generic [ref=e232]:
+            - generic [ref=e233]: TASK-005
+            - text: python
+          - generic [ref=e234]: feature_request
+        - heading "Add task snapshots, inspection, and diffing to aiomonitor" [level=2] [ref=e235]
+        - code [ref=e236]: aiomonitor-task-snapshots-diff
+        - paragraph [ref=e237]: Add point-in-time task snapshots with interactive inspection, diffing, deletion, and web/CLI access.
+        - generic [ref=e238]:
+          - generic [ref=e239]: 官方 63% · 15m 0s
+          - emphasis [ref=e240]: 无本地历史
+      - article [ref=e241]:
+        - generic [ref=e242] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e243]
+          - text: 选择任务
+        - generic [ref=e244]:
+          - generic [ref=e245]:
+            - generic [ref=e246]: TASK-006
+            - text: go
+          - generic [ref=e247]: feature_request
+        - heading "Add default arguments to Anko function parameters" [level=2] [ref=e248]
+        - code [ref=e249]: anko-default-function-arguments
+        - paragraph [ref=e250]: Add parsing and call-time evaluation of default parameter values in Anko functions.
+        - generic [ref=e251]:
+          - generic [ref=e252]: 官方 69% · 24m 14s
+          - emphasis [ref=e253]: 无本地历史
+      - article [ref=e254]:
+        - generic [ref=e255] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e256]
+          - text: 选择任务
+        - generic [ref=e257]:
+          - generic [ref=e258]:
+            - generic [ref=e259]: TASK-007
+            - text: go
+          - generic [ref=e260]: feature_request
+        - heading "Add typed variable bindings to Anko" [level=2] [ref=e261]
+        - code [ref=e262]: anko-typed-variable-bindings
+        - paragraph [ref=e263]: "Add typed `var` declarations in Anko and enforce declared type constraints on assignment when TypedBindings is enabled."
+        - generic [ref=e264]:
+          - generic [ref=e265]: 官方 41% · 13m 28s
+          - emphasis [ref=e266]: 无本地历史
+      - article [ref=e267]:
+        - generic [ref=e268] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e269]
+          - text: 选择任务
+        - generic [ref=e270]:
+          - generic [ref=e271]:
+            - generic [ref=e272]: TASK-008
+            - text: go
+          - generic [ref=e273]: feature_request
+        - heading "Add drift detection and compliance baselines" [level=2] [ref=e274]
+        - code [ref=e275]: arcane-drift-detection-baselines
+        - paragraph [ref=e276]: Implement baseline capture, drift comparison, and compliance tracking for container configurations.
+        - generic [ref=e277]:
+          - generic [ref=e278]: 官方 65% · 30m 41s
+          - emphasis [ref=e279]: 无本地历史
+      - article [ref=e280]:
+        - generic [ref=e281] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e282]
+          - text: 选择任务
+        - generic [ref=e283]:
+          - generic [ref=e284]:
+            - generic [ref=e285]: TASK-009
+            - text: typescript
+          - generic [ref=e286]: feature_request
+        - heading "Add JSON Schema refs and dependency keywords" [level=2] [ref=e287]
+        - code [ref=e288]: arktype-json-schema-refs-dependencies
+        - paragraph [ref=e289]: Add JSON Schema dependency keywords, local $defs/$ref resolution, and conditional schema handling.
+        - generic [ref=e290]:
+          - generic [ref=e291]: 官方 37% · 31m 50s
+          - emphasis [ref=e292]: 无本地历史
+      - article [ref=e293]:
+        - generic [ref=e294] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e295]
+          - text: 选择任务
+        - generic [ref=e296]:
+          - generic [ref=e297]:
+            - generic [ref=e298]: TASK-010
+            - text: typescript
+          - generic [ref=e299]: feature_request
+        - heading "Add dependency-aware async initialization to the container" [level=2] [ref=e300]
+        - code [ref=e301]: awilix-async-container-initialization
+        - paragraph [ref=e302]: Add dependency-aware asynchronous container initialization with ordered startup, concurrency limits, and rollback on failure.
+        - generic [ref=e303]:
+          - generic [ref=e304]: 官方 35% · 22m 29s
+          - emphasis [ref=e305]: 无本地历史
+      - article [ref=e306]:
+        - generic [ref=e307] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e308]
+          - text: 选择任务
+        - generic [ref=e309]:
+          - generic [ref=e310]:
+            - generic [ref=e311]: TASK-011
+            - text: python
+          - generic [ref=e312]: feature_request
+        - heading "Add incremental cache controls to Bandit" [level=2] [ref=e313]
+        - code [ref=e314]: bandit-incremental-cache-control
+        - paragraph [ref=e315]: Add incremental analysis caching with cache invalidation, import/export, pruning, and cache inspection CLI options.
+        - generic [ref=e316]:
+          - generic [ref=e317]: 官方 51% · 16m 53s
+          - emphasis [ref=e318]: 无本地历史
+      - article [ref=e319]:
+        - generic [ref=e320] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e321]
+          - text: 选择任务
+        - generic [ref=e322]:
+          - generic [ref=e323]:
+            - generic [ref=e324]: TASK-012
+            - text: python
+          - generic [ref=e325]: feature_request
+        - heading "Add interprocedural taint checks for Bandit injection sinks" [level=2] [ref=e326]
+        - code [ref=e327]: bandit-interprocedural-taint-checks
+        - paragraph [ref=e328]: Track user input through variables and calls so Bandit flags injection sinks beyond string literals.
+        - generic [ref=e329]:
+          - generic [ref=e330]: 官方 52% · 16m 17s
+          - emphasis [ref=e331]: 无本地历史
+      - article [ref=e332]:
+        - generic [ref=e333] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e334]
+          - text: 选择任务
+        - generic [ref=e335]:
+          - generic [ref=e336]:
+            - generic [ref=e337]: TASK-013
+            - text: python
+          - generic [ref=e338]: feature_request
+        - heading "Add structured nosec directives for regions and next line" [level=2] [ref=e339]
+        - code [ref=e340]: bandit-structured-nosec-directives
+        - paragraph [ref=e341]: Add region and next-line nosec directives with selector expressions and ignore-nosec handling.
+        - generic [ref=e342]:
+          - generic [ref=e343]: 官方 5% · 21m 46s
+          - emphasis [ref=e344]: 无本地历史
+      - article [ref=e345]:
+        - generic [ref=e346] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e347]
+          - text: 选择任务
+        - generic [ref=e348]:
+          - generic [ref=e349]:
+            - generic [ref=e350]: TASK-014
+            - text: rust
+          - generic [ref=e351]: feature_request
+        - heading "Add hierarchical evaluation cancellation to Boa" [level=2] [ref=e352]
+        - code [ref=e353]: boa-hierarchical-evaluation-cancellation
+        - paragraph [ref=e354]: Add cancellable evaluation handles that propagate through nested script, module, and job execution.
+        - generic [ref=e355]:
+          - generic [ref=e356]: 官方 43% · 40m 41s
+          - emphasis [ref=e357]: 无本地历史
+      - article [ref=e358]:
+        - generic [ref=e359] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e360]
+          - text: 选择任务
+        - generic [ref=e361]:
+          - generic [ref=e362]:
+            - generic [ref=e363]: TASK-015
+            - text: python
+          - generic [ref=e364]: feature_request
+        - heading "Add partial structuring with error recovery to cattrs" [level=2] [ref=e365]
+        - code [ref=e366]: cattrs-partial-structuring-recovery
+        - paragraph [ref=e367]: "Add `partial_structure` and `PartialResult` for recoverable, field-level structuring with nested partial results."
+        - generic [ref=e368]:
+          - generic [ref=e369]: 官方 59% · 17m 2s
+          - emphasis [ref=e370]: 无本地历史
+      - article [ref=e371]:
+        - generic [ref=e372] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e373]
+          - text: 选择任务
+        - generic [ref=e374]:
+          - generic [ref=e375]:
+            - generic [ref=e376]: TASK-016
+            - text: typescript
+          - generic [ref=e377]: feature_request
+        - heading "Add async autocomplete options and fetch lifecycle handling" [level=2] [ref=e378]
+        - code [ref=e379]: clack-async-autocomplete-options
+        - paragraph [ref=e380]: Add async option fetching with caching, retries, debouncing, and loading state to AutocompletePrompt.
+        - generic [ref=e381]:
+          - generic [ref=e382]: 官方 27% · 24m 10s
+          - emphasis [ref=e383]: 无本地历史
+      - article [ref=e384]:
+        - generic [ref=e385] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e386]
+          - text: 选择任务
+        - generic [ref=e387]:
+          - generic [ref=e388]:
+            - generic [ref=e389]: TASK-017
+            - text: typescript
+          - generic [ref=e390]: feature_request
+        - heading "Implement recursive agent delegation through delegate_task tool calls" [level=2] [ref=e391]
+        - code [ref=e392]: claude-code-by-agents-recursive-delegation
+        - paragraph [ref=e393]: Run delegated sub-agents, feed their results back as tool_result, and handle unknown agents, failures, and circular delegation.
+        - generic [ref=e394]:
+          - generic [ref=e395]: 官方 55% · 16m 46s
+          - emphasis [ref=e396]: 无本地历史
+      - article [ref=e397]:
+        - generic [ref=e398] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e399]
+          - text: 选择任务
+        - generic [ref=e400]:
+          - generic [ref=e401]:
+            - generic [ref=e402]: TASK-018
+            - text: typescript
+          - generic [ref=e403]: feature_request
+        - heading "Add config file parsing to Cliffy commands" [level=2] [ref=e404]
+        - code [ref=e405]: cliffy-config-file-parsing
+        - paragraph [ref=e406]: Add command-level config file loading, parsing, merging, and precedence handling.
+        - generic [ref=e407]:
+          - generic [ref=e408]: 官方 46% · 17m 8s
+          - emphasis [ref=e409]: 无本地历史
+      - article [ref=e410]:
+        - generic [ref=e411] [cursor=pointer]:
+          - checkbox "已选择" [checked] [ref=e412]
+          - text: 已选择
+        - generic [ref=e413]:
+          - generic [ref=e414]:
+            - generic [ref=e415]: TASK-019
+            - text: javascript
+          - generic [ref=e416]: feature_request
+        - heading "Add shorthand expansion and compression to the lexer" [level=2] [ref=e417]
+        - code [ref=e418]: csstree-shorthand-expansion-compression
+        - paragraph [ref=e419]: Add lexer methods to expand CSS shorthands into longhands and compress longhands back into shorthand values.
+        - generic [ref=e420]:
+          - generic [ref=e421]: 官方 29% · 15m 33s
+          - emphasis [ref=e422]: 无本地历史
+      - article [ref=e423]:
+        - generic [ref=e424] [cursor=pointer]:
+          - checkbox "已选择" [checked] [ref=e425]
+          - text: 已选择
+        - generic [ref=e426]:
+          - generic [ref=e427]:
+            - generic [ref=e428]: TASK-020
+            - text: go
+          - generic [ref=e429]: feature_request
+        - heading "Add HTML document format handling to Dasel" [level=2] [ref=e430]
+        - code [ref=e431]: dasel-html-document-format
+        - paragraph [ref=e432]: Add read and write support for HTML documents with Dasel's format handling.
+        - generic [ref=e433]:
+          - generic [ref=e434]: 官方 43% · 15m 58s
+          - emphasis [ref=e435]: 无本地历史
+      - article [ref=e436]:
+        - generic [ref=e437] [cursor=pointer]:
+          - checkbox "已选择" [checked] [ref=e438]
+          - text: 已选择
+        - generic [ref=e439]:
+          - generic [ref=e440]:
+            - generic [ref=e441]: TASK-021
+            - text: python
+          - generic [ref=e442]: enhancement
+        - heading "Add RFC 5545 timezone interoperability to dateutil recurrence parsing" [level=2] [ref=e443]
+        - code [ref=e444]: dateutil-rfc5545-timezone-interop
+        - paragraph [ref=e445]: Extend rrule and rruleset to serialize, parse, and compare RFC 5545 timezone-aware recurrence data.
+        - generic [ref=e446]:
+          - generic [ref=e447]: 官方 36% · 15m 43s
+          - emphasis [ref=e448]: 无本地历史
+      - article [ref=e449]:
+        - generic [ref=e450] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e451]
+          - text: 选择任务
+        - generic [ref=e452]:
+          - generic [ref=e453]:
+            - generic [ref=e454]: TASK-022
+            - text: typescript
+          - generic [ref=e455]: feature_request
+        - heading "Add typed window function builders with OVER clauses" [level=2] [ref=e456]
+        - code [ref=e457]: drizzle-orm-window-function-builders
+        - paragraph [ref=e458]: Add typed query-builder helpers for SQL window functions, named windows, and frame specs.
+        - generic [ref=e459]:
+          - generic [ref=e460]: 官方 85% · 19m 11s
+          - emphasis [ref=e461]: 无本地历史
+      - article [ref=e462]:
+        - generic [ref=e463] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e464]
+          - text: 选择任务
+        - generic [ref=e465]:
+          - generic [ref=e466]:
+            - generic [ref=e467]: TASK-023
+            - text: typescript
+          - generic [ref=e468]: feature_request
+        - heading "Add conditional required attributes to schemas" [level=2] [ref=e469]
+        - code [ref=e470]: dynamodb-toolbox-conditional-attribute-requirements
+        - paragraph [ref=e471]: "Add `requiredIf`-based conditional attribute enforcement across schema validation, parsing, updates, and JSON Schema export."
+        - generic [ref=e472]:
+          - generic [ref=e473]: 官方 69% · 36m 10s
+          - emphasis [ref=e474]: 无本地历史
+      - article [ref=e475]:
+        - generic [ref=e476] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e477]
+          - text: 选择任务
+        - generic [ref=e478]:
+          - generic [ref=e479]:
+            - generic [ref=e480]: TASK-024
+            - text: typescript
+          - generic [ref=e481]: feature_request
+        - heading "Add lazy recursive schemas with DTO and JSON Schema export" [level=2] [ref=e482]
+        - code [ref=e483]: dynamodb-toolbox-lazy-recursive-schemas
+        - paragraph [ref=e484]: Add a lazy schema type for self-referencing recursive data with full serialization, validation, and export support.
+        - generic [ref=e485]:
+          - generic [ref=e486]: 官方 64% · 45m 8s
+          - emphasis [ref=e487]: 无本地历史
+      - article [ref=e488]:
+        - generic [ref=e489] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e490]
+          - text: 选择任务
+        - generic [ref=e491]:
+          - generic [ref=e492]:
+            - generic [ref=e493]: TASK-025
+            - text: typescript
+          - generic [ref=e494]: feature_request
+        - heading "Add SSE streaming endpoints to HttpApi" [level=2] [ref=e495]
+        - code [ref=e496]: effect-sse-httpapi-streaming
+        - paragraph [ref=e497]: Add typed Server-Sent Events streaming endpoints, encoders/decoders, and client handling to HttpApi.
+        - generic [ref=e498]:
+          - generic [ref=e499]: 官方 15% · 38m 48s
+          - emphasis [ref=e500]: 无本地历史
+      - article [ref=e501]:
+        - generic [ref=e502] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e503]
+          - text: 选择任务
+        - generic [ref=e504]:
+          - generic [ref=e505]:
+            - generic [ref=e506]: TASK-026
+            - text: typescript
+          - generic [ref=e507]: feature_request
+        - 'heading "Add keyset cursor pagination to `$find`" [level=2] [ref=e508]'
+        - code [ref=e509]: eicrud-keyset-pagination-cursor
+        - paragraph [ref=e510]: "Add cursor-based keyset pagination to `$find` with nextCursor handling and validation."
+        - generic [ref=e511]:
+          - generic [ref=e512]: 官方 25% · 23m 14s
+          - emphasis [ref=e513]: 无本地历史
+      - article [ref=e514]:
+        - generic [ref=e515] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e516]
+          - text: 选择任务
+        - generic [ref=e517]:
+          - generic [ref=e518]:
+            - generic [ref=e519]: TASK-027
+            - text: go
+          - generic [ref=e520]: feature_request
+        - heading "Add XML diff, patch, and merge operations to etree" [level=2] [ref=e521]
+        - code [ref=e522]: etree-xml-diff-patch
+        - paragraph [ref=e523]: Add recursive XML diffing, patch generation and application, reverse patching, three-way merge, and diff summaries.
+        - generic [ref=e524]:
+          - generic [ref=e525]: 官方 57% · 21m 40s
+          - emphasis [ref=e526]: 无本地历史
+      - article [ref=e527]:
+        - generic [ref=e528] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e529]
+          - text: 选择任务
+        - generic [ref=e530]:
+          - generic [ref=e531]:
+            - generic [ref=e532]: TASK-028
+            - text: go
+          - generic [ref=e533]: feature_request
+        - heading "Add try/catch error recovery to expr" [level=2] [ref=e534]
+        - code [ref=e535]: expr-try-catch-errors
+        - paragraph [ref=e536]: Add expression and block-level error recovery with try, catch, finally, throw, retry, and errtype.
+        - generic [ref=e537]:
+          - generic [ref=e538]: 官方 26% · 28m 6s
+          - emphasis [ref=e539]: 无本地历史
+      - article [ref=e540]:
+        - generic [ref=e541] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e542]
+          - text: 选择任务
+        - generic [ref=e543]:
+          - generic [ref=e544]:
+            - generic [ref=e545]: TASK-029
+            - text: python
+          - generic [ref=e546]: feature_request
+        - heading "Add deprecation, sunset, and successor headers to FastAPI routes" [level=2] [ref=e547]
+        - code [ref=e548]: fastapi-deprecation-response-headers
+        - paragraph [ref=e549]: Add runtime Deprecation, Sunset, and Link headers plus OpenAPI metadata and tracking middleware for deprecated routes.
+        - generic [ref=e550]:
+          - generic [ref=e551]: 官方 43% · 19m 31s
+          - emphasis [ref=e552]: 无本地历史
+      - article [ref=e553]:
+        - generic [ref=e554] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e555]
+          - text: 选择任务
+        - generic [ref=e556]:
+          - generic [ref=e557]:
+            - generic [ref=e558]: TASK-030
+            - text: python
+          - generic [ref=e559]: feature_request
+        - heading "Add implicit HEAD and automatic OPTIONS responses to FastAPI routes" [level=2] [ref=e560]
+        - code [ref=e561]: fastapi-implicit-head-options
+        - paragraph [ref=e562]: Add configurable implicit HEAD handling and automatic OPTIONS responses for FastAPI routes, routers, and included routers.
+        - generic [ref=e563]:
+          - generic [ref=e564]: 官方 49% · 27m 11s
+          - emphasis [ref=e565]: 无本地历史
+      - article [ref=e566]:
+        - generic [ref=e567] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e568]
+          - text: 选择任务
+        - generic [ref=e569]:
+          - generic [ref=e570]:
+            - generic [ref=e571]: TASK-031
+            - text: rust
+          - generic [ref=e572]: feature_request
+        - heading "Add deterministic multi-key sorting to fd" [level=2] [ref=e573]
+        - code [ref=e574]: fd-deterministic-multi-key-sorting
+        - paragraph [ref=e575]: Add repeatable multi-key sorting controls to fd output with deterministic tie-breaking and seeded random order.
+        - generic [ref=e576]:
+          - generic [ref=e577]: 官方 59% · 19m 26s
+          - emphasis [ref=e578]: 无本地历史
+      - article [ref=e579]:
+        - generic [ref=e580] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e581]
+          - text: 选择任务
+        - generic [ref=e582]:
+          - generic [ref=e583]:
+            - generic [ref=e584]: TASK-032
+            - text: go
+          - generic [ref=e585]: feature_request
+        - heading "Add ShapeIndex encoding and decoding" [level=2] [ref=e586]
+        - code [ref=e587]: geo-shapeindex-serialization
+        - paragraph [ref=e588]: Add stable ShapeIndex Encode/Decode support so indices round-trip without rebuilding.
+        - generic [ref=e589]:
+          - generic [ref=e590]: 官方 71% · 15m 46s
+          - emphasis [ref=e591]: 无本地历史
+      - article [ref=e592]:
+        - generic [ref=e593] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e594]
+          - text: 选择任务
+        - generic [ref=e595]:
+          - generic [ref=e596]:
+            - generic [ref=e597]: TASK-033
+            - text: go
+          - generic [ref=e598]: feature_request
+        - heading "Add a checker for broken doc comment links" [level=2] [ref=e599]
+        - code [ref=e600]: go-critic-doc-link-checker
+        - paragraph [ref=e601]: Add a diagnostic checker that validates doc comment symbol links against package and type information.
+        - generic [ref=e602]:
+          - generic [ref=e603]: 官方 50% · 21m 17s
+          - emphasis [ref=e604]: 无本地历史
+      - article [ref=e605]:
+        - generic [ref=e606] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e607]
+          - text: 选择任务
+        - generic [ref=e608]:
+          - generic [ref=e609]:
+            - generic [ref=e610]: TASK-034
+            - text: go
+          - generic [ref=e611]: feature_request
+        - heading "Expose accumulated streamed function-call args in SDK surfaces" [level=2] [ref=e612]
+        - code [ref=e613]: go-genai-streamed-function-args
+        - paragraph [ref=e614]: Expose fully accumulated streamed function-call arguments across streaming, live sessions, and chat history.
+        - generic [ref=e615]:
+          - generic [ref=e616]: 官方 68% · 17m 18s
+          - emphasis [ref=e617]: 无本地历史
+      - article [ref=e618]:
+        - generic [ref=e619] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e620]
+          - text: 选择任务
+        - generic [ref=e621]:
+          - generic [ref=e622]:
+            - generic [ref=e623]: TASK-035
+            - text: go
+          - generic [ref=e624]: feature_request
+        - heading "Add worktree merge conflict handling" [level=2] [ref=e625]
+        - code [ref=e626]: go-git-worktree-merge-conflicts
+        - paragraph [ref=e627]: Add worktree merge support with conflict detection, merge head handling, and index stage updates.
+        - generic [ref=e628]:
+          - generic [ref=e629]: 官方 60% · 24m 53s
+          - emphasis [ref=e630]: 无本地历史
+      - article [ref=e631]:
+        - generic [ref=e632] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e633]
+          - text: 选择任务
+        - generic [ref=e634]:
+          - generic [ref=e635]:
+            - generic [ref=e636]: TASK-036
+            - text: go
+          - generic [ref=e637]: feature_request
+        - heading "Add retry-aware publishing audit logs" [level=2] [ref=e638]
+        - code [ref=e639]: goreleaser-retry-publish-auditing
+        - paragraph [ref=e640]: Implement per-artifact retries for uploads, artifactory, and blobs while recording deterministic publish attempt history.
+        - generic [ref=e641]:
+          - generic [ref=e642]: 官方 78% · 25m 10s
+          - emphasis [ref=e643]: 无本地历史
+      - article [ref=e644]:
+        - generic [ref=e645] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e646]
+          - text: 选择任务
+        - generic [ref=e647]:
+          - generic [ref=e648]:
+            - generic [ref=e649]: TASK-037
+            - text: python
+          - generic [ref=e650]: feature_request
+        - heading "Add GraphQL incremental delivery with @defer and @stream" [level=2] [ref=e651]
+        - code [ref=e652]: gql-incremental-graphql-delivery
+        - paragraph [ref=e653]: Add incremental GraphQL response handling with @defer and @stream across HTTP multipart, WebSocket transport, and the DSL.
+        - generic [ref=e654]:
+          - generic [ref=e655]: 官方 4% · 21m 33s
+          - emphasis [ref=e656]: 无本地历史
+      - article [ref=e657]:
+        - generic [ref=e658] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e659]
+          - text: 选择任务
+        - generic [ref=e660]:
+          - generic [ref=e661]:
+            - generic [ref=e662]: TASK-038
+            - text: typescript
+          - generic [ref=e663]: bugfix
+        - heading "Abort pending body reads on shutdown" [level=2] [ref=e664]
+        - code [ref=e665]: happy-dom-abort-pending-body-reads
+        - paragraph [ref=e666]: Ensure interrupted request and response body reads, formData parsing, and discarded timers abort cleanly during shutdown.
+        - generic [ref=e667]:
+          - generic [ref=e668]: 官方 91% · 22m 37s
+          - emphasis [ref=e669]: 无本地历史
+      - article [ref=e670]:
+        - generic [ref=e671] [cursor=pointer]:
+          - checkbox "已选择" [checked] [ref=e672]
+          - text: 已选择
+        - generic [ref=e673]:
+          - generic [ref=e674]:
+            - generic [ref=e675]: TASK-039
+            - text: typescript
+          - generic [ref=e676]: feature_request
+        - heading "Implement a deterministic IntersectionObserver in Happy DOM" [level=2] [ref=e677]
+        - code [ref=e678]: happy-dom-deterministic-intersectionobserver
+        - paragraph [ref=e679]: Implement a real, deterministic IntersectionObserver with async delivery, thresholds, root margins, and target tracking.
+        - generic [ref=e680]:
+          - generic [ref=e681]: 官方 30% · 18m 27s
+          - emphasis [ref=e682]: 无本地历史
+      - article [ref=e683]:
+        - generic [ref=e684] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e685]
+          - text: 选择任务
+        - generic [ref=e686]:
+          - generic [ref=e687]:
+            - generic [ref=e688]: TASK-040
+            - text: go
+          - generic [ref=e689]: feature_request
+        - heading "Add configurable array merge strategies to Helm value coalescing" [level=2] [ref=e690]
+        - code [ref=e691]: helm-array-merge-strategies
+        - paragraph [ref=e692]: Add chart-scoped append and key-based merge strategies for coalescing arrays during Helm value merging.
+        - generic [ref=e693]:
+          - generic [ref=e694]: 官方 16% · 31m 19s
+          - emphasis [ref=e695]: 无本地历史
+      - article [ref=e696]:
+        - generic [ref=e697] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e698]
+          - text: 选择任务
+        - generic [ref=e699]:
+          - generic [ref=e700]:
+            - generic [ref=e701]: TASK-041
+            - text: go
+          - generic [ref=e702]: feature_request
+        - heading "Add unified manifest stream output across Helm commands" [level=2] [ref=e703]
+        - code [ref=e704]: helm-unified-manifest-stream
+        - paragraph [ref=e705]: Add a stable unified manifest stream for template, dry-run install/upgrade, and get manifest output.
+        - generic [ref=e706]:
+          - generic [ref=e707]: 官方 76% · 36m 52s
+          - emphasis [ref=e708]: 无本地历史
+      - article [ref=e709]:
+        - generic [ref=e710] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e711]
+          - text: 选择任务
+        - generic [ref=e712]:
+          - generic [ref=e713]:
+            - generic [ref=e714]: TASK-042
+            - text: typescript
+          - generic [ref=e715]: feature_request
+        - heading "Add a deterministic CookieStore with modern Set-Cookie parsing" [level=2] [ref=e716]
+        - code [ref=e717]: httpx-deterministic-cookie-store
+        - paragraph [ref=e718]: Add a deterministic CookieStore with modern Set-Cookie parsing, cookie eviction, and request header handling.
+        - generic [ref=e719]:
+          - generic [ref=e720]: 官方 80% · 19m 47s
+          - emphasis [ref=e721]: 无本地历史
+      - article [ref=e722]:
+        - generic [ref=e723] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e724]
+          - text: 选择任务
+        - generic [ref=e725]:
+          - generic [ref=e726]:
+            - generic [ref=e727]: TASK-043
+            - text: python
+          - generic [ref=e728]: feature_request
+        - heading "Add multipart response parsing to HTTPX" [level=2] [ref=e729]
+        - code [ref=e730]: httpx-multipart-response-parsing
+        - paragraph [ref=e731]: Add Response iterators that parse multipart HTTP response bodies into parts.
+        - generic [ref=e732]:
+          - generic [ref=e733]: 官方 65% · 23m 24s
+          - emphasis [ref=e734]: 无本地历史
+      - article [ref=e735]:
+        - generic [ref=e736] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e737]
+          - text: 选择任务
+        - generic [ref=e738]:
+          - generic [ref=e739]:
+            - generic [ref=e740]: TASK-044
+            - text: python
+          - generic [ref=e741]: feature_request
+        - heading "Add streaming JSON iteration to HTTPX responses" [level=2] [ref=e742]
+        - code [ref=e743]: httpx-streaming-json-iteration
+        - paragraph [ref=e744]: Add response iterators that incrementally parse JSON values from supported streaming media types.
+        - generic [ref=e745]:
+          - generic [ref=e746]: 官方 38% · 15m 35s
+          - emphasis [ref=e747]: 无本地历史
+      - article [ref=e748]:
+        - generic [ref=e749] [cursor=pointer]:
+          - checkbox "已选择" [checked] [ref=e750]
+          - text: 已选择
+        - generic [ref=e751]:
+          - generic [ref=e752]:
+            - generic [ref=e753]: TASK-045
+            - text: python
+          - generic [ref=e754]: feature_request
+        - heading "Persist the fitted feature schema across evaluate, predict, serve, and export" [level=2] [ref=e755]
+        - code [ref=e756]: igel-persist-feature-schema
+        - paragraph [ref=e757]: Persist and reuse the fitted feature schema so evaluation, prediction, serving, and export all apply the same canonicalized inputs.
+        - generic [ref=e758]:
+          - generic [ref=e759]: 官方 49% · 14m 26s
+          - emphasis [ref=e760]: 无本地历史
+      - article [ref=e761]:
+        - generic [ref=e762] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e763]
+          - text: 选择任务
+        - generic [ref=e764]:
+          - generic [ref=e765]:
+            - generic [ref=e766]: TASK-046
+            - text: typescript
+          - generic [ref=e767]: feature_request
+        - heading "Add CSS Grid layout to the Box component" [level=2] [ref=e768]
+        - code [ref=e769]: ink-grid-box-layout
+        - paragraph [ref=e770]: Add CSS Grid layout parsing and placement to the Box component, including track sizing, gaps, and explicit child positioning.
+        - generic [ref=e771]:
+          - generic [ref=e772]: 官方 30% · 27m 57s
+          - emphasis [ref=e773]: 无本地历史
+      - article [ref=e774]:
+        - generic [ref=e775] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e776]
+          - text: 选择任务
+        - generic [ref=e777]:
+          - generic [ref=e778]:
+            - generic [ref=e779]: TASK-047
+            - text: python
+          - generic [ref=e780]: feature_request
+        - heading "Add session bundle recording and replay to IPython" [level=2] [ref=e781]
+        - code [ref=e782]: ipython-session-bundle-replay
+        - paragraph [ref=e783]: "Add `.ipybundle` recording, validation, and replay APIs for IPython sessions."
+        - generic [ref=e784]:
+          - generic [ref=e785]: 官方 57% · 16m 4s
+          - emphasis [ref=e786]: 无本地历史
+      - article [ref=e787]:
+        - generic [ref=e788] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e789]
+          - text: 选择任务
+        - generic [ref=e790]:
+          - generic [ref=e791]:
+            - generic [ref=e792]: TASK-048
+            - text: javascript
+          - generic [ref=e793]: feature_request
+        - 'heading "Add `\\multicolumn` column spans to array-like environments" [level=2] [ref=e794]'
+        - code [ref=e795]: katex-multicolumn-array-spans
+        - paragraph [ref=e796]: "Add `\\multicolumn` parsing and rendering for array-like environments with span-aware alignment and errors."
+        - generic [ref=e797]:
+          - generic [ref=e798]: 官方 24% · 24m 31s
+          - emphasis [ref=e799]: 无本地历史
+      - article [ref=e800]:
+        - generic [ref=e801] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e802]
+          - text: 选择任务
+        - generic [ref=e803]:
+          - generic [ref=e804]:
+            - generic [ref=e805]: TASK-049
+            - text: go
+          - generic [ref=e806]: feature_request
+        - heading "Add multiplexed ordered streams over KCP" [level=2] [ref=e807]
+        - code [ref=e808]: kcp-go-multiplexed-kcp-streams
+        - paragraph [ref=e809]: Add a multiplexing layer that carries many ordered sub-streams over one KCP connection with flow control, priority scheduling, and SNMP counters.
+        - generic [ref=e810]:
+          - generic [ref=e811]: 官方 70% · 26m 24s
+          - emphasis [ref=e812]: 无本地历史
+      - article [ref=e813]:
+        - generic [ref=e814] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e815]
+          - text: 选择任务
+        - generic [ref=e816]:
+          - generic [ref=e817]:
+            - generic [ref=e818]: TASK-050
+            - text: typescript
+          - generic [ref=e819]: feature_request
+        - heading "Add atomic signal selectors to Kea" [level=2] [ref=e820]
+        - code [ref=e821]: kea-atomic-signal-selectors
+        - paragraph [ref=e822]: Introduce fine-grained atomic selector tracking with dependency health, circular detection, and unchanged Kea lifecycle behavior.
+        - generic [ref=e823]:
+          - generic [ref=e824]: 官方 32% · 36m 14s
+          - emphasis [ref=e825]: 无本地历史
+      - article [ref=e826]:
+        - generic [ref=e827] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e828]
+          - text: 选择任务
+        - generic [ref=e829]:
+          - generic [ref=e830]:
+            - generic [ref=e831]: TASK-051
+            - text: go
+          - generic [ref=e832]: feature_request
+        - heading "Add consistent hash policy support to TrafficPolicy" [level=2] [ref=e833]
+        - code [ref=e834]: kgateway-consistent-hash-policy
+        - paragraph [ref=e835]: Add spec.consistentHash to TrafficPolicy and merge it into route hash_policy generation.
+        - generic [ref=e836]:
+          - generic [ref=e837]: 官方 37% · 33m 52s
+          - emphasis [ref=e838]: 无本地历史
+      - article [ref=e839]:
+        - generic [ref=e840] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e841]
+          - text: 选择任务
+        - generic [ref=e842]:
+          - generic [ref=e843]:
+            - generic [ref=e844]: TASK-052
+            - text: python
+          - generic [ref=e845]: feature_request
+        - heading "Add single-active-consumer priority and cancel tracking to virtual transports" [level=2] [ref=e846]
+        - code [ref=e847]: kombu-single-active-consumer-priority
+        - paragraph [ref=e848]: Add single-active-consumer semantics, consumer priority selection, cancel notifications, and lifecycle tracking to virtual transports.
+        - generic [ref=e849]:
+          - generic [ref=e850]: 官方 52% · 20m 22s
+          - emphasis [ref=e851]: 无本地历史
+      - article [ref=e852]:
+        - generic [ref=e853] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e854]
+          - text: 选择任务
+        - generic [ref=e855]:
+          - generic [ref=e856]:
+            - generic [ref=e857]: TASK-053
+            - text: python
+          - generic [ref=e858]: feature_request
+        - heading "Add dead-lettering, TTL, and overflow handling to virtual queues" [level=2] [ref=e859]
+        - code [ref=e860]: kombu-virtual-queue-dead-lettering
+        - paragraph [ref=e861]: Add dead-letter routing, TTL expiry, and max-length overflow handling to the virtual transport layer.
+        - generic [ref=e862]:
+          - generic [ref=e863]: 官方 18% · 20m 51s
+          - emphasis [ref=e864]: 无本地历史
+      - article [ref=e865]:
+        - generic [ref=e866] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e867]
+          - text: 选择任务
+        - generic [ref=e868]:
+          - generic [ref=e869]:
+            - generic [ref=e870]: TASK-054
+            - text: typescript
+          - generic [ref=e871]: feature_request
+        - heading "Add composite trait aspects to Koota" [level=2] [ref=e872]
+        - code [ref=e873]: koota-composite-trait-aspects
+        - paragraph [ref=e874]: Add createAspect and aspect-aware query operations that merge constituent traits and propagate writes and lifecycle events.
+        - generic [ref=e875]:
+          - generic [ref=e876]: 官方 30% · 29m 36s
+          - emphasis [ref=e877]: 无本地历史
+      - article [ref=e878]:
+        - generic [ref=e879] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e880]
+          - text: 选择任务
+        - generic [ref=e881]:
+          - generic [ref=e882]:
+            - generic [ref=e883]: TASK-055
+            - text: typescript
+          - generic [ref=e884]: feature_request
+        - heading "Add a deferred mutation buffer to batch entity changes" [level=2] [ref=e885]
+        - code [ref=e886]: koota-deferred-mutation-buffer
+        - paragraph [ref=e887]: Add a deferred command buffer that batches entity mutations during query iteration and flushes them at defined boundaries.
+        - generic [ref=e888]:
+          - generic [ref=e889]: 官方 25% · 27m 57s
+          - emphasis [ref=e890]: 无本地历史
+      - article [ref=e891]:
+        - generic [ref=e892] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e893]
+          - text: 选择任务
+        - generic [ref=e894]:
+          - generic [ref=e895]:
+            - generic [ref=e896]: TASK-056
+            - text: python
+          - generic [ref=e897]: feature_request
+        - heading "Add entity snapshot and rollback APIs to Koota" [level=2] [ref=e898]
+        - code [ref=e899]: koota-entity-snapshot-rollback
+        - paragraph [ref=e900]: Add snapshot, rollback, and diff APIs for entities and worlds, including registry-based trait and relation serialization.
+        - generic [ref=e901]:
+          - generic [ref=e902]: 官方 77% · 14m 52s
+          - emphasis [ref=e903]: 无本地历史
+      - article [ref=e904]:
+        - generic [ref=e905] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e906]
+          - text: 选择任务
+        - generic [ref=e907]:
+          - generic [ref=e908]:
+            - generic [ref=e909]: TASK-057
+            - text: typescript
+          - generic [ref=e910]: feature_request
+        - heading "Add pair-level relation tracking modifiers" [level=2] [ref=e911]
+        - code [ref=e912]: koota-pair-relation-tracking
+        - paragraph [ref=e913]: Tracking modifiers should distinguish changes to specific relation pairs, not just trait-level additions and removals.
+        - generic [ref=e914]:
+          - generic [ref=e915]: 官方 18% · 29m 42s
+          - emphasis [ref=e916]: 无本地历史
+      - article [ref=e917]:
+        - generic [ref=e918] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e919]
+          - text: 选择任务
+        - generic [ref=e920]:
+          - generic [ref=e921]:
+            - generic [ref=e922]: TASK-058
+            - text: typescript
+          - generic [ref=e923]: feature_request
+        - heading "Add value-based query predicates to Koota" [level=2] [ref=e924]
+        - code [ref=e925]: koota-query-predicates
+        - paragraph [ref=e926]: Add composable value-based entity predicates with dependency tracking and change transitions.
+        - generic [ref=e927]:
+          - generic [ref=e928]: 官方 18% · 26m 50s
+          - emphasis [ref=e929]: 无本地历史
+      - article [ref=e930]:
+        - generic [ref=e931] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e932]
+          - text: 选择任务
+        - generic [ref=e933]:
+          - generic [ref=e934]:
+            - generic [ref=e935]: TASK-059
+            - text: typescript
+          - generic [ref=e936]: feature_request
+        - heading "Add grouping-set and window-frame SQL helpers" [level=2] [ref=e937]
+        - code [ref=e938]: kysely-window-grouping-helpers
+        - paragraph [ref=e939]: Add grouped aggregation clauses, window frame builders, null-handling modifiers, and related SQL function helpers.
+        - generic [ref=e940]:
+          - generic [ref=e941]: 官方 64% · 20m 32s
+          - emphasis [ref=e942]: 无本地历史
+      - article [ref=e943]:
+        - generic [ref=e944] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e945]
+          - text: 选择任务
+        - generic [ref=e946]:
+          - generic [ref=e947]:
+            - generic [ref=e948]: TASK-060
+            - text: python
+          - generic [ref=e949]: feature_request
+        - 'heading "Add request coalescing to `Runnable`" [level=2] [ref=e950]'
+        - code [ref=e951]: langchain-request-coalescing
+        - paragraph [ref=e952]: "Add `Runnable.with_coalesce()` so concurrent identical inputs share one execution across sync, async, streaming, and batch APIs."
+        - generic [ref=e953]:
+          - generic [ref=e954]: 官方 35% · 21m 28s
+          - emphasis [ref=e955]: 无本地历史
+      - article [ref=e956]:
+        - generic [ref=e957] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e958]
+          - text: 选择任务
+        - generic [ref=e959]:
+          - generic [ref=e960]:
+            - generic [ref=e961]: TASK-061
+            - text: python
+          - generic [ref=e962]: feature_request
+        - heading "Add flattened dataclass fields to Mashumaro field options" [level=2] [ref=e963]
+        - code [ref=e964]: mashumaro-flattened-dataclass-fields
+        - paragraph [ref=e965]: Add field_options support for flattening nested dataclass fields into parent dictionaries with prefix and rename validation.
+        - generic [ref=e966]:
+          - generic [ref=e967]: 官方 47% · 24m 17s
+          - emphasis [ref=e968]: 无本地历史
+      - article [ref=e969]:
+        - generic [ref=e970] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e971]
+          - text: 选择任务
+        - generic [ref=e972]:
+          - generic [ref=e973]:
+            - generic [ref=e974]: TASK-062
+            - text: typescript
+          - generic [ref=e975]: feature_request
+        - heading "Add explicit resource management declarations to the parser" [level=2] [ref=e976]
+        - code [ref=e977]: meriyah-explicit-resource-declarations
+        - paragraph [ref=e978]: "Add parsing and AST support for `using` and `await using` declarations, including context-sensitive errors."
+        - generic [ref=e979]:
+          - generic [ref=e980]: 官方 24% · 28m 34s
+          - emphasis [ref=e981]: 无本地历史
+      - article [ref=e982]:
+        - generic [ref=e983] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e984]
+          - text: 选择任务
+        - generic [ref=e985]:
+          - generic [ref=e986]:
+            - generic [ref=e987]: TASK-063
+            - text: python
+          - generic [ref=e988]: feature_request
+        - heading "Validate daemon watch, status, and log lifecycle" [level=2] [ref=e989]
+        - code [ref=e990]: mnamer-daemon-watch-lifecycle
+        - paragraph [ref=e991]: Add daemon watch validation, state tracking, logging, and lifecycle commands with non-blocking run-once processing.
+        - generic [ref=e992]:
+          - generic [ref=e993]: 官方 52% · 17m 46s
+          - emphasis [ref=e994]: 无本地历史
+      - article [ref=e995]:
+        - generic [ref=e996] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e997]
+          - text: 选择任务
+        - generic [ref=e998]:
+          - generic [ref=e999]:
+            - generic [ref=e1000]: TASK-064
+            - text: python
+          - generic [ref=e1001]: feature_request
+        - heading "Add grouped test phases with synchronized barriers" [level=2] [ref=e1002]
+        - code [ref=e1003]: mobly-grouped-test-barriers
+        - paragraph [ref=e1004]: Add grouped execution phases with explicit synchronization barriers and per-group setup and teardown.
+        - generic [ref=e1005]:
+          - generic [ref=e1006]: 官方 57% · 20m 43s
+          - emphasis [ref=e1007]: 无本地历史
+      - article [ref=e1008]:
+        - generic [ref=e1009] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1010]
+          - text: 选择任务
+        - generic [ref=e1011]:
+          - generic [ref=e1012]:
+            - generic [ref=e1013]: TASK-065
+            - text: python
+          - generic [ref=e1014]: feature_request
+        - heading "Add rolling min, max, median, and quantile methods" [level=2] [ref=e1015]
+        - code [ref=e1016]: narwhals-rolling-window-suite
+        - paragraph [ref=e1017]: Add the remaining rolling window methods to Expr and Series with consistent validation and backend delegation.
+        - generic [ref=e1018]:
+          - generic [ref=e1019]: 官方 87% · 24m 41s
+          - emphasis [ref=e1020]: 无本地历史
+      - article [ref=e1021]:
+        - generic [ref=e1022] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1023]
+          - text: 选择任务
+        - generic [ref=e1024]:
+          - generic [ref=e1025]:
+            - generic [ref=e1026]: TASK-066
+            - text: python
+          - generic [ref=e1027]: feature_request
+        - 'heading "Add boundary modes to `@stencil`" [level=2] [ref=e1028]'
+        - code [ref=e1029]: numba-stencil-boundary-modes
+        - paragraph [ref=e1030]: "Add configurable boundary handling modes to `@stencil` for out-of-bounds accesses."
+        - generic [ref=e1031]:
+          - generic [ref=e1032]: 官方 59% · 33m 60s
+          - emphasis [ref=e1033]: 无本地历史
+      - article [ref=e1034]:
+        - generic [ref=e1035] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1036]
+          - text: 选择任务
+        - generic [ref=e1037]:
+          - generic [ref=e1038]:
+            - generic [ref=e1039]: TASK-067
+            - text: typescript
+          - generic [ref=e1040]: feature_request
+        - heading "Add automatic table of contents generation for Obsidian linter" [level=2] [ref=e1041]
+        - code [ref=e1042]: obsidian-linter-auto-table-of-contents
+        - paragraph [ref=e1043]: Implement an opt-in rule that generates and updates a TOC from document headings.
+        - generic [ref=e1044]:
+          - generic [ref=e1045]: 官方 1% · 19m 29s
+          - emphasis [ref=e1046]: 无本地历史
+      - article [ref=e1047]:
+        - generic [ref=e1048] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1049]
+          - text: 选择任务
+        - generic [ref=e1050]:
+          - generic [ref=e1051]:
+            - generic [ref=e1052]: TASK-068
+            - text: typescript
+          - generic [ref=e1053]: feature_request
+        - heading "Add link format conversion between wiki and markdown syntax" [level=2] [ref=e1054]
+        - code [ref=e1055]: obsidian-linter-link-format-conversion
+        - paragraph [ref=e1056]: Add a Link Style rule that converts between Obsidian wiki links or embeds and markdown links or images while preserving ignored regions and edge cases.
+        - generic [ref=e1057]:
+          - generic [ref=e1058]: 官方 29% · 20m 4s
+          - emphasis [ref=e1059]: 无本地历史
+      - article [ref=e1060]:
+        - generic [ref=e1061] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1062]
+          - text: 选择任务
+        - generic [ref=e1063]:
+          - generic [ref=e1064]:
+            - generic [ref=e1065]: TASK-069
+            - text: typescript
+          - generic [ref=e1066]: feature_request
+        - heading "Add scoped per-rule ignore markers to Obsidian Linter" [level=2] [ref=e1067]
+        - code [ref=e1068]: obsidian-linter-scoped-ignore-markers
+        - paragraph [ref=e1069]: Implement standalone comment markers that disable and re-enable specific lint rules with nested scope handling.
+        - generic [ref=e1070]:
+          - generic [ref=e1071]: 官方 63% · 24m 29s
+          - emphasis [ref=e1072]: 无本地历史
+      - article [ref=e1073]:
+        - generic [ref=e1074] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1075]
+          - text: 选择任务
+        - generic [ref=e1076]:
+          - generic [ref=e1077]:
+            - generic [ref=e1078]: TASK-070
+            - text: typescript
+          - generic [ref=e1079]: feature_request
+        - heading "Add a per-origin circuit breaker to ofetch" [level=2] [ref=e1080]
+        - code [ref=e1081]: ofetch-per-origin-circuit-breaker
+        - paragraph [ref=e1082]: Add an opt-in per-origin circuit breaker for fetch requests with half-open probing and shared state across clients.
+        - generic [ref=e1083]:
+          - generic [ref=e1084]: 官方 76% · 23m 15s
+          - emphasis [ref=e1085]: 无本地历史
+      - article [ref=e1086]:
+        - generic [ref=e1087] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1088]
+          - text: 选择任务
+        - generic [ref=e1089]:
+          - generic [ref=e1090]:
+            - generic [ref=e1091]: TASK-071
+            - text: go
+          - generic [ref=e1092]: feature_request
+        - heading "Add transparent encryption to dump uploads" [level=2] [ref=e1093]
+        - code [ref=e1094]: onedump-dump-encryption-pipeline
+        - paragraph [ref=e1095]: Encrypt database dumps before upload and add keyed config, loading, and decryptable streaming support.
+        - generic [ref=e1096]:
+          - generic [ref=e1097]: 官方 27% · 18m 13s
+          - emphasis [ref=e1098]: 无本地历史
+      - article [ref=e1099]:
+        - generic [ref=e1100] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1101]
+          - text: 选择任务
+        - generic [ref=e1102]:
+          - generic [ref=e1103]:
+            - generic [ref=e1104]: TASK-072
+            - text: go
+          - generic [ref=e1105]: feature_request
+        - heading "Add rule evaluation profiling to Rego" [level=2] [ref=e1106]
+        - code [ref=e1107]: opa-rego-rule-profiling
+        - paragraph [ref=e1108]: Add opt-in per-rule evaluation profiling to Rego results with profiling stats and diff helpers.
+        - generic [ref=e1109]:
+          - generic [ref=e1110]: 官方 59% · 20m 37s
+          - emphasis [ref=e1111]: 无本地历史
+      - article [ref=e1112]:
+        - generic [ref=e1113] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1114]
+          - text: 选择任务
+        - generic [ref=e1115]:
+          - generic [ref=e1116]:
+            - generic [ref=e1117]: TASK-073
+            - text: go
+          - generic [ref=e1118]: bugfix
+        - heading "Reconstruct template strings in partial evaluation output" [level=2] [ref=e1119]
+        - code [ref=e1120]: opa-template-string-reconstruction
+        - paragraph [ref=e1121]: Rebuild lowered template strings into normal Rego syntax in partial evaluation outputs and support modules.
+        - generic [ref=e1122]:
+          - generic [ref=e1123]: 官方 55% · 36m 44s
+          - emphasis [ref=e1124]: 无本地历史
+      - article [ref=e1125]:
+        - generic [ref=e1126] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1127]
+          - text: 选择任务
+        - generic [ref=e1128]:
+          - generic [ref=e1129]:
+            - generic [ref=e1130]: TASK-074
+            - text: typescript
+          - generic [ref=e1131]: feature_request
+        - heading "Add conditional option dependencies to Optique" [level=2] [ref=e1132]
+        - code [ref=e1133]: optique-conditional-option-dependencies
+        - paragraph [ref=e1134]: Add conditional dependencies so options can require or hide based on other option presence or values.
+        - generic [ref=e1135]:
+          - generic [ref=e1136]: 官方 27% · 24m 24s
+          - emphasis [ref=e1137]: 无本地历史
+      - article [ref=e1138]:
+        - generic [ref=e1139] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1140]
+          - text: 选择任务
+        - generic [ref=e1141]:
+          - generic [ref=e1142]:
+            - generic [ref=e1143]: TASK-075
+            - text: rust
+          - generic [ref=e1144]: enhancement
+        - heading "Preserve structure needed by stylesheet selectors" [level=2] [ref=e1145]
+        - code [ref=e1146]: oxvg-structural-selector-preservation
+        - paragraph [ref=e1147]: Keep rewrite optimizations from breaking structure-dependent stylesheet selector matching.
+        - generic [ref=e1148]:
+          - generic [ref=e1149]: 官方 10% · 41m 34s
+          - emphasis [ref=e1150]: 无本地历史
+      - article [ref=e1151]:
+        - generic [ref=e1152] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1153]
+          - text: 选择任务
+        - generic [ref=e1154]:
+          - generic [ref=e1155]:
+            - generic [ref=e1156]: TASK-076
+            - text: go
+          - generic [ref=e1157]: feature_request
+        - heading "Add build-time grammar conflict analysis to participle" [level=2] [ref=e1158]
+        - code [ref=e1159]: participle-grammar-conflict-analysis
+        - paragraph [ref=e1160]: Add build-time static analysis that detects ambiguous participle grammars and reports conflicts.
+        - generic [ref=e1161]:
+          - generic [ref=e1162]: 官方 21% · 21m 45s
+          - emphasis [ref=e1163]: 无本地历史
+      - article [ref=e1164]:
+        - generic [ref=e1165] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1166]
+          - text: 选择任务
+        - generic [ref=e1167]:
+          - generic [ref=e1168]:
+            - generic [ref=e1169]: TASK-077
+            - text: go
+          - generic [ref=e1170]: feature_request
+        - heading "Add durability callbacks and wait APIs for sync writes" [level=2] [ref=e1171]
+        - code [ref=e1172]: pebble-durability-wait-apis
+        - paragraph [ref=e1173]: Add batch durability callbacks, durability wait methods, notifications, and metrics for sync write commits.
+        - generic [ref=e1174]:
+          - generic [ref=e1175]: 官方 55% · 41m 55s
+          - emphasis [ref=e1176]: 无本地历史
+      - article [ref=e1177]:
+        - generic [ref=e1178] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1179]
+          - text: 选择任务
+        - generic [ref=e1180]:
+          - generic [ref=e1181]:
+            - generic [ref=e1182]: TASK-078
+            - text: rust
+          - generic [ref=e1183]: feature_request
+        - heading "Coalesce qualifying choices into character classes" [level=2] [ref=e1184]
+        - code [ref=e1185]: pest-character-class-coalescing
+        - paragraph [ref=e1186]: Add optimizer passes that collapse qualifying choice chains into merged character and negated character classes.
+        - generic [ref=e1187]:
+          - generic [ref=e1188]: 官方 13% · 23m 16s
+          - emphasis [ref=e1189]: 无本地历史
+      - article [ref=e1190]:
+        - generic [ref=e1191] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1192]
+          - text: 选择任务
+        - generic [ref=e1193]:
+          - generic [ref=e1194]:
+            - generic [ref=e1195]: TASK-079
+            - text: typescript
+          - generic [ref=e1196]: feature_request
+        - heading "Add transactional reload status and rollback tracking to Prometheus" [level=2] [ref=e1197]
+        - code [ref=e1198]: prometheus-transactional-reload-status
+        - paragraph [ref=e1199]: Add an opt-in transactional config reload mode with durable reload outcomes, rollback tracking, and an HTTP status endpoint.
+        - generic [ref=e1200]:
+          - generic [ref=e1201]: 官方 19% · 29m 9s
+          - emphasis [ref=e1202]: 无本地历史
+      - article [ref=e1203]:
+        - generic [ref=e1204] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1205]
+          - text: 选择任务
+        - generic [ref=e1206]:
+          - generic [ref=e1207]:
+            - generic [ref=e1208]: TASK-080
+            - text: go
+          - generic [ref=e1209]: bugfix
+        - heading "Fix PromQL label sorting across typed and untyped values" [level=2] [ref=e1210]
+        - code [ref=e1211]: prometheus-typed-label-sorting
+        - paragraph [ref=e1212]: PromQL label sorting must order mixed typed and untyped label values with stable typed comparison rules.
+        - generic [ref=e1213]:
+          - generic [ref=e1214]: 官方 46% · 25m 12s
+          - emphasis [ref=e1215]: 无本地历史
+      - article [ref=e1216]:
+        - generic [ref=e1217] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1218]
+          - text: 选择任务
+        - generic [ref=e1219]:
+          - generic [ref=e1220]:
+            - generic [ref=e1221]: TASK-081
+            - text: python
+          - generic [ref=e1222]: feature_request
+        - heading "Add typed blend range access and blend-if compositing" [level=2] [ref=e1223]
+        - code [ref=e1224]: psd-tools-blend-range-api
+        - paragraph [ref=e1225]: Add typed blend range objects, persist them on layers, and apply blend-if during compositing.
+        - generic [ref=e1226]:
+          - generic [ref=e1227]: 官方 80% · 14m 3s
+          - emphasis [ref=e1228]: 无本地历史
+      - article [ref=e1229]:
+        - generic [ref=e1230] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1231]
+          - text: 选择任务
+        - generic [ref=e1232]:
+          - generic [ref=e1233]:
+            - generic [ref=e1234]: TASK-082
+            - text: python
+          - generic [ref=e1235]: feature_request
+        - heading "Add tube multiplexing to pwntools" [level=2] [ref=e1236]
+        - code [ref=e1237]: pwntools-tube-multiplexing
+        - paragraph [ref=e1238]: Add a TubeMultiplexer and MuxChannel API for multiple bidirectional logical channels over one tube, with flow control and close propagation.
+        - generic [ref=e1239]:
+          - generic [ref=e1240]: 官方 32% · 19m 40s
+          - emphasis [ref=e1241]: 无本地历史
+      - article [ref=e1242]:
+        - generic [ref=e1243] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1244]
+          - text: 选择任务
+        - generic [ref=e1245]:
+          - generic [ref=e1246]:
+            - generic [ref=e1247]: TASK-083
+            - text: python
+          - generic [ref=e1248]: feature_request
+        - heading "Add scoped state data to state machine callbacks and history" [level=2] [ref=e1249]
+        - code [ref=e1250]: python-statemachine-state-data-scoping
+        - paragraph [ref=e1251]: Add per-state scoped data ownership with lifecycle resets, callback injection, history restoration, and validation.
+        - generic [ref=e1252]:
+          - generic [ref=e1253]: 官方 27% · 28m 22s
+          - emphasis [ref=e1254]: 无本地历史
+      - article [ref=e1255]:
+        - generic [ref=e1256] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1257]
+          - text: 选择任务
+        - generic [ref=e1258]:
+          - generic [ref=e1259]:
+            - generic [ref=e1260]: TASK-084
+            - text: typescript
+          - generic [ref=e1261]: feature_request
+        - heading "Preserve restored query state in persisted snapshots" [level=2] [ref=e1262]
+        - code [ref=e1263]: query-persist-restored-query-state
+        - paragraph [ref=e1264]: Preserve full persisted query state, including errors, counters, timestamps, and infinite pagination, during restoration and cache rebuilds.
+        - generic [ref=e1265]:
+          - generic [ref=e1266]: 官方 69% · 22m 57s
+          - emphasis [ref=e1267]: 无本地历史
+      - article [ref=e1268]:
+        - generic [ref=e1269] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1270]
+          - text: 选择任务
+        - generic [ref=e1271]:
+          - generic [ref=e1272]:
+            - generic [ref=e1273]: TASK-085
+            - text: typescript
+          - generic [ref=e1274]: feature_request
+        - heading "Reuse one toolbar across multiple Quill editors" [level=2] [ref=e1275]
+        - code [ref=e1276]: quill-shared-toolbar-focus
+        - paragraph [ref=e1277]: Allow multiple Quill editors to share one toolbar container while routing toolbar actions and UI state to the currently active editor.
+        - generic [ref=e1278]:
+          - generic [ref=e1279]: 官方 26% · 23m 56s
+          - emphasis [ref=e1280]: 无本地历史
+      - article [ref=e1281]:
+        - generic [ref=e1282] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1283]
+          - text: 选择任务
+        - generic [ref=e1284]:
+          - generic [ref=e1285]:
+            - generic [ref=e1286]: TASK-086
+            - text: python
+          - generic [ref=e1287]: feature_request
+        - heading "Add an error-accumulating Validated container" [level=2] [ref=e1288]
+        - code [ref=e1289]: returns-validated-error-accumulation
+        - paragraph [ref=e1290]: Add a Validated container that accumulates errors while preserving standard container APIs.
+        - generic [ref=e1291]:
+          - generic [ref=e1292]: 官方 80% · 17m 46s
+          - emphasis [ref=e1293]: 无本地历史
+      - article [ref=e1294]:
+        - generic [ref=e1295] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1296]
+          - text: 选择任务
+        - generic [ref=e1297]:
+          - generic [ref=e1298]:
+            - generic [ref=e1299]: TASK-087
+            - text: go
+          - generic [ref=e1300]: feature_request
+        - heading "Add bounded-memory spilling to SCC aggregation" [level=2] [ref=e1301]
+        - code [ref=e1302]: scc-bounded-memory-spilling
+        - paragraph [ref=e1303]: Add an opt-in bounded-memory mode that spills per-file aggregation results to disk without changing output.
+        - generic [ref=e1304]:
+          - generic [ref=e1305]: 官方 59% · 20m 34s
+          - emphasis [ref=e1306]: 无本地历史
+      - article [ref=e1307]:
+        - generic [ref=e1308] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1309]
+          - text: 选择任务
+        - generic [ref=e1310]:
+          - generic [ref=e1311]:
+            - generic [ref=e1312]: TASK-088
+            - text: go
+          - generic [ref=e1313]: feature_request
+        - heading "Add method declarations and interface dispatch to Scriggo" [level=2] [ref=e1314]
+        - code [ref=e1315]: scriggo-method-declarations
+        - paragraph [ref=e1316]: Implement method declarations with receiver handling, method expressions, and interface satisfaction for Scriggo-defined types.
+        - generic [ref=e1317]:
+          - generic [ref=e1318]: 官方 54% · 44m 43s
+          - emphasis [ref=e1319]: 无本地历史
+      - article [ref=e1320]:
+        - generic [ref=e1321] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1322]
+          - text: 选择任务
+        - generic [ref=e1323]:
+          - generic [ref=e1324]:
+            - generic [ref=e1325]: TASK-089
+            - text: python
+          - generic [ref=e1326]: feature_request
+        - heading "Add duration encoding to TableVectorizer" [level=2] [ref=e1327]
+        - code [ref=e1328]: skrub-duration-encoding
+        - paragraph [ref=e1329]: Add a DurationEncoder, duration selector, and duration routing in TableVectorizer.
+        - generic [ref=e1330]:
+          - generic [ref=e1331]: 官方 53% · 24m 52s
+          - emphasis [ref=e1332]: 无本地历史
+      - article [ref=e1333]:
+        - generic [ref=e1334] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1335]
+          - text: 选择任务
+        - generic [ref=e1336]:
+          - generic [ref=e1337]:
+            - generic [ref=e1338]: TASK-090
+            - text: typescript
+          - generic [ref=e1339]: feature_request
+        - heading "Format BigQuery pipe syntax queries correctly" [level=2] [ref=e1340]
+        - code [ref=e1341]: sql-formatter-bigquery-pipe-formatting
+        - paragraph [ref=e1342]: Add parsing and formatting support for BigQuery pipe syntax queries without changing traditional SQL formatting.
+        - generic [ref=e1343]:
+          - generic [ref=e1344]: 官方 80% · 19m 4s
+          - emphasis [ref=e1345]: 无本地历史
+      - article [ref=e1346]:
+        - generic [ref=e1347] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1348]
+          - text: 选择任务
+        - generic [ref=e1349]:
+          - generic [ref=e1350]:
+            - generic [ref=e1351]: TASK-091
+            - text: python
+          - generic [ref=e1352]: feature_request
+        - heading "Format CREATE TABLE DDL and add DDL parsing helpers" [level=2] [ref=e1353]
+        - code [ref=e1354]: sqlfmt-create-table-ddl-formatting
+        - paragraph [ref=e1355]: Format CREATE TABLE statements with DDL-aware line breaking and add parsing models for table columns and constraints.
+        - generic [ref=e1356]:
+          - generic [ref=e1357]: 官方 22% · 29m 41s
+          - emphasis [ref=e1358]: 无本地历史
+      - article [ref=e1359]:
+        - generic [ref=e1360] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1361]
+          - text: 选择任务
+        - generic [ref=e1362]:
+          - generic [ref=e1363]:
+            - generic [ref=e1364]: TASK-092
+            - text: python
+          - generic [ref=e1365]: feature_request
+        - heading "Add safe import checkpoints and invariant validation" [level=2] [ref=e1366]
+        - code [ref=e1367]: sqlite-utils-safe-import-checkpoints
+        - paragraph [ref=e1368]: Add safe bulk import checkpoints, invariant validation, and rollback-on-failure behavior.
+        - generic [ref=e1369]:
+          - generic [ref=e1370]: 官方 48% · 19m 46s
+          - emphasis [ref=e1371]: 无本地历史
+      - article [ref=e1372]:
+        - generic [ref=e1373] [cursor=pointer]:
+          - checkbox "已选择" [checked] [ref=e1374]
+          - text: 已选择
+        - generic [ref=e1375]:
+          - generic [ref=e1376]:
+            - generic [ref=e1377]: TASK-093
+            - text: typescript
+          - generic [ref=e1378]: feature_request
+        - heading "Add error stack serialization to SuperJSON" [level=2] [ref=e1379]
+        - code [ref=e1380]: superjson-error-stack-serialization
+        - paragraph [ref=e1381]: Add configurable serialization and restoration of error stacks, stack frames, causes, and sanitization in SuperJSON.
+        - generic [ref=e1382]:
+          - generic [ref=e1383]: 官方 34% · 28m 19s
+          - emphasis [ref=e1384]: 无本地历史
+      - article [ref=e1385]:
+        - generic [ref=e1386] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1387]
+          - text: 选择任务
+        - generic [ref=e1388]:
+          - generic [ref=e1389]:
+            - generic [ref=e1390]: TASK-094
+            - text: go
+          - generic [ref=e1391]: feature_request
+        - heading "Add task graph export with JSON, DOT, and text output" [level=2] [ref=e1392]
+        - code [ref=e1393]: task-task-graph-export
+        - paragraph [ref=e1394]: Add a graph export command for tasks with JSON, DOT, and text output, including reverse traversal and status control.
+        - generic [ref=e1395]:
+          - generic [ref=e1396]: 官方 71% · 21m 34s
+          - emphasis [ref=e1397]: 无本地历史
+      - article [ref=e1398]:
+        - generic [ref=e1399] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1400]
+          - text: 选择任务
+        - generic [ref=e1401]:
+          - generic [ref=e1402]:
+            - generic [ref=e1403]: TASK-095
+            - text: go
+          - generic [ref=e1404]: bugfix
+        - heading "Fix isolated Go-side calls for Tengo callables and closures" [level=2] [ref=e1405]
+        - code [ref=e1406]: tengo-callable-instance-isolation
+        - paragraph [ref=e1407]: Enable Go-side invocation of exported Tengo functions and closures while preserving runtime context and isolating compiled-instance state.
+        - generic [ref=e1408]:
+          - generic [ref=e1409]: 官方 59% · 21m 35s
+          - emphasis [ref=e1410]: 无本地历史
+      - article [ref=e1411]:
+        - generic [ref=e1412] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1413]
+          - text: 选择任务
+        - generic [ref=e1414]:
+          - generic [ref=e1415]:
+            - generic [ref=e1416]: TASK-096
+            - text: go
+          - generic [ref=e1417]: feature_request
+        - heading "Add destructuring bindings to Tengo" [level=2] [ref=e1418]
+        - code [ref=e1419]: tengo-destructuring-bindings
+        - paragraph [ref=e1420]: "Add destructuring bindings for `:=` in arrays, maps, and function parameters."
+        - generic [ref=e1421]:
+          - generic [ref=e1422]: 官方 48% · 21m 33s
+          - emphasis [ref=e1423]: 无本地历史
+      - article [ref=e1424]:
+        - generic [ref=e1425] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1426]
+          - text: 选择任务
+        - generic [ref=e1427]:
+          - generic [ref=e1428]:
+            - generic [ref=e1429]: TASK-097
+            - text: go
+          - generic [ref=e1430]: feature_request
+        - heading "Preserve ANSI resets during truncation and styling" [level=2] [ref=e1431]
+        - code [ref=e1432]: termenv-preserve-ansi-resets
+        - paragraph [ref=e1433]: Add ANSI tokenization, reset-preserving truncation, and style-aware output helpers.
+        - generic [ref=e1434]:
+          - generic [ref=e1435]: 官方 16% · 22m 20s
+          - emphasis [ref=e1436]: 无本地历史
+      - article [ref=e1437]:
+        - generic [ref=e1438] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1439]
+          - text: 选择任务
+        - generic [ref=e1440]:
+          - generic [ref=e1441]:
+            - generic [ref=e1442]: TASK-098
+            - text: javascript
+          - generic [ref=e1443]: feature_request
+        - heading "Add bail-on-test-failure handling to Testem" [level=2] [ref=e1444]
+        - code [ref=e1445]: testem-bail-on-test-failure
+        - paragraph [ref=e1446]: Add configurable early bailout on test failures across runners, reporters, and exit codes.
+        - generic [ref=e1447]:
+          - generic [ref=e1448]: 官方 13% · 22m 25s
+          - emphasis [ref=e1449]: 无本地历史
+      - article [ref=e1450]:
+        - generic [ref=e1451] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1452]
+          - text: 选择任务
+        - generic [ref=e1453]:
+          - generic [ref=e1454]:
+            - generic [ref=e1455]: TASK-099
+            - text: javascript
+          - generic [ref=e1456]: feature_request
+        - heading "Partition report files by launcher and expand report templates" [level=2] [ref=e1457]
+        - code [ref=e1458]: testem-per-launcher-reports
+        - paragraph [ref=e1459]: Split report output into per-launcher files with template expansion, launcher-safe filenames, and per-launcher summaries.
+        - generic [ref=e1460]:
+          - generic [ref=e1461]: 官方 65% · 15m 30s
+          - emphasis [ref=e1462]: 无本地历史
+      - article [ref=e1463]:
+        - generic [ref=e1464] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1465]
+          - text: 选择任务
+        - generic [ref=e1466]:
+          - generic [ref=e1467]:
+            - generic [ref=e1468]: TASK-100
+            - text: python
+          - generic [ref=e1469]: feature_request
+        - heading "Complete Kitty keyboard phases and stable fallback key metadata" [level=2] [ref=e1470]
+        - code [ref=e1471]: textual-kitty-key-phases
+        - paragraph [ref=e1472]: Add full Kitty keyboard phase handling and stable fallback key metadata for keys and shortcuts.
+        - generic [ref=e1473]:
+          - generic [ref=e1474]: 官方 28% · 19m 12s
+          - emphasis [ref=e1475]: 无本地历史
+      - article [ref=e1476]:
+        - generic [ref=e1477] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1478]
+          - text: 选择任务
+        - generic [ref=e1479]:
+          - generic [ref=e1480]:
+            - generic [ref=e1481]: TASK-101
+            - text: python
+          - generic [ref=e1482]: feature_request
+        - heading "Restore RichLog follow-state parity and expand reflow behavior" [level=2] [ref=e1483]
+        - code [ref=e1484]: textual-richlog-follow-state
+        - paragraph [ref=e1485]: Restore RichLog follow-mode parity with Log and preserve expand reflow behavior for justified writes.
+        - generic [ref=e1486]:
+          - generic [ref=e1487]: 官方 65% · 20m 51s
+          - emphasis [ref=e1488]: 无本地历史
+      - article [ref=e1489]:
+        - generic [ref=e1490] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1491]
+          - text: 选择任务
+        - generic [ref=e1492]:
+          - generic [ref=e1493]:
+            - generic [ref=e1494]: TASK-102
+            - text: python
+          - generic [ref=e1495]: feature_request
+        - heading "Add bidirectional TOML table converters" [level=2] [ref=e1496]
+        - code [ref=e1497]: tomlkit-toml-table-converters
+        - paragraph [ref=e1498]: Add in-place conversion helpers between standard tables, inline tables, dotted keys, and super tables while preserving comments and round-trip integrity.
+        - generic [ref=e1499]:
+          - generic [ref=e1500]: 官方 58% · 22m 54s
+          - emphasis [ref=e1501]: 无本地历史
+      - article [ref=e1502]:
+        - generic [ref=e1503] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1504]
+          - text: 选择任务
+        - generic [ref=e1505]:
+          - generic [ref=e1506]:
+            - generic [ref=e1507]: TASK-103
+            - text: typescript
+          - generic [ref=e1508]: feature_request
+        - heading "Add iterable collection combinators to true-myth" [level=2] [ref=e1509]
+        - code [ref=e1510]: true-myth-iterable-collection-combinators
+        - paragraph [ref=e1511]: Add iterable-aware sequence, traverse, zip, filtering, and task combinators across Maybe, Result, Task, and toolbelt APIs.
+        - generic [ref=e1512]:
+          - generic [ref=e1513]: 官方 86% · 15m 18s
+          - emphasis [ref=e1514]: 无本地历史
+      - article [ref=e1515]:
+        - generic [ref=e1516] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1517]
+          - text: 选择任务
+        - generic [ref=e1518]:
+          - generic [ref=e1519]:
+            - generic [ref=e1520]: TASK-104
+            - text: typescript
+          - generic [ref=e1521]: feature_request
+        - 'heading "Add `matchEach` to ts-pattern" [level=2] [ref=e1522]'
+        - code [ref=e1523]: ts-pattern-match-each
+        - paragraph [ref=e1524]: "Add a new `matchEach` matcher that evaluates all matching clauses and returns all results in order."
+        - generic [ref=e1525]:
+          - generic [ref=e1526]: 官方 71% · 11m 32s
+          - emphasis [ref=e1527]: 无本地历史
+      - article [ref=e1528]:
+        - generic [ref=e1529] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1530]
+          - text: 选择任务
+        - generic [ref=e1531]:
+          - generic [ref=e1532]:
+            - generic [ref=e1533]: TASK-105
+            - text: go
+          - generic [ref=e1534]: feature_request
+        - heading "Add policy-based alerting for failures, latency, and SSL expiry" [level=2] [ref=e1535]
+        - code [ref=e1536]: updo-policy-alerting
+        - paragraph [ref=e1537]: Add policy-driven alerting with consecutive failure, latency, recovery, and SSL expiry notifications.
+        - generic [ref=e1538]:
+          - generic [ref=e1539]: 官方 12% · 17m 47s
+          - emphasis [ref=e1540]: 无本地历史
+      - article [ref=e1541]:
+        - generic [ref=e1542] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1543]
+          - text: 选择任务
+        - generic [ref=e1544]:
+          - generic [ref=e1545]:
+            - generic [ref=e1546]: TASK-106
+            - text: typescript
+          - generic [ref=e1547]: feature_request
+        - heading "Add recursive schema composition to Valibot" [level=2] [ref=e1548]
+        - code [ref=e1549]: valibot-recursive-schema-composition
+        - paragraph [ref=e1550]: "Add first-class recursive schema composition with `Recur`, `recursive(...)`, and `recursiveAsync(...)` wrappers."
+        - generic [ref=e1551]:
+          - generic [ref=e1552]: 官方 63% · 40m 1s
+          - emphasis [ref=e1553]: 无本地历史
+      - article [ref=e1554]:
+        - generic [ref=e1555] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1556]
+          - text: 选择任务
+        - generic [ref=e1557]:
+          - generic [ref=e1558]:
+            - generic [ref=e1559]: TASK-107
+            - text: typescript
+          - generic [ref=e1560]: feature_request
+        - heading "Add duration-aware sharding to Vitest" [level=2] [ref=e1561]
+        - code [ref=e1562]: vitest-duration-sharding
+        - paragraph [ref=e1563]: Add duration-aware sharding strategies and duration history handling for Vitest.
+        - generic [ref=e1564]:
+          - generic [ref=e1565]: 官方 73% · 23m 51s
+          - emphasis [ref=e1566]: 无本地历史
+      - article [ref=e1567]:
+        - generic [ref=e1568] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1569]
+          - text: 选择任务
+        - generic [ref=e1570]:
+          - generic [ref=e1571]:
+            - generic [ref=e1572]: TASK-108
+            - text: python
+          - generic [ref=e1573]: feature_request
+        - heading "Add a persistent analysis cache to Vulture" [level=2] [ref=e1574]
+        - code [ref=e1575]: vulture-persistent-analysis-cache
+        - paragraph [ref=e1576]: Add a persistent cache so Vulture can reuse unchanged analysis across runs.
+        - generic [ref=e1577]:
+          - generic [ref=e1578]: 官方 32% · 19m 47s
+          - emphasis [ref=e1579]: 无本地历史
+      - article [ref=e1580]:
+        - generic [ref=e1581] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1582]
+          - text: 选择任务
+        - generic [ref=e1583]:
+          - generic [ref=e1584]:
+            - generic [ref=e1585]: TASK-109
+            - text: rust
+          - generic [ref=e1586]: feature_request
+        - heading "Add trap coredump generation to wasmi" [level=2] [ref=e1587]
+        - code [ref=e1588]: wasmi-trap-coredumps
+        - paragraph [ref=e1589]: Generate opt-in Wasm coredumps on traps and attach the bytes to errors.
+        - generic [ref=e1590]:
+          - generic [ref=e1591]: 官方 61% · 30m 27s
+          - emphasis [ref=e1592]: 无本地历史
+      - article [ref=e1593]:
+        - generic [ref=e1594] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1595]
+          - text: 选择任务
+        - generic [ref=e1596]:
+          - generic [ref=e1597]:
+            - generic [ref=e1598]: TASK-110
+            - text: go
+          - generic [ref=e1599]: feature_request
+        - heading "Add multi-module memory snapshots to wazero" [level=2] [ref=e1600]
+        - code [ref=e1601]: wazero-multi-module-snapshots
+        - paragraph [ref=e1602]: Add coordinated capture, restore, diff, and serialization for multi-module memory snapshots.
+        - generic [ref=e1603]:
+          - generic [ref=e1604]: 官方 74% · 16m 22s
+          - emphasis [ref=e1605]: 无本地历史
+      - article [ref=e1606]:
+        - generic [ref=e1607] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1608]
+          - text: 选择任务
+        - generic [ref=e1609]:
+          - generic [ref=e1610]:
+            - generic [ref=e1611]: TASK-111
+            - text: go
+          - generic [ref=e1612]: feature_request
+        - heading "Add go:embed directive support for interpreted packages" [level=2] [ref=e1613]
+        - code [ref=e1614]: yaegi-go-embed-directives
+        - paragraph [ref=e1615]: Support //go:embed directives so interpreted package variables can receive embedded file contents and embed.FS values.
+        - generic [ref=e1616]:
+          - generic [ref=e1617]: 官方 59% · 28m 58s
+          - emphasis [ref=e1618]: 无本地历史
+      - article [ref=e1619]:
+        - generic [ref=e1620] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1621]
+          - text: 选择任务
+        - generic [ref=e1622]:
+          - generic [ref=e1623]:
+            - generic [ref=e1624]: TASK-112
+            - text: javascript
+          - generic [ref=e1625]: feature_request
+        - heading "Add deterministic map conflict detection to Y.Map writes" [level=2] [ref=e1626]
+        - code [ref=e1627]: yjs-map-conflict-detection
+        - paragraph [ref=e1628]: Add strict, deterministic conflict detection for Y.Map key writes with collect and error policies.
+        - generic [ref=e1629]:
+          - generic [ref=e1630]: 官方 73% · 23m 40s
+          - emphasis [ref=e1631]: 无本地历史
+      - article [ref=e1632]:
+        - generic [ref=e1633] [cursor=pointer]:
+          - checkbox "选择任务" [ref=e1634]
+          - text: 选择任务
+        - generic [ref=e1635]:
+          - generic [ref=e1636]:
+            - generic [ref=e1637]: TASK-113
+            - text: go
+          - generic [ref=e1638]: feature_request
+        - heading "Add JSONPath query APIs to orderedmap and Starlark modules" [level=2] [ref=e1639]
+        - code [ref=e1640]: ytt-jsonpath-query-api
+        - paragraph [ref=e1641]: Add orderedmap and Starlark JSONPath query APIs with selectors, filters, and syntax errors.
+        - generic [ref=e1642]:
+          - generic [ref=e1643]: 官方 74% · 19m 21s
+          - emphasis [ref=e1644]: 无本地历史
