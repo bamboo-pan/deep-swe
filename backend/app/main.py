@@ -235,7 +235,11 @@ def set_baseline(run_id:int,draft:BaselineDraft):
 
 @app.delete("/api/runs/{run_id}/baseline")
 def remove_baseline(run_id:int):
-    with SessionLocal() as db: db.execute(delete(Baseline).where(Baseline.run_id==run_id)); db.commit()
+    with SessionLocal() as db:
+        run=db.get(Run,run_id)
+        if not run: raise HTTPException(404,"run not found")
+        matching=db.scalars(select(Run.id).where(Run.agent==run.agent,Run.model==run.model,Run.reasoning_effort==run.reasoning_effort)).all()
+        db.execute(delete(Baseline).where(Baseline.run_id.in_(matching))); db.commit()
     return {"deleted":True}
 
 @app.get("/api/tasks")

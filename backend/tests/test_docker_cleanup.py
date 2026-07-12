@@ -187,3 +187,10 @@ def test_builder_prune_confirms_via_stdin_not_force(monkeypatch):
     assert "--force" not in args and "-f" not in args
     assert input_text == "y\n"
     assert "--filter" in args and "until=168h" in args
+
+def test_builder_prune_zero_retention_clears_all(monkeypatch):
+    calls = []
+    monkeypatch.setattr(dc, "_docker", lambda args, timeout=30, input_text=None: (calls.append(list(args)) or (True, "Total reclaimed space: 2GB", "")))
+    result = dc.prune_builder_cache(0)
+    assert result["available"] is True
+    assert calls == [["builder", "prune", "--all"]]

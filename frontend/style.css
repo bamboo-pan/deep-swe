@@ -967,3 +967,7 @@ select {
   display: grid;
   gap: 2px;
 }
+.comparetask{margin-top:18px;border-top:1px solid #183028;padding-top:16px}.comparetable{display:grid;grid-template-columns:minmax(180px,1.4fr) .65fr .7fr 1.35fr .65fr .45fr;overflow:auto}.comparetable>*{padding:11px 9px;border-bottom:1px solid #183028;min-width:0}.comparetable>span:nth-child(6n+1){display:grid;gap:3px}.comparetable small{color:#607e73;font:10px "IBM Plex Mono"}
+.retentionselect{display:flex!important;align-items:center;gap:8px}.retentionselect select{width:auto;min-width:90px}
+.emptytasklink{margin:14px 0;padding:18px;border:1px dashed #285444;border-radius:8px;text-align:center;color:#809b91}.emptytasklink .textbutton{margin-left:6px;color:#47dda5}
+.comparefilters{display:grid;grid-template-columns:repeat(4,minmax(150px,1fr));gap:12px;margin:16px 0}.comparefilters label{display:grid;gap:6px;color:#809b91}.comparegroup{margin-top:18px}.comparegroup>h3{color:#47dda5;font:700 12px "IBM Plex Mono";padding:0 4px}

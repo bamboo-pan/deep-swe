@@ -111,6 +111,7 @@ type Run = {
     reasons: string[];
     baseline_name: string;
     pass_rate_delta: number;
+    baseline_type?: "official" | "custom";
   } | null;
   input_tokens?: number;
   cached_tokens?: number;
@@ -264,9 +265,7 @@ function App() {
       setModel(x.defaults.model);
       setEffort(x.defaults.reasoning_effort);
       setConcurrency(x.defaults.concurrency);
-      setSelectedTasks(
-        x.task_suite.tasks.filter((t) => t.available).map((t) => t.id),
-      );
+      setSelectedTasks([]);
     });
     refresh();
     const id = setInterval(refreshRuns, 4000);
@@ -283,7 +282,7 @@ function App() {
         .then((d) => {
           if (closed) return; // 快速切换运行时丢弃过期响应
           latestStatus = d.status;
-          setDetail(d);
+        setDetail(terminal.has(d.status) && tab === "live" ? null : d);
         })
         .catch(() => {});
     const connect = () => {
@@ -293,7 +292,7 @@ function App() {
         const next = JSON.parse(e.data);
         latestStatus = next.status;
         // SSE 后端已附带 regression；万一缺失则保留上次值，避免回归横幅闪现后被抹掉
-        setDetail((prev) => ({
+        setDetail((prev) => terminal.has(next.status) && tab === "live" ? null : ({
           ...next,
           regression: next.regression ?? prev?.regression ?? null,
         }));
@@ -321,7 +320,7 @@ function App() {
       clearTimeout(retryTimer);
       source?.close();
     };
-  }, [selectedRun]);
+  }, [selectedRun, tab]);
   useEffect(() => {
     if (tab === "tasks" && !tasks.length)
       request<TaskInfo[]>("/api/tasks").then(setTasks);
@@ -475,6 +474,13 @@ function App() {
     });
     setDetail(await request<Run>(`/api/runs/${detail.id}`));
     refreshRuns();
+  };
+  const resetBaseline = async () => {
+    if (!detail) return;
+    await request(`/api/runs/${detail.id}/baseline`, { method: "DELETE" });
+    setDetail(await request<Run>(`/api/runs/${detail.id}`));
+    refreshRuns();
+    setNotice("已恢复 DeepSWE 官方基线");
   };
   const savePrefs = async () => {
     if (!prefs) return;
@@ -784,20 +790,9 @@ function App() {
                 <h3>{boot.task_suite.name}</h3>
                 <span>{selectedTasks.length} selected</span>
               </div>
-              <button
-                onClick={() =>
-                  setSelectedTasks(
-                    selectedTasks.length
-                      ? []
-                      : boot.task_suite.tasks
-                          .filter((t) => t.available)
-                          .map((t) => t.id),
-                  )
-                }
-              >
-                {selectedTasks.length ? "清空" : "选择默认七题"}
-              </button>
+              <button disabled={!selectedTasks.length} onClick={() => setSelectedTasks([])}>清空</button>
             </div>
+            {!selectedTasks.length && <div className="emptytasklink">未选择任务。<button className="textbutton" onClick={() => setTab("tasks")}>前往任务目录选择</button></div>}
             <div className="tasks">
               {boot.task_suite.tasks.map((t) => (
                 <label key={t.id} className={!t.available ? "disabled" : ""}>
@@ -862,7 +857,7 @@ function App() {
         {tab === "live" && (
           <Live
             runs={runs}
-            detail={detail}
+            detail={detail && !terminal.has(detail.status) ? detail : null}
             selectRun={(id) => {
               // 切换 Agent 视图时清掉上一个运行的 Trial 详情，防止 A 的 patch 挂在 B 下
               setSelectedRun(id);
@@ -884,6 +879,7 @@ function App() {
             activeTrial={activeTrial}
             trialLog={trialLog}
             baseline={baseline}
+            resetBaseline={resetBaseline}
             selected={selectedResults}
             setSelected={setSelectedResults}
             remove={deleteResults}
@@ -1063,6 +1059,7 @@ function Results({
   activeTrial,
   trialLog,
   baseline,
+  resetBaseline,
   selected,
   setSelected,
   remove,
@@ -1074,6 +1071,7 @@ function Results({
   activeTrial: Trial | null;
   trialLog: string;
   baseline: () => void;
+  resetBaseline: () => void;
   selected: number[];
   setSelected: (ids: number[]) => void;
   remove: () => void;
@@ -1148,8 +1146,8 @@ function Results({
               />
               <Metric label="Output" value={number(detail.output_tokens)} />
               <Metric
-                label="报告 / 估算费用"
-                value={`${money(detail.reported_cost_usd)} / ${money(detail.estimated_cost_usd)}`}
+                label="估算费用"
+                value={money(detail.estimated_cost_usd)}
               />
             </section>
             {detail.regression && (
@@ -1163,23 +1161,6 @@ function Results({
             <section className="panel">
               <div className="panelhead">
                 <h2>Trial 结果</h2>
-                <button
-                  className="secondary"
-                  disabled={detail.status !== "completed" || detail.is_baseline}
-                  onClick={baseline}
-                >
-                  {detail.is_baseline ? (
-                    <>
-                      <CheckCircle2 />
-                      当前基线
-                    </>
-                  ) : (
-                    <>
-                      <Database />
-                      设为基线
-                    </>
-                  )}
-                </button>
               </div>
               <div className="table">
                 <div className="tr">
@@ -1265,23 +1246,45 @@ function Compare({
   setSelected: (x: number[]) => void;
   comparison: any;
 }) {
+  const [taskFilter, setTaskFilter] = useState("all");
+  const [agentFilter, setAgentFilter] = useState("all");
+  const [modelFilter, setModelFilter] = useState("all");
+  const [effortFilter, setEffortFilter] = useState("all");
+  const taskNames = [...new Set(runs.flatMap((run) => run.tasks))].sort();
+  const filteredRuns = runs.filter((run) =>
+    (taskFilter === "all" || run.tasks.includes(taskFilter)) &&
+    (agentFilter === "all" || run.agent === agentFilter) &&
+    (modelFilter === "all" || run.model === modelFilter) &&
+    (effortFilter === "all" || run.reasoning_effort === effortFilter));
+  const groupedRuns = taskNames.filter((task) => taskFilter === "all" || task === taskFilter).map((task) => ({task, runs: filteredRuns.filter((run) => run.tasks.includes(task))})).filter((group) => group.runs.length);
+  const selectedRuns = runs.filter((run) => selected.includes(run.id));
+  const compatible = (candidate: Run) => {
+    const peers = selectedRuns.filter((run) => run.id !== candidate.id);
+    return !peers.length || peers.some((run) => run.tasks.some((task) => candidate.tasks.includes(task)));
+  };
   return (
     <>
       <section className="panel">
         <div className="panelhead">
           <div>
             <h2>选择运行</h2>
-            <p>最多 8 次；严格比较时请选择相同 agent、模型和配置。</p>
+            <p>最多 8 次，仅允许选择至少包含一个相同任务的运行；Agent、模型和思考强度可以不同。</p>
           </div>
           <b>{selected.length}/8</b>
         </div>
-        <div className="comparepick">
-          {runs.map((r) => (
+        <div className="comparefilters">
+          <label>Task<select value={taskFilter} onChange={(e)=>setTaskFilter(e.target.value)}><option value="all">全部任务</option>{taskNames.map(x=><option key={x} value={x}>{x}</option>)}</select></label>
+          <label>Agent<select value={agentFilter} onChange={(e)=>setAgentFilter(e.target.value)}><option value="all">全部 Agent</option>{[...new Set(runs.map(x=>x.agent))].map(x=><option key={x}>{x}</option>)}</select></label>
+          <label>模型<select value={modelFilter} onChange={(e)=>setModelFilter(e.target.value)}><option value="all">全部模型</option>{[...new Set(runs.map(x=>x.model))].map(x=><option key={x}>{x}</option>)}</select></label>
+          <label>思考强度<select value={effortFilter} onChange={(e)=>setEffortFilter(e.target.value)}><option value="all">全部强度</option>{[...new Set(runs.map(x=>x.reasoning_effort))].map(x=><option key={x}>{x}</option>)}</select></label>
+        </div>
+        {groupedRuns.map(group=><div className="comparegroup" key={group.task}><h3>{group.task}</h3><div className="comparepick">
+          {group.runs.map((r) => (
             <label key={r.id}>
               <input
                 type="checkbox"
                 checked={selected.includes(r.id)}
-                disabled={!selected.includes(r.id) && selected.length >= 8}
+                disabled={!selected.includes(r.id) && (selected.length >= 8 || !compatible(r))}
                 onChange={(e) =>
                   setSelected(
                     e.target.checked
@@ -1292,7 +1295,7 @@ function Compare({
               />
               <Status value={r.status} />
               <span>
-                {r.agent} · {r.reasoning_effort}
+                {r.agent} · {r.model} · {r.reasoning_effort}
               </span>
               <em>
                 <b>{r.run_code || `RUN-${String(r.id).padStart(6, "0")}`}</b>
@@ -1300,7 +1303,7 @@ function Compare({
               </em>
             </label>
           ))}
-        </div>
+        </div></div>)}
       </section>
       {comparison?.runs?.length > 0 && (
         <>
@@ -1315,32 +1318,21 @@ function Compare({
             ))}
           </section>
           <section className="panel">
-            <h2>Task × Run</h2>
-            <div className="heatmap">
-              <div></div>
-              {comparison.runs.map((r: Run) => (
-                <b key={r.id}>{r.run_code || `RUN-${String(r.id).padStart(6, "0")}`}</b>
-              ))}
-              {comparison.tasks.map((row: any) => (
-                <React.Fragment key={row.task}>
-                  <span className="heatmaptask">
-                    <b>{row.task_code}</b>
-                    <small>{row.task_title}</small>
-                  </span>
-                  {comparison.runs.map((r: Run) => {
-                    const v = row.runs[String(r.id)]?.pass_rate;
-                    return (
-                      <i
-                        key={r.id}
-                        style={{ opacity: v == null ? 0.18 : 0.25 + v * 0.75 }}
-                      >
-                        {v == null ? "—" : `${Math.round(v * 100)}%`}
-                      </i>
-                    );
-                  })}
-                </React.Fragment>
-              ))}
-            </div>
+            <h2>同任务详细对比</h2>
+            {!comparison.tasks.length ? <Empty text="所选运行没有共同任务。" /> : comparison.tasks.map((row: any) => (
+              <div className="comparetask" key={row.task}>
+                <h3>{row.task_code} · {row.task_title}</h3>
+                <div className="comparetable">
+                  <b>运行 / 基线</b><b>通过率</b><b>耗时</b><b>Input / Cache / Output</b><b>成本</b><b>步骤</b>
+                  <span>DeepSWE 官方</span><span>{row.official?.pass_rate == null ? "—" : `${Math.round(row.official.pass_rate * 100)}%`}</span><span>{duration(row.official?.avg_duration_seconds)}</span><span>{number(row.official?.avg_input_tokens)} / {number(row.official?.avg_cache_tokens)} / {number(row.official?.avg_output_tokens)}</span><span>{money(row.official?.avg_cost_usd)}</span><span>{row.official?.avg_steps ?? "—"}</span>
+                  {comparison.runs.map((r: Run) => { const v=row.runs[String(r.id)] || {}; return <React.Fragment key={r.id}>
+                    <span><b>{r.agent}</b><small>{r.model} · {r.reasoning_effort}</small></span>
+                    <span>{v.pass_rate == null ? "—" : `${Math.round(v.pass_rate * 100)}%`}</span><span>{duration(v.duration_seconds)}</span>
+                    <span>{number(v.input_tokens)} / {number(v.cached_tokens)} / {number(v.output_tokens)}</span><span>{money(v.cost_usd)}</span><span>{v.steps ?? "—"}</span>
+                  </React.Fragment>})}
+                </div>
+              </div>
+            ))}
           </section>
         </>
       )}
@@ -1832,10 +1824,11 @@ function DockerCard({
     }
     setBusy(false);
   };
-  const cleanCache = async () => {
+  const cleanCache = async (all = false) => {
     setBusy(true);
     try {
-      const info = await preview("build_cache");
+      const retention = all ? 0 : prefs.docker_cache_retention_hours;
+      const info = await request<any>("/api/docker/cleanup/preview", {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({scope:"build_cache",retention_hours:retention})});
       if (!info.available) {
         notify(`Docker 不可用：${info.error ?? ""}`);
         setBusy(false);
@@ -1843,15 +1836,15 @@ function DockerCard({
       }
       if (
         !confirm(
-          `将清理超过 ${prefs.docker_cache_retention_hours} 小时（${Math.round(prefs.docker_cache_retention_hours / 24)} 天）未使用的构建缓存\n` +
+          (all ? "将清空全部 Docker 构建缓存\n" : `将清理超过 ${retention} 小时（${Math.round(retention / 24)} 天）未使用的构建缓存\n`) +
             `当前缓存占用：${formatBytes(info.build_cache?.size_bytes)}，其中可回收：${formatBytes(info.build_cache?.reclaimable_bytes)}\n` +
-            "近期缓存将保留，下次运行仍可命中",
+            (all ? "下次运行可能需要重新构建镜像" : "近期缓存将保留，下次运行仍可命中"),
         )
       ) {
         setBusy(false);
         return;
       }
-      const result = await cleanup("build_cache");
+      const result = await request<any>("/api/docker/cleanup", {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({scope:"build_cache",retention_hours:retention})});
       notify(
         result.available
           ? `构建缓存清理完成，释放 ${result.reclaimed ?? "0B"}`
@@ -1921,6 +1914,11 @@ function DockerCard({
             </p>
           )}
           <div className="actions">
+            <label className="retentionselect">构建缓存保留
+              <select value={prefs.docker_cache_retention_hours} onChange={(e)=>saveDockerPrefs({...prefs,docker_cache_retention_hours:+e.target.value})}>
+                <option value={24}>1 天</option><option value={72}>3 天</option><option value={168}>7 天</option><option value={336}>14 天</option><option value={720}>30 天</option><option value={2160}>90 天</option>
+              </select>
+            </label>
             <button className="secondary" disabled={busy} onClick={load}>
               <RefreshCw />
               刷新
@@ -1943,11 +1941,12 @@ function DockerCard({
             <button
               className="secondary"
               disabled={busy || activeRuns > 0}
-              onClick={cleanCache}
+              onClick={() => cleanCache(false)}
             >
               <Trash2 />
               清理过期构建缓存
             </button>
+            <button className="danger" disabled={busy || activeRuns > 0} onClick={() => cleanCache(true)}><Trash2 />清空全部构建缓存</button>
           </div>
           {activeRuns > 0 && (
             <p className="muted">

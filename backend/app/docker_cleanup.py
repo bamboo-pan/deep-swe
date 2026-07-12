@@ -342,8 +342,11 @@ def preview_builder_cleanup(retention_hours: int) -> dict:
 
 def prune_builder_cache(retention_hours: int) -> dict:
     """带保留期的 BuildKit 缓存清理。经 stdin 确认，命令行不使用 --force。"""
+    command = ["builder", "prune", "--all"]
+    if retention_hours > 0:
+        command += ["--filter", f"until={retention_hours}h"]
     ok, out, err = _docker(
-        ["builder", "prune", "--all", "--filter", f"until={retention_hours}h"],
+        command,
         timeout=600, input_text="y\n")
     if not ok:
         return {"available": False, "error": err.strip() or "builder prune 失败"}

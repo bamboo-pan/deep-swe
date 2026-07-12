@@ -191,6 +191,12 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
     trial_folders = sorted((p for p in root.iterdir() if p.is_dir() and "__" in p.name), key=lambda p: p.name) if root.exists() else []
     expected_tasks = json.loads(run.tasks_json)
     trials = [_trial(folder, include_patch=include_patches, expected_tasks=expected_tasks) for folder in trial_folders]
+    if run.status in {"failed", "cancelled", "interrupted"}:
+        for trial in trials:
+            if trial["status"] not in {"completed", "failed"}:
+                trial["status"] = "failed"
+                trial["failure_type"] = trial.get("failure_type") or "RunTerminated"
+                trial["failure_message"] = trial.get("failure_message") or run.error
     # result.json 尚未写出时 trial 任务名回退到目录名（32 字符截断），归一回全名，
     # 否则占位补齐会产生幽灵 trial、compare 出现假任务行
     prefix_map = {}
@@ -205,7 +211,8 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
     existing_tasks = [trial["task"] for trial in trials]
     for task, attempt in expected:
         if existing_tasks.count(task) < attempt:
-            trials.append({"id": f"{task}#{attempt}", **task_identity(task), "status": "queued", "reward": None, "partial": None, "duration_seconds": None, "agent_duration_seconds": None, "input_tokens": None, "cached_tokens": None, "output_tokens": None, "reported_cost_usd": None, "steps": None, "patch": "", "patch_bytes": 0, "failure_type": None, "failure_message": None})
+            terminal = run.status in {"failed", "cancelled", "interrupted"}
+            trials.append({"id": f"{task}#{attempt}", **task_identity(task), "status": "failed" if terminal else "queued", "reward": None, "partial": None, "duration_seconds": None, "agent_duration_seconds": None, "input_tokens": None, "cached_tokens": None, "output_tokens": None, "reported_cost_usd": None, "steps": None, "patch": "", "patch_bytes": 0, "failure_type": "RunTerminated" if terminal else None, "failure_message": run.error if terminal else None})
     _enrich_trials(run, trials)
     completed = sum(t["status"] in {"completed", "failed"} for t in trials)
     passed = sum(t.get("reward") == 1 for t in trials)
@@ -244,13 +251,15 @@ def compare_runs(run_ids: list[int]) -> dict:
     with SessionLocal() as db:
         rows = [db.get(Run, run_id) for run_id in run_ids]
     details = [run_detail(row, include_patches=False) for row in rows if row]
-    task_names = sorted({trial["task"] for detail in details for trial in detail["trials"]})
+    task_names = sorted(set.intersection(*[set(detail["tasks"]) for detail in details])) if details else []
+    official = load_official_stats()
     matrix = []
     for task in task_names:
-        item = {**task_identity(task), "runs": {}}
+        item = {**task_identity(task), "runs": {}, "official": official.get(task) or None}
         for detail in details:
             values = [t for t in detail["trials"] if t["task"] == task and t.get("reward") is not None]
-            item["runs"][str(detail["id"])] = {"pass_rate": mean(t["reward"] == 1 for t in values) if values else None, "reward": mean(t["reward"] for t in values) if values else None}
+            durations = [t["duration_seconds"] for t in values if t.get("duration_seconds") is not None]
+            item["runs"][str(detail["id"])] = {"pass_rate": mean(t["reward"] == 1 for t in values) if values else None, "reward": mean(t["reward"] for t in values) if values else None, "duration_seconds": mean(durations) if durations else None, "input_tokens": sum(t.get("input_tokens") or 0 for t in values) or None, "cached_tokens": sum(t.get("cached_tokens") or 0 for t in values) or None, "output_tokens": sum(t.get("output_tokens") or 0 for t in values) or None, "cost_usd": sum(t.get("reported_cost_usd") or 0 for t in values) or None, "steps": sum(t.get("steps") or 0 for t in values) or None}
         matrix.append(item)
     return {"runs": details, "tasks": matrix}
 
@@ -294,27 +303,15 @@ def _regression_reasons(current: dict, baseline: dict) -> list[str]:
     return reasons
 
 def regression_for(run: Run, current: dict | None = None) -> dict | None:
-    with SessionLocal() as db:
-        baseline_row = db.scalar(select(Baseline).join(Run, Baseline.run_id == Run.id).where(Run.agent == run.agent, Run.model == run.model, Run.reasoning_effort == run.reasoning_effort).order_by(Baseline.created_at.desc()))
-        baseline_run = db.get(Run, baseline_row.run_id) if baseline_row else None
-    if not baseline_run or baseline_run.id == run.id:
-        return None
     current = current or run_detail(run, include_patches=False)
-    baseline_detail = run_detail(baseline_run, include_patches=False)
-    reasons = _regression_reasons(current, baseline_detail)
-    level = "ok"
-    if reasons:
-        # 一次异常黄色；相同配置连续两次异常升级红色
-        level = "warning"
-        with SessionLocal() as db:
-            previous = db.scalar(
-                select(Run).where(
-                    Run.agent == run.agent, Run.model == run.model, Run.reasoning_effort == run.reasoning_effort,
-                    Run.id < run.id, Run.id != baseline_run.id, Run.status == "completed",
-                ).order_by(Run.id.desc()))
-        if previous and _regression_reasons(run_detail(previous, include_patches=False), baseline_detail):
-            level = "danger"
-    return {"baseline_run_id": baseline_run.id, "baseline_name": baseline_row.name, "level": level, "reasons": reasons, "pass_rate_delta": _pass_rate(current) - _pass_rate(baseline_detail)}
+    official = load_official_stats()
+    comparable = [(trial, official.get(trial["task"])) for trial in current["trials"] if official.get(trial["task"], {}).get("pass_rate") is not None]
+    if not comparable: return None
+    local_rate = mean(t.get("reward") == 1 for t, _ in comparable)
+    official_rate = mean(s["pass_rate"] for _, s in comparable)
+    delta = local_rate - official_rate
+    reasons = [] if delta >= 0 else [f"通过率低于 DeepSWE 官方基线 {-delta * 100:.1f} 个百分点"]
+    return {"baseline_run_id": None, "baseline_name": "DeepSWE 官方基线", "baseline_type": "official", "level": "warning" if reasons else "ok", "reasons": reasons, "pass_rate_delta": delta}
 
 def task_catalog(tasks_dir: Path) -> list[dict]:
     history = list_details()

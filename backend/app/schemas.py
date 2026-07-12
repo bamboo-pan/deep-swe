@@ -43,7 +43,7 @@ class RestorePayload(BaseModel):
 class DockerCleanupRequest(BaseModel):
     scope: Literal["job", "orphaned", "expired", "build_cache"]
     run_id: int | None = None
-    retention_hours: int = Field(168, ge=1, le=24 * 365)
+    retention_hours: int = Field(168, ge=0, le=24 * 365)
     include_build_cache: bool = False
 
 def concurrency_advice(value: int) -> dict:

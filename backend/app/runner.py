@@ -66,7 +66,15 @@ def _mini_limits_config(folder: Path) -> Path:
     """mini-swe-agent 的 cost_limit 走 litellm 价格表，自建网关模型算不出成本（恒为 0），
     只有 step_limit 是确定性护栏；pier adapter 会把该文件内容写进容器再以 -c 追加。"""
     path = folder / "mini-limits.yaml"
-    path.write_text(f"agent:\n  step_limit: {MINI_STEP_LIMIT}\n", encoding="utf-8", newline="\n")
+    # mini-swe-agent/litellm otherwise creates a fresh prompt_cache_key for
+    # every turn.  Keep one key for the whole trial so growing conversation
+    # prefixes can hit the provider cache.
+    cache_key = f"deepswe-{uuid.uuid4().hex}"
+    path.write_text(
+        f"agent:\n  step_limit: {MINI_STEP_LIMIT}\n"
+        f"model:\n  model_kwargs:\n    prompt_cache_key: {cache_key}\n"
+        "    prompt_cache_retention: 24h\n",
+        encoding="utf-8", newline="\n")
     return path
 
 def _pier_version() -> str | None:

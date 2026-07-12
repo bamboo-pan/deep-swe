@@ -42,20 +42,27 @@ def aggregate_trials(rows: list[dict]) -> dict:
         task = row.get("task_name")
         if not task:
             continue
-        entry = stats.setdefault(task, {"n": 0, "passed": 0, "durations": []})
+        entry = stats.setdefault(task, {"n": 0, "passed": 0, "durations": [], "input": [], "cache": [], "output": [], "cost": [], "steps": []})
         entry["n"] += 1
         entry["passed"] += bool(row.get("passed"))
         duration = row.get("trial_duration_seconds")
         if isinstance(duration, (int, float)) and duration > 0:
             entry["durations"].append(duration)
+        for source, target in (("n_input_tokens", "input"), ("n_cache_tokens", "cache"), ("n_output_tokens", "output"), ("cost_usd", "cost"), ("n_agent_steps", "steps")):
+            value = row.get(source)
+            if isinstance(value, (int, float)) and value >= 0:
+                entry[target].append(value)
     tasks = {}
     for task, entry in sorted(stats.items()):
         durations = entry["durations"]
-        tasks[task] = {
+        result = {
             "trials": entry["n"],
             "pass_rate": round(entry["passed"] / entry["n"], 4),
             "avg_duration_seconds": round(sum(durations) / len(durations), 1) if durations else None,
         }
+        for key, values, digits in (("avg_input_tokens", entry["input"], 0), ("avg_cache_tokens", entry["cache"], 0), ("avg_output_tokens", entry["output"], 0), ("avg_cost_usd", entry["cost"], 6), ("avg_steps", entry["steps"], 1)):
+            if values: result[key] = round(sum(values) / len(values), digits)
+        tasks[task] = result
     return tasks
 
 def sync_official_stats(timeout: float = 180.0) -> dict:

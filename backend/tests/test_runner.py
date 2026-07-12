@@ -79,6 +79,7 @@ def test_mini_limits_config_sets_step_limit(tmp_path: Path):
     path=runner._mini_limits_config(tmp_path)
     text=path.read_text(encoding="utf-8")
     assert f"step_limit: {runner.MINI_STEP_LIMIT}" in text and text.startswith("agent:")
+    assert "prompt_cache_key: deepswe-" in text and "prompt_cache_retention: 24h" in text
 
 def test_preflight_rejects_crlf_scripts(tmp_path: Path, monkeypatch):
     # CRLF 的 shebang 在容器内无法执行，verifier 必然失败，agent 费用全部报废（2026-07-12 事故）
