@@ -7,7 +7,7 @@ from sqlalchemy import select
 from .database import SessionLocal
 from .config import settings
 from .models import Baseline, Run
-from .official_stats import load_official_stats
+from .official_stats import configuration_stats, load_official_stats, normalize_model_name
 from .preferences import current_secrets, jobs_path
 from .pier_retry_patch.transient import is_transient_agent_failure
 from .security import redact
@@ -233,6 +233,10 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
     _enrich_trials(run, trials)
     completed = sum(t["status"] in {"completed", "failed"} for t in trials)
     passed = sum(t.get("reward") == 1 for t in trials)
+    passed_tasks = sum(
+        any(t.get("reward") == 1 for t in trials if t["task"] == task)
+        for task in expected_tasks
+    )
     stage = "completed" if run.status == "completed" else "failed" if run.status in {"failed", "cancelled", "interrupted"} else next((t["status"] for t in trials if t["status"] not in {"queued", "completed", "failed"}), run.status)
     total = len(expected)
     input_tokens = stats.get("n_input_tokens", run.input_tokens)
@@ -261,9 +265,23 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
         "output_tokens": output_tokens, "reported_cost_usd": stats.get("cost_usd", run.cost_usd),
         "estimated_cost_usd": estimate_cost(input_tokens, cached_tokens, output_tokens, run.service_tier),
         "error": run.error, "progress": {"completed": completed, "total": total, "passed": passed, "percent": round(completed / total * 100) if total else 0},
+        "task_progress": {"passed": passed_tasks, "total": len(expected_tasks)},
         "job_stats": {key: stats.get(key) for key in ("n_completed_trials", "n_errored_trials", "n_running_trials", "n_pending_trials", "n_cancelled_trials", "n_retries")},
         "trials": trials, "is_baseline": bool(baseline), "baseline_name": baseline.name if baseline else None,
     }
+
+def run_task_progress(run: Run) -> dict:
+    """Return task-level pass counts without building the full run detail payload."""
+    expected_tasks = json.loads(run.tasks_json)
+    root = jobs_root_for(run) / run.job_name
+    passed_tasks: set[str] = set()
+    if root.exists():
+        for folder in (p for p in root.iterdir() if p.is_dir() and "__" in p.name):
+            data = _json(folder / "result.json")
+            reward = ((data.get("verifier_result") or {}).get("rewards") or {}).get("reward")
+            if reward == 1:
+                passed_tasks.add(_canonical_task_name(folder, data, expected_tasks))
+    return {"passed": sum(task in passed_tasks for task in expected_tasks), "total": len(expected_tasks)}
 
 def list_details() -> list[dict]:
     with SessionLocal() as db:
@@ -282,13 +300,47 @@ def compare_runs(run_ids: list[int], selections: list[tuple[int, str]] | None = 
     official = load_official_stats()
     matrix = []
     for task in task_names:
-        item = {**task_identity(task), "runs": {}, "official": official.get(task) or None}
+        task_official = official.get(task) or None
+        item = {**task_identity(task), "runs": {}, "official": task_official, "official_configurations": []}
+        seen_configurations: set[tuple[str, str]] = set()
         for detail in details:
             if selected_pairs and (detail["id"], task) not in selected_pairs:
                 continue
+            configuration_key = (normalize_model_name(detail["model"]), detail["reasoning_effort"].lower())
+            if configuration_key not in seen_configurations:
+                seen_configurations.add(configuration_key)
+                exact = configuration_stats(task_official, detail["model"], detail["reasoning_effort"])
+                item["official_configurations"].append({
+                    "model": detail["model"],
+                    "reasoning_effort": detail["reasoning_effort"],
+                    "available": exact is not None,
+                    **(exact or {}),
+                })
             values = [t for t in detail["trials"] if t["task"] == task and t.get("reward") is not None]
             durations = [t["duration_seconds"] for t in values if t.get("duration_seconds") is not None]
-            item["runs"][str(detail["id"])] = {"pass_rate": mean(t["reward"] == 1 for t in values) if values else None, "reward": mean(t["reward"] for t in values) if values else None, "duration_seconds": mean(durations) if durations else None, "input_tokens": sum(t.get("input_tokens") or 0 for t in values) or None, "cached_tokens": sum(t.get("cached_tokens") or 0 for t in values) or None, "output_tokens": sum(t.get("output_tokens") or 0 for t in values) or None, "cost_usd": sum(t.get("reported_cost_usd") or 0 for t in values) or None, "steps": sum(t.get("steps") or 0 for t in values) or None}
+            def average(field: str) -> float | None:
+                present = [t[field] for t in values if t.get(field) is not None]
+                return mean(present) if present else None
+            estimated_costs = [
+                estimate_cost(t.get("input_tokens"), t.get("cached_tokens"), t.get("output_tokens"), detail["service_tier"])
+                for t in values
+            ]
+            estimated_costs = [value for value in estimated_costs if value is not None]
+            item["runs"][str(detail["id"])] = {
+                "passed": any(t["reward"] == 1 for t in values),
+                "attempts": len(values),
+                "pass_rate": mean(t["reward"] == 1 for t in values) if values else None,
+                "reward": mean(t["reward"] for t in values) if values else None,
+                "duration_seconds": mean(durations) if durations else None,
+                "input_tokens": average("input_tokens"),
+                "cached_tokens": average("cached_tokens"),
+                "output_tokens": average("output_tokens"),
+                "cost_usd": average("reported_cost_usd"),
+                "steps": average("steps"),
+                "total_input_tokens": sum(t.get("input_tokens") or 0 for t in values) if values else None,
+                "total_cost_usd": sum(t.get("reported_cost_usd") or 0 for t in values) if values else None,
+                "total_estimated_cost_usd": sum(estimated_costs) if estimated_costs else None,
+            }
         matrix.append(item)
     return {"runs": details, "tasks": matrix, "selections": [f"{run_id}:{task}" for run_id, task in selections or []]}
 

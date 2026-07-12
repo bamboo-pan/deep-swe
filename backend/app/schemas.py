@@ -39,6 +39,9 @@ class SettingsUpdate(BaseModel):
 class BaselineDraft(BaseModel):
     name: str | None = Field(None, max_length=160)
 
+class CompareRequest(BaseModel):
+    items: list[str] = Field(default_factory=list)
+
 class RestorePayload(BaseModel):
     version: int
     settings: list[dict]

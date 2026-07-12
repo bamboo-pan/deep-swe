@@ -1,6 +1,7 @@
 import json, subprocess, uuid
 import ipaddress
 from pathlib import Path
+from types import SimpleNamespace
 from app.database import SessionLocal, init_db
 from app.models import Run
 from app import runner
@@ -221,6 +222,41 @@ def test_official_regression_contains_baseline_values(monkeypatch):
     assert regression["current_duration_seconds"] == 80
     assert regression["baseline_duration_seconds"] == 100
     assert regression["baseline_trials"] == 40
+
+def test_compare_uses_exact_configuration_and_task_averages(monkeypatch):
+    detail = {
+        "id": 7,
+        "tasks": ["task-a"],
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "xhigh",
+        "service_tier": "standard",
+        "trials": [
+            {"task": "task-a", "reward": 1, "duration_seconds": 60.0, "input_tokens": 100, "cached_tokens": 50, "output_tokens": 10, "reported_cost_usd": 1.0, "steps": 10},
+            {"task": "task-a", "reward": 0, "duration_seconds": 120.0, "input_tokens": 300, "cached_tokens": 150, "output_tokens": 30, "reported_cost_usd": 3.0, "steps": 30},
+        ],
+    }
+    class FakeSession:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return None
+        def get(self, _model, run_id): return SimpleNamespace(id=run_id)
+    monkeypatch.setattr(results, "SessionLocal", FakeSession)
+    monkeypatch.setattr(results, "run_detail", lambda _row, include_patches=False: detail)
+    monkeypatch.setattr(results, "task_identity", lambda task: {"task": task, "task_code": "TASK-001", "task_title": task})
+    monkeypatch.setattr(results, "load_official_stats", lambda: {"task-a": {
+        "trials": 20,
+        "pass_rate": 0.4,
+        "avg_duration_seconds": 100.0,
+        "configurations": [{"model": "gpt-5-6-sol", "reasoning_effort": "xhigh", "trials": 4, "pass_rate": 0.5, "avg_duration_seconds": 90.0}],
+    }})
+    comparison = results.compare_runs([7], [(7, "task-a")])
+    row = comparison["tasks"][0]
+    exact = row["official_configurations"][0]
+    local = row["runs"]["7"]
+    assert exact["available"] is True and exact["pass_rate"] == 0.5
+    assert local["passed"] is True and local["pass_rate"] == 0.5
+    assert local["duration_seconds"] == 90.0
+    assert local["input_tokens"] == 200 and local["total_input_tokens"] == 400
+    assert local["cost_usd"] == 2.0 and local["total_cost_usd"] == 4.0
 
 def test_preflight_rejects_crlf_scripts(tmp_path: Path, monkeypatch):
     # CRLF 的 shebang 在容器内无法执行，verifier 必然失败，agent 费用全部报废（2026-07-12 事故）

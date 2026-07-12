@@ -5,6 +5,7 @@ import {
   BarChart3,
   Box,
   CheckCircle2,
+  CheckSquare2,
   ClipboardList,
   Database,
   Download,
@@ -16,6 +17,7 @@ import {
   Settings as SettingsIcon,
   ShieldCheck,
   Square,
+  SquareX,
   Trash2,
   Upload,
   Wifi,
@@ -90,6 +92,7 @@ type Run = {
   agent: string;
   model: string;
   reasoning_effort: string;
+  passed?: boolean | null;
   reward: number | null;
   reported_cost_usd: number | null;
   estimated_cost_usd: number | null;
@@ -108,21 +111,11 @@ type Run = {
     passed: number;
     percent: number;
   };
+  task_progress?: {
+    passed: number;
+    total: number;
+  };
   trials?: Trial[];
-  is_baseline?: boolean;
-  baseline_name?: string;
-  regression?: {
-    level: string;
-    reasons: string[];
-    baseline_name: string;
-    pass_rate_delta: number;
-    current_pass_rate?: number | null;
-    baseline_pass_rate?: number | null;
-    current_duration_seconds?: number | null;
-    baseline_duration_seconds?: number | null;
-    baseline_trials?: number | null;
-    baseline_type?: "official" | "custom";
-  } | null;
   input_tokens?: number;
   cached_tokens?: number;
   uncached_input_tokens?: number;
@@ -174,9 +167,9 @@ type DockerStorage = {
   };
   active_runs: number;
 };
-// 由后端 8765 直接服务（或反向代理无端口）时用相对路径；vite dev/preview 的任意端口都指向后端
-const apiBase =
-  location.port && location.port !== "8765" ? "http://127.0.0.1:8765" : "";
+// 生产构建由后端或反向代理同源服务；Vite 开发模式默认连接本地后端。
+const apiBase = import.meta.env.VITE_API_BASE ||
+  (import.meta.env.DEV ? "http://127.0.0.1:8765" : "");
 const request = async <T,>(path: string, options?: RequestInit): Promise<T> => {
   const response = await fetch(apiBase + path, options);
   if (!response.ok) {
@@ -201,6 +194,8 @@ const number = (value: number | null | undefined) =>
   value == null ? "—" : value.toLocaleString();
 const percent = (value: number | null | undefined) =>
   value == null ? "—" : `${(value * 100).toFixed(2)}%`;
+const score = (value: number | null | undefined) =>
+  value == null ? "—" : Number.isInteger(value) ? String(value) : value.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
 const duration = (seconds: number | null | undefined) =>
   seconds == null
     ? "—"
@@ -208,10 +203,49 @@ const duration = (seconds: number | null | undefined) =>
       ? `${Math.round(seconds)}s`
       : `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
 const terminal = new Set(["completed", "failed", "cancelled", "interrupted"]);
+const parseCompareSelection = (key: string) => {
+  const separator = key.indexOf(":");
+  if (separator <= 0 || separator === key.length - 1) return null;
+  const runId = Number(key.slice(0, separator));
+  return Number.isInteger(runId)
+    ? { runId, task: key.slice(separator + 1) }
+    : null;
+};
+const pruneCompareSelections = (selected: string[], runs: Run[]) => {
+  const tasksByRun = new Map(runs.map((run) => [run.id, new Set(run.tasks)]));
+  const seen = new Set<string>();
+  const next = selected.filter((key) => {
+    const parsed = parseCompareSelection(key);
+    if (!parsed || seen.has(key) || !tasksByRun.get(parsed.runId)?.has(parsed.task))
+      return false;
+    seen.add(key);
+    return true;
+  });
+  return next.length === selected.length ? selected : next;
+};
 
-function Status({ value }: { value: string }) {
+function Status({
+  value,
+  passed,
+  reward,
+}: {
+  value: string;
+  passed?: boolean | null;
+  reward?: number | null;
+}) {
+  const failedCompletion =
+    value === "completed" && (passed === false || (reward != null && reward < 1));
+  const tone = failedCompletion
+    ? "failure"
+    : value === "completed"
+      ? "success"
+      : ["failed", "cancelled", "interrupted"].includes(value)
+        ? "failure"
+        : ["preflight", "running", "preparing_environment", "agent_running", "extracting_patch", "verifier"].includes(value)
+          ? "active"
+          : "waiting";
   return (
-    <span className={`status ${value}`}>{value.replaceAll("_", " ")}</span>
+    <span className={`status ${value} ${tone}`}>{value.replaceAll("_", " ")}</span>
   );
 }
 function Metric({
@@ -268,7 +302,10 @@ function App() {
   const [tier, setTier] = useState("standard");
   const refreshRuns = () =>
     request<Run[]>("/api/runs")
-      .then(setRuns)
+      .then((nextRuns) => {
+        setRuns(nextRuns);
+        setCompareIds((current) => pruneCompareSelections(current, nextRuns));
+      })
       .catch(() => {});
   const refresh = () => {
     refreshRuns();
@@ -309,11 +346,7 @@ function App() {
       source.onmessage = (e) => {
         const next = JSON.parse(e.data);
         latestStatus = next.status;
-        // SSE 后端已附带 regression；万一缺失则保留上次值，避免回归横幅闪现后被抹掉
-        setDetail((prev) => terminal.has(next.status) && tab === "live" ? null : ({
-          ...next,
-          regression: next.regression ?? prev?.regression ?? null,
-        }));
+        setDetail(terminal.has(next.status) && tab === "live" ? null : next);
         refreshRuns();
         if (terminal.has(next.status)) source?.close();
       };
@@ -347,9 +380,11 @@ function App() {
   }, [tab]);
   useEffect(() => {
     if (compareIds.length)
-      request(
-        `/api/compare?${compareIds.map((id) => `items=${encodeURIComponent(id)}`).join("&")}`,
-      ).then(setComparison);
+      request("/api/compare", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ items: compareIds }),
+      }).then(setComparison);
     else setComparison(undefined);
   }, [compareIds]);
   const latest = runs[0];
@@ -507,23 +542,6 @@ function App() {
       log.status === "fulfilled" ? log.value.log : "该 Trial 暂无日志",
     );
   };
-  const baseline = async () => {
-    if (!detail) return;
-    await request(`/api/runs/${detail.id}/baseline`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: "{}",
-    });
-    setDetail(await request<Run>(`/api/runs/${detail.id}`));
-    refreshRuns();
-  };
-  const resetBaseline = async () => {
-    if (!detail) return;
-    await request(`/api/runs/${detail.id}/baseline`, { method: "DELETE" });
-    setDetail(await request<Run>(`/api/runs/${detail.id}`));
-    refreshRuns();
-    setNotice("已恢复 DeepSWE 官方基线");
-  };
   const savePrefs = async () => {
     if (!prefs) return;
     setPrefs(
@@ -583,7 +601,17 @@ function App() {
       }
     }
     const failedIds = failures.map((x) => x.id);
+    const deletedIds = new Set(ids.filter((id) => !failedIds.includes(id)));
     setSelectedResults(failedIds);
+    if (deletedIds.size) {
+      setCompareIds((current) => {
+        const next = current.filter((key) => {
+          const parsed = parseCompareSelection(key);
+          return parsed && !deletedIds.has(parsed.runId);
+        });
+        return next.length === current.length ? current : next;
+      });
+    }
     if (
       selectedRun &&
       ids.includes(selectedRun) &&
@@ -976,8 +1004,6 @@ function App() {
             openTrial={openTrial}
             activeTrial={activeTrial}
             trialLog={trialLog}
-            baseline={baseline}
-            resetBaseline={resetBaseline}
             selected={selectedResults}
             setSelected={setSelectedResults}
             remove={deleteResults}
@@ -1092,7 +1118,7 @@ function Live({
               key={r.id}
               onClick={() => selectRun(r.id)}
             >
-              <Status value={r.status} />
+              <Status value={r.status} passed={r.passed} />
               {r.agent}
               <small>{r.run_code || `RUN-${String(r.id).padStart(6, "0")}`}</small>
             </button>
@@ -1102,7 +1128,7 @@ function Live({
       <section className="panel">
         <div className="panelhead">
           <div>
-            <Status value={detail.status} />
+            <Status value={detail.status} passed={detail.passed} />
             <h2>{detail.run_code || `RUN-${String(detail.id).padStart(6, "0")}`}</h2>
             <p>
               {detail.agent} · {detail.model} · {detail.reasoning_effort} ·
@@ -1141,7 +1167,7 @@ function Live({
             key={t.id}
             onClick={() => openTrial(t)}
           >
-            <Status value={t.status} />
+            <Status value={t.status} reward={t.reward} />
             <small className="identitycode">{t.trial_code}</small>
             <b>{t.task_title || t.task}</b>
             <code>{t.task_slug || t.task}</code>
@@ -1162,8 +1188,6 @@ function Results({
   openTrial,
   activeTrial,
   trialLog,
-  baseline,
-  resetBaseline,
   selected,
   setSelected,
   remove,
@@ -1174,8 +1198,6 @@ function Results({
   openTrial: (t: Trial) => void;
   activeTrial: Trial | null;
   trialLog: string;
-  baseline: () => void;
-  resetBaseline: () => void;
   selected: number[];
   setSelected: (ids: number[]) => void;
   remove: () => void;
@@ -1221,13 +1243,15 @@ function Results({
                 }
               />
               <button onClick={() => openRun(r.id)}>
-                <Status value={r.status} />
+                <Status value={r.status} passed={r.passed} />
                 <b>{r.agent}</b>
                 <span>
                   {r.run_code || `RUN-${String(r.id).padStart(6, "0")}`}
                   <small>{r.job_name}</small>
                 </span>
-                <em>{r.reward == null ? "—" : r.reward.toFixed(3)}</em>
+                <em className={r.status === "completed" ? (r.passed ? "success" : "failure") : "waiting"}>
+                  {r.task_progress ? `${r.task_progress.passed}/${r.task_progress.total}` : "—"}
+                </em>
               </button>
             </div>
           ))
@@ -1239,10 +1263,9 @@ function Results({
         {detail ? (
           <>
             <section className="metrics">
-              <Metric label="Reward" value={detail.reward ?? "—"} />
               <Metric
-                label="通过"
-                value={`${detail.progress?.passed || 0}/${detail.progress?.total || 0}`}
+                label="通过任务"
+                value={`${detail.task_progress?.passed || 0}/${detail.task_progress?.total || detail.tasks.length}`}
               />
               <Metric
                 label="Input / Cache"
@@ -1266,19 +1289,6 @@ function Results({
                 <span>{detail.error}</span>
               </div>
             )}
-            {detail.regression && (
-              <div className={`regression ${detail.regression.level}`}>
-                <b>基线：{detail.regression.baseline_name}</b>
-                <span>
-                  通过率 {percent(detail.regression.current_pass_rate)} vs {percent(detail.regression.baseline_pass_rate)}
-                  {detail.regression.pass_rate_delta != null && `（${detail.regression.pass_rate_delta >= 0 ? "+" : ""}${(detail.regression.pass_rate_delta * 100).toFixed(2)}pp）`}
-                  {detail.regression.current_duration_seconds != null && detail.regression.baseline_duration_seconds != null &&
-                    ` · 耗时 ${duration(detail.regression.current_duration_seconds)} vs ${duration(detail.regression.baseline_duration_seconds)}`}
-                  {detail.regression.baseline_trials ? ` · 官方 ${detail.regression.baseline_trials} 次 Trial` : ""}
-                  {detail.regression.reasons.length ? ` · ${detail.regression.reasons.join("；")}` : " · 未检测到回归"}
-                </span>
-              </div>
-            )}
             <section className="panel">
               <div className="panelhead">
                 <h2>Trial 结果</h2>
@@ -1290,6 +1300,8 @@ function Results({
                   <b>Reward</b>
                   <b>F2P / P2P</b>
                   <b>Duration</b>
+                  <b>Tokens (I / C / O)</b>
+                  <b>Cost</b>
                   <b>Steps</b>
                 </div>
                 {detail.trials?.map((t) => (
@@ -1303,12 +1315,18 @@ function Results({
                       <span>{t.task_title || t.task}</span>
                       <small>{t.task_slug || t.task}</small>
                     </span>
-                    <Status value={t.status} />
-                    <span>{t.reward ?? "—"}</span>
+                    <Status value={t.status} reward={t.reward} />
+                    <span>{score(t.reward)}</span>
                     <span>
-                      {t.f2p ?? "—"} / {t.p2p ?? "—"}
+                      {score(t.f2p)} / {score(t.p2p)}
                     </span>
                     <span>{duration(t.duration_seconds)}</span>
+                    <span className="trialtokens">
+                      <span><i>I</i>{number(t.input_tokens)}</span>
+                      <span><i>C</i>{number(t.cached_tokens)}</span>
+                      <span><i>O</i>{number(t.output_tokens)}</span>
+                    </span>
+                    <span>{money(t.reported_cost_usd)}</span>
                     <span>{t.steps ?? "—"}</span>
                   </button>
                 ))}
@@ -1333,8 +1351,9 @@ function TrialDetail({ trial, log }: { trial: Trial; log: string }) {
         <p className="technicalid">Pier / Docker 资源前缀：{trial.resource_name}</p>
       )}
       <div className="metrics compact">
-        <Metric label="Partial" value={trial.partial ?? "—"} />
-        <Metric label="Tokens" value={number(trial.input_tokens)} />
+        <Metric label="Partial" value={score(trial.partial)} />
+        <Metric label="Input / Cache" value={`${number(trial.input_tokens)} / ${number(trial.cached_tokens)}`} />
+        <Metric label="Output" value={number(trial.output_tokens)} />
         <Metric label="Cost" value={money(trial.reported_cost_usd)} />
         <Metric label="Patch" value={`${number(trial.patch_bytes)} B`} />
       </div>
@@ -1356,6 +1375,26 @@ function TrialDetail({ trial, log }: { trial: Trial; log: string }) {
     </section>
   );
 }
+type ComparisonTone = "better" | "equal" | "worse" | "unknown";
+const modelKey = (value: string | null | undefined) =>
+  (value || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+const comparisonTone = (
+  value: number | null | undefined,
+  baseline: number | null | undefined,
+  higherIsBetter: boolean,
+): ComparisonTone => {
+  if (value == null || baseline == null) return "unknown";
+  const tolerance = higherIsBetter ? 0.0005 : Math.max(Math.abs(baseline) * 0.005, 0.01);
+  if (Math.abs(value - baseline) <= tolerance) return "equal";
+  return (higherIsBetter ? value > baseline : value < baseline) ? "better" : "worse";
+};
+const comparisonLabel = (tone: ComparisonTone) => ({
+  better: "优于基准",
+  equal: "持平",
+  worse: "差于基准",
+  unknown: "无精确基准",
+}[tone]);
+
 function Compare({
   runs,
   selected,
@@ -1372,21 +1411,89 @@ function Compare({
   const [modelFilter, setModelFilter] = useState("all");
   const [effortFilter, setEffortFilter] = useState("all");
   const taskNames = [...new Set(runs.flatMap((run) => run.tasks))].sort();
-  const filteredRuns = runs.filter((run) =>
+  const matchesRunFilters = (run: Run) =>
     (taskFilter === "all" || run.tasks.includes(taskFilter)) &&
     (agentFilter === "all" || run.agent === agentFilter) &&
     (modelFilter === "all" || run.model === modelFilter) &&
-    (effortFilter === "all" || run.reasoning_effort === effortFilter));
+    (effortFilter === "all" || run.reasoning_effort === effortFilter);
+  const filteredRuns = runs.filter(matchesRunFilters);
   const groupedRuns = taskNames.filter((task) => taskFilter === "all" || task === taskFilter).map((task) => ({task, runs: filteredRuns.filter((run) => run.tasks.includes(task))})).filter((group) => group.runs.length);
+  const visibleSelectionKeys = groupedRuns.flatMap((group) =>
+    group.runs.map((run) => `${run.id}:${group.task}`),
+  );
+  const selectedSet = new Set(selected);
+  const allVisibleSelected = visibleSelectionKeys.length > 0 &&
+    visibleSelectionKeys.every((key) => selectedSet.has(key));
+  const runById = new Map(runs.map((run) => [run.id, run]));
+  const visibleSelections = selected.filter((key) => {
+    const parsed = parseCompareSelection(key);
+    const run = parsed ? runById.get(parsed.runId) : undefined;
+    return Boolean(run && matchesRunFilters(run) && (taskFilter === "all" || parsed?.task === taskFilter));
+  });
+  const visibleSelectionSet = new Set(visibleSelections);
+  const visibleComparisonRuns = (comparison?.runs || []).filter((run: Run) =>
+    visibleSelections.some((key) => key.startsWith(`${run.id}:`)),
+  );
+  const visibleTasks = (comparison?.tasks || []).filter((row: any) =>
+    visibleSelections.some((key) => key.endsWith(`:${row.task}`)),
+  );
+  const exactBaseline = (row: any, run: Run) =>
+    (row.official_configurations || []).find((item: any) =>
+      modelKey(item.model) === modelKey(run.model) &&
+      (item.reasoning_effort || "none").toLowerCase() === (run.reasoning_effort || "none").toLowerCase(),
+    );
+  const visibleOfficialConfigurations = (row: any) =>
+    (row.official_configurations || []).filter((item: any) =>
+      visibleComparisonRuns.some((run: Run) =>
+        visibleSelectionSet.has(`${run.id}:${row.task}`) &&
+        modelKey(item.model) === modelKey(run.model) &&
+        (item.reasoning_effort || "none").toLowerCase() === (run.reasoning_effort || "none").toLowerCase(),
+      ),
+    );
+  const summaries = visibleComparisonRuns.map((run: Run) => {
+    const values = visibleTasks
+      .filter((row: any) => visibleSelectionSet.has(`${run.id}:${row.task}`))
+      .map((row: any) => row.runs[String(run.id)] || {});
+    const total = (field: string) => {
+      const present = values.map((value: any) => value[field]).filter((value: any) => value != null);
+      return present.length ? present.reduce((sum: number, value: number) => sum + value, 0) : null;
+    };
+    return {
+      run,
+      passed: values.filter((value: any) => value.passed).length,
+      total: values.length,
+      cost: total("total_estimated_cost_usd"),
+      input: total("total_input_tokens"),
+    };
+  });
   return (
     <>
       <section className="panel">
-        <div className="panelhead">
+        <div className="panelhead comparepickerhead">
           <div>
             <h2>选择结果</h2>
-            <p>最多选择 8 个 Run × Task 结果；同一个 Run 中的不同任务可以独立勾选。</p>
           </div>
-          <b>{selected.length}/8</b>
+          <div className="compareselectiontools">
+            <b>已选 {selected.length}</b>
+            <button
+              className="secondary"
+              disabled={!visibleSelectionKeys.length || allVisibleSelected}
+              onClick={() => setSelected([...new Set([...selected, ...visibleSelectionKeys])])}
+              title="选择当前筛选条件下的全部 Run × Task 结果"
+            >
+              <CheckSquare2 />
+              全选当前筛选
+            </button>
+            <button
+              className="secondary"
+              disabled={!selected.length}
+              onClick={() => setSelected([])}
+              title="清空全部对比选择"
+            >
+              <SquareX />
+              清空选择
+            </button>
+          </div>
         </div>
         <div className="comparefilters">
           <label>Task<select value={taskFilter} onChange={(e)=>setTaskFilter(e.target.value)}><option value="all">全部任务</option>{taskNames.map(x=><option key={x} value={x}>{x}</option>)}</select></label>
@@ -1399,8 +1506,7 @@ function Compare({
             <label key={selectionKey}>
               <input
                 type="checkbox"
-                checked={selected.includes(selectionKey)}
-                disabled={!selected.includes(selectionKey) && selected.length >= 8}
+                checked={selectedSet.has(selectionKey)}
                 onChange={(e) =>
                   setSelected(
                     e.target.checked
@@ -1409,7 +1515,7 @@ function Compare({
                   )
                 }
               />
-              <Status value={r.status} />
+              <Status value={r.status} passed={r.passed} />
               <span>
                 {r.agent} · {r.model} · {r.reasoning_effort}
               </span>
@@ -1421,34 +1527,72 @@ function Compare({
           )})}
         </div></div>)}
       </section>
-      {comparison?.runs?.length > 0 && (
+      {summaries.length > 0 && (
         <>
           <section className="metrics">
-            {comparison.runs.map((r: Run) => (
+            {summaries.map(({ run, passed, total, cost, input }: any) => (
               <Metric
-                key={r.id}
-                label={`${r.run_code || `RUN-${String(r.id).padStart(6, "0")}`} ${r.agent}`}
-                value={`${r.progress?.passed || 0}/${r.progress?.total || 0}`}
-                hint={`${money(r.estimated_cost_usd)} · reward ${r.reward ?? "—"}`}
+                key={run.id}
+                label={`${run.run_code || `RUN-${String(run.id).padStart(6, "0")}`} ${run.agent}`}
+                value={`${passed}/${total}`}
+                hint={`${money(cost)} · ${number(input)} input`}
               />
             ))}
           </section>
           <section className="panel">
-            <h2>同任务详细对比</h2>
-            {!comparison.tasks.length ? <Empty text="所选运行没有共同任务。" /> : comparison.tasks.map((row: any) => (
-              <div className="comparetask" key={row.task}>
-                <h3>{row.task_code} · {row.task_title}</h3>
-                <div className="comparetable">
-                  <b>运行 / 基线</b><b>通过率</b><b>耗时</b><b>Input / Cache / Output</b><b>成本</b><b>步骤</b>
-                  <span>DeepSWE 官方</span><span>{row.official?.pass_rate == null ? "—" : `${Math.round(row.official.pass_rate * 100)}%`}</span><span>{duration(row.official?.avg_duration_seconds)}</span><span>{number(row.official?.avg_input_tokens)} / {number(row.official?.avg_cache_tokens)} / {number(row.official?.avg_output_tokens)}</span><span>{money(row.official?.avg_cost_usd)}</span><span>{row.official?.avg_steps ?? "—"}</span>
-                  {comparison.runs.filter((r: Run) => Object.hasOwn(row.runs, String(r.id))).map((r: Run) => { const v=row.runs[String(r.id)] || {}; return <React.Fragment key={r.id}>
-                    <span><b>{r.agent}</b><small>{r.model} · {r.reasoning_effort}</small></span>
-                    <span>{v.pass_rate == null ? "—" : `${Math.round(v.pass_rate * 100)}%`}</span><span>{duration(v.duration_seconds)}</span>
-                    <span>{number(v.input_tokens)} / {number(v.cached_tokens)} / {number(v.output_tokens)}</span><span>{money(v.cost_usd)}</span><span>{v.steps ?? "—"}</span>
-                  </React.Fragment>})}
+            <div className="comparetitle">
+              <h2>同任务详细对比</h2>
+              <div className="comparisonlegend"><i className="better"></i>优于 <i className="equal"></i>持平 <i className="worse"></i>差于</div>
+            </div>
+            {visibleTasks.map((row: any) => {
+              const localRuns = visibleComparisonRuns.filter((run: Run) =>
+                visibleSelectionSet.has(`${run.id}:${row.task}`) && Object.hasOwn(row.runs, String(run.id)),
+              );
+              const configurations = visibleOfficialConfigurations(row);
+              return (
+                <div className="comparetask" key={row.task}>
+                  <h3>{row.task_code} · {row.task_title}</h3>
+                  <div className="comparetable">
+                    <b>运行 / 官方基准</b><b>通过率</b><b>平均耗时</b><b>Input / Cache / Output（每 Trial）</b><b>平均成本</b><b>平均步骤</b>
+                    <span className="officialcell"><b>官方全部模型汇总</b><small>{row.official?.trials ? `${row.official.trials} trials` : "暂无数据"}</small></span>
+                    <span className="officialcell">{percent(row.official?.pass_rate)}</span>
+                    <span className="officialcell">{duration(row.official?.avg_duration_seconds)}</span>
+                    <span className="officialcell comparetokens">{number(row.official?.avg_input_tokens)} / {number(row.official?.avg_cache_tokens)} / {number(row.official?.avg_output_tokens)}</span>
+                    <span className="officialcell">{money(row.official?.avg_cost_usd)}</span>
+                    <span className="officialcell">{row.official?.avg_steps ?? "—"}</span>
+                    {configurations.map((baseline: any) => (
+                      <React.Fragment key={`${baseline.model}:${baseline.reasoning_effort}`}>
+                        <span className="officialcell exact"><b>官方精确基准</b><small>{baseline.model} · {baseline.reasoning_effort}{baseline.trials ? ` · ${baseline.trials} trials` : " · 暂无数据"}</small></span>
+                        <span className="officialcell exact">{percent(baseline.pass_rate)}</span>
+                        <span className="officialcell exact">{duration(baseline.avg_duration_seconds)}</span>
+                        <span className="officialcell exact comparetokens">{number(baseline.avg_input_tokens)} / {number(baseline.avg_cache_tokens)} / {number(baseline.avg_output_tokens)}</span>
+                        <span className="officialcell exact">{money(baseline.avg_cost_usd)}</span>
+                        <span className="officialcell exact">{baseline.avg_steps ?? "—"}</span>
+                      </React.Fragment>
+                    ))}
+                    {localRuns.map((run: Run) => {
+                      const value = row.runs[String(run.id)] || {};
+                      const baseline = exactBaseline(row, run);
+                      const passTone = comparisonTone(value.pass_rate, baseline?.pass_rate, true);
+                      return (
+                        <React.Fragment key={run.id}>
+                          <span className="localcell"><b>{run.agent}</b><small>{run.model} · {run.reasoning_effort}</small><em className={`comparisonbadge ${passTone}`}>{comparisonLabel(passTone)}</em></span>
+                          <span className={`localcell comparevalue ${passTone}`}>{percent(value.pass_rate)}</span>
+                          <span className={`localcell comparevalue ${comparisonTone(value.duration_seconds, baseline?.avg_duration_seconds, false)}`}>{duration(value.duration_seconds)}</span>
+                          <span className="localcell comparetokens">
+                            <i className={`comparevalue ${comparisonTone(value.input_tokens, baseline?.avg_input_tokens, false)}`}>{number(value.input_tokens)}</i> /
+                            <i className={`comparevalue ${comparisonTone(value.cached_tokens, baseline?.avg_cache_tokens, false)}`}>{number(value.cached_tokens)}</i> /
+                            <i className={`comparevalue ${comparisonTone(value.output_tokens, baseline?.avg_output_tokens, false)}`}>{number(value.output_tokens)}</i>
+                          </span>
+                          <span className={`localcell comparevalue ${comparisonTone(value.cost_usd, baseline?.avg_cost_usd, false)}`}>{money(value.cost_usd)}</span>
+                          <span className={`localcell comparevalue ${comparisonTone(value.steps, baseline?.avg_steps, false)}`}>{value.steps ?? "—"}</span>
+                        </React.Fragment>
+                      );
+                    })}
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </section>
         </>
       )}

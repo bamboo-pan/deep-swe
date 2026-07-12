@@ -25,11 +25,11 @@ from .models import ACTIVE_STATES, TERMINAL_STATES, Baseline, Run, Setting
 from .official_stats import load_official_stats, official_stats_meta, sync_official_stats
 from .preferences import KEYS as PREFERENCE_KEYS, get_preferences, update_preferences
 from .results import (
-    compare_runs, jobs_root_for, parse_timestamp, regression_for,
+    compare_runs, jobs_root_for, parse_timestamp,
     run_detail as parsed_run_detail, task_catalog, trial_detail, trial_log,
 )
 from .runner import cancel_run, create_run, get_run, list_runs, reap_orphaned_runs, run_log, shutdown_processes
-from .schemas import BaselineDraft, DockerCleanupRequest, RestorePayload, RunDraft, SettingsUpdate, concurrency_advice
+from .schemas import BaselineDraft, CompareRequest, DockerCleanupRequest, RestorePayload, RunDraft, SettingsUpdate, concurrency_advice
 from .security import is_safe_job_name, read_credential
 
 DEFAULT_TASKS = ["dasel-html-document-format", "igel-persist-feature-schema", "csstree-shorthand-expansion-compression", "happy-dom-deterministic-intersectionobserver", "superjson-error-stack-serialization", "dateutil-rfc5545-timezone-interop", "actionlint-action-pinning-lint"]
@@ -103,9 +103,7 @@ def runs(): return list_runs()
 def run_detail(run_id:int):
     with SessionLocal() as db: row=db.get(Run,run_id)
     if not row: raise HTTPException(404,"run not found")
-    result=parsed_run_detail(row, include_patches=False)
-    result["regression"]=regression_for(row, current=result)
-    return result
+    return parsed_run_detail(row, include_patches=False)
 
 @app.get("/api/runs/{run_id}/log")
 def log(run_id:int): return {"log":run_log(run_id)}
@@ -202,7 +200,6 @@ async def run_events(run_id:int):
             if fingerprint != last_fingerprint:
                 last_fingerprint = fingerprint
                 detail = parsed_run_detail(row, include_patches=False)
-                detail["regression"] = regression_for(row, current=detail)
                 payload = json.dumps(detail, default=str, ensure_ascii=False)
                 if payload != last_payload:
                     yield f"data: {payload}\n\n"; last_payload = payload
@@ -212,14 +209,20 @@ async def run_events(run_id:int):
 
 @app.get("/api/compare")
 def compare(ids:list[int]=Query(default=[]), items:list[str]=Query(default=[])):
-    if len(items)>8 or (not items and len(ids)>8): raise HTTPException(422,"最多比较 8 个结果")
+    return compare_runs(ids, _parse_compare_items(items) or None)
+
+@app.post("/api/compare")
+def compare_selected(payload: CompareRequest):
+    return compare_runs([], _parse_compare_items(payload.items) or None)
+
+def _parse_compare_items(items: list[str]) -> list[tuple[int, str]]:
     selections=[]
     for item in items:
         run_id, separator, task = item.partition(":")
         if not separator or not run_id.isdigit() or not task:
             raise HTTPException(422,"无效的比较结果标识")
         selections.append((int(run_id), task))
-    return compare_runs(ids, selections or None)
+    return selections
 
 @app.get("/api/baselines")
 def baselines():

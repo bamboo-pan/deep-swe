@@ -1,7 +1,7 @@
 """官方任务统计聚合与合并测试。"""
 import json
 from app import official_stats
-from app.official_stats import aggregate_trials, load_official_stats
+from app.official_stats import aggregate_trials, configuration_stats, load_official_stats
 
 def test_aggregate_matches_official_site_semantics():
     rows = [
@@ -19,6 +19,20 @@ def test_load_returns_empty_when_cache_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(official_stats.settings, "tasks_dir", tmp_path / "tasks")
     monkeypatch.setattr(official_stats, "_cache", None)
     assert load_official_stats() == {}
+
+def test_aggregate_includes_model_and_reasoning_configuration():
+    rows = [
+        {"task_name": "a", "model": "gpt-5-6-sol", "reasoning_effort": "high", "passed": True, "trial_duration_seconds": 60.0, "cost_usd": 1.0},
+        {"task_name": "a", "model": "gpt-5-6-sol", "reasoning_effort": "high", "passed": False, "trial_duration_seconds": 120.0, "cost_usd": 3.0},
+        {"task_name": "a", "model": "gpt-5-5", "reasoning_effort": "low", "passed": True, "trial_duration_seconds": 30.0, "cost_usd": 0.5},
+    ]
+    stats = aggregate_trials(rows)["a"]
+    exact = configuration_stats(stats, "gpt-5.6-sol", "high")
+    assert exact is not None
+    assert exact["trials"] == 2
+    assert exact["pass_rate"] == 0.5
+    assert exact["avg_duration_seconds"] == 90.0
+    assert exact["avg_cost_usd"] == 2.0
 
 def test_load_reads_cache_file(tmp_path, monkeypatch):
     monkeypatch.setattr(official_stats.settings, "tasks_dir", tmp_path / "tasks")

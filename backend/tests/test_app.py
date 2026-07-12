@@ -75,9 +75,20 @@ def test_compare_accepts_independent_run_task_items():
         assert response.status_code == 200
         assert response.json()["selections"] == ["1:task-a", "1:task-b"]
 
+def test_compare_accepts_unlimited_items_over_post_and_get():
+    items = [f"{900000 + index}:task-{index}" for index in range(12)]
+    with TestClient(app) as client:
+        get_response = client.get("/api/compare", params=[("items", item) for item in items])
+        post_response = client.post("/api/compare", json={"items": items})
+        assert get_response.status_code == 200
+        assert post_response.status_code == 200
+        assert get_response.json()["selections"] == items
+        assert post_response.json()["selections"] == items
+
 def test_compare_rejects_invalid_item_key():
     with TestClient(app) as client:
         assert client.get("/api/compare", params={"items":"not-a-pair"}).status_code == 422
+        assert client.post("/api/compare", json={"items":["not-a-pair"]}).status_code == 422
 
 def test_delete_terminal_run_and_reject_active_run():
     with TestClient(app) as client:
