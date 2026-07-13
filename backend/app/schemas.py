@@ -50,6 +50,9 @@ class BaselineDraft(BaseModel):
 class CompareRequest(BaseModel):
     items: list[str] = Field(default_factory=list)
 
+class CompareAnalysisRequest(BaseModel):
+    items: list[str] = Field(default_factory=list)
+
 class RestorePayload(BaseModel):
     version: int
     settings: list[dict]

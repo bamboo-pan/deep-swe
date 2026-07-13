@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
@@ -18,6 +18,7 @@ import {
   Save,
   Settings as SettingsIcon,
   ShieldCheck,
+  Sparkles,
   Square,
   SquareX,
   Trash2,
@@ -171,6 +172,44 @@ type DockerStorage = {
   };
   active_runs: number;
 };
+type CompareAnalysis = {
+  model: string;
+  reasoning_effort: string;
+  analysis: string;
+  summary: {
+    total: number;
+    consistent: number;
+    better: number;
+    worse: number;
+    unavailable: number;
+    strict: number;
+    reference: number;
+  };
+  comparisons: Array<{
+    task: string;
+    run_id: number;
+    run_code?: string;
+    agent: string;
+    model: string;
+    reasoning_effort: string;
+    comparison_scope: "strict" | "reference";
+    verdict: "consistent" | "better" | "worse" | "unavailable";
+    local: {
+      pass_rate: number | null;
+      attempts: number | null;
+      avg_duration_seconds: number | null;
+      avg_cost_usd: number | null;
+      avg_steps: number | null;
+    };
+    official: {
+      pass_rate: number | null;
+      trials: number | null;
+      avg_duration_seconds: number | null;
+      avg_cost_usd: number | null;
+      avg_steps: number | null;
+    };
+  }>;
+};
 // 生产构建由后端或反向代理同源服务；Vite 开发模式默认连接本地后端。
 const apiBase = import.meta.env.VITE_API_BASE ||
   (import.meta.env.DEV ? "http://127.0.0.1:8765" : "");
@@ -207,6 +246,17 @@ const duration = (seconds: number | null | undefined) =>
     : seconds < 60
       ? `${Math.round(seconds)}s`
       : `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+const compactPercent = (value: number | null | undefined) => {
+  if (value == null) return "—";
+  const percentValue = value * 100;
+  return `${percentValue.toFixed(Number.isInteger(percentValue) ? 0 : 1)}%`;
+};
+const compactMinutes = (seconds: number | null | undefined) =>
+  seconds == null ? "—" : `${Math.max(Math.round(seconds / 60), 1)}m`;
+const compactMoney = (value: number | null | undefined) =>
+  value == null ? "—" : `$${value.toFixed(1)}`;
+const compactNumber = (value: number | null | undefined) =>
+  value == null ? "—" : value.toFixed(Number.isInteger(value) ? 0 : 1);
 const terminal = new Set(["completed", "failed", "cancelled", "interrupted"]);
 const parseCompareSelection = (key: string) => {
   const separator = key.indexOf(":");
@@ -1626,6 +1676,12 @@ const comparisonLabel = (tone: ComparisonTone) => ({
   worse: "差于基准",
   unknown: "无精确基准",
 }[tone]);
+const analysisVerdictLabel = (verdict: string) => ({
+  consistent: "一致",
+  better: "变好",
+  worse: "变坏",
+  unavailable: "无法判断",
+}[verdict] || verdict);
 
 function Compare({
   runs,
@@ -1643,6 +1699,10 @@ function Compare({
   const [modelFilter, setModelFilter] = useState("all");
   const [effortFilter, setEffortFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState("all");
+  const [analysis, setAnalysis] = useState<CompareAnalysis>();
+  const [analysisError, setAnalysisError] = useState("");
+  const [analyzing, setAnalyzing] = useState(false);
+  const analysisRef = useRef<HTMLElement>(null);
   const taskNames = [...new Set(runs.flatMap((run) => (run.trials || []).map((trial) => trial.task)))].sort();
   const trialStatuses = [...new Set(runs.flatMap((run) =>
     (run.trials || []).map((trial) => trial.status),
@@ -1683,6 +1743,36 @@ function Compare({
     matchesTrialFilters(trial) &&
     (taskFilter === "all" || trial.task === taskFilter),
   );
+  const analysisSelectionKeys = visibleSelectedEntries.map(({ key }) => key);
+  const analysisScopeKey = [...analysisSelectionKeys].sort().join("|");
+  useEffect(() => {
+    setAnalysis(undefined);
+    setAnalysisError("");
+  }, [analysisScopeKey]);
+  useEffect(() => {
+    if (!analysis && !analysisError) return;
+    const frame = requestAnimationFrame(() => {
+      analysisRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [analysis, analysisError]);
+  const analyzeSelection = async () => {
+    if (!analysisSelectionKeys.length || analyzing) return;
+    setAnalyzing(true);
+    setAnalysisError("");
+    try {
+      setAnalysis(await request<CompareAnalysis>("/api/compare/analyze", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ items: analysisSelectionKeys }),
+      }));
+    } catch (error) {
+      setAnalysis(undefined);
+      setAnalysisError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setAnalyzing(false);
+    }
+  };
   const visibleRunIds = new Set(visibleSelectedEntries.map(({ run }) => run.id));
   const visibleTaskNames = new Set(visibleSelectedEntries.map(({ trial }) => trial.task));
   const visibleComparisonRuns = (comparison?.runs || []).filter((run: Run) =>
@@ -1734,6 +1824,16 @@ function Compare({
           </div>
           <div className="compareselectiontools">
             <b>已选 {selected.length}</b>
+            <small className="compareanalysismodel">分析模型 gpt-5.6-sol · max</small>
+            <button
+              className="secondary compareanalysisbutton"
+              disabled={!analysisSelectionKeys.length || analyzing}
+              onClick={analyzeSelection}
+              title={analysisSelectionKeys.length ? "分析当前筛选中已选择的 Trial" : "当前筛选中没有已选择的 Trial"}
+            >
+              <Sparkles />
+              {analyzing ? "分析中" : "AI 分析"}
+            </button>
             <button
               className="secondary"
               disabled={!visibleSelectionKeys.length || allVisibleSelected}
@@ -1790,6 +1890,50 @@ function Compare({
           <div className="comparefilterempty">没有符合当前筛选条件的 Trial 结果。</div>
         )}
       </section>
+      {(analysis || analysisError) && (
+        <section className="panel compareanalysis" ref={analysisRef}>
+          <div className="comparetitle">
+            <h2>AI 对比分析</h2>
+            {analysis && <span className="compareanalysismeta">分析模型 {analysis.model} · {analysis.reasoning_effort}</span>}
+          </div>
+          {analysisError ? (
+            <div className="compareanalysiserror">{analysisError}</div>
+          ) : analysis && (
+            <>
+              <div className="compareanalysissummary">
+                <span>共 {analysis.summary.total}</span>
+                <span className="equal">一致 {analysis.summary.consistent}</span>
+                <span className="better">变好 {analysis.summary.better}</span>
+                <span className="worse">变坏 {analysis.summary.worse}</span>
+                <span>无法判断 {analysis.summary.unavailable}</span>
+                <span>严格 {analysis.summary.strict} · 参考 {analysis.summary.reference}</span>
+              </div>
+              <div className="compareanalysistext">{analysis.analysis}</div>
+              <div className="compareanalysisfacts">
+                <b>Task / Run</b><b>结论</b><b>通过率</b><b>平均用时</b><b>平均成本</b><b>平均步骤</b>
+                {analysis.comparisons.map((item) => {
+                  const verdictTone = item.verdict === "consistent"
+                    ? "equal"
+                    : item.verdict === "unavailable" ? "unknown" : item.verdict;
+                  const durationTone = comparisonTone(item.local.avg_duration_seconds, item.official.avg_duration_seconds, false);
+                  const costTone = comparisonTone(item.local.avg_cost_usd, item.official.avg_cost_usd, false);
+                  const stepsTone = comparisonTone(item.local.avg_steps, item.official.avg_steps, false);
+                  return (
+                    <React.Fragment key={`${item.run_id}:${item.task}`}>
+                      <span><b>{item.task}</b><small>{item.run_code || `RUN-${String(item.run_id).padStart(6, "0")}`} · {item.agent} · {item.model} · {item.reasoning_effort}</small></span>
+                      <span className={`comparevalue ${verdictTone}`}>{analysisVerdictLabel(item.verdict)}</span>
+                      <span className={`compareanalysismetric ${verdictTone}`}><b>{compactPercent(item.local.pass_rate)}</b><small>官方 {compactPercent(item.official.pass_rate)} · {item.local.attempts ?? 0}/{item.official.trials ?? 0} trials</small></span>
+                      <span className={`compareanalysismetric ${durationTone}`}><b>{compactMinutes(item.local.avg_duration_seconds)}</b><small>官方 {compactMinutes(item.official.avg_duration_seconds)}</small></span>
+                      <span className={`compareanalysismetric ${costTone}`}><b>{compactMoney(item.local.avg_cost_usd)}</b><small>官方 {compactMoney(item.official.avg_cost_usd)}</small></span>
+                      <span className={`compareanalysismetric ${stepsTone}`}><b>{compactNumber(item.local.avg_steps)}</b><small>官方 {compactNumber(item.official.avg_steps)}</small></span>
+                    </React.Fragment>
+                  );
+                })}
+              </div>
+            </>
+          )}
+        </section>
+      )}
       {summaries.length > 0 && (
         <>
           <section className="metrics">

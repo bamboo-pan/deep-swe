@@ -14,6 +14,9 @@ from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete, select
 from .config import settings
+from .compare_analysis import (
+    CompareAnalysisInputError, CompareAnalysisProviderError, analyze_compare_items,
+)
 from .database import SessionLocal, init_db
 from .diagnostics import run_checks
 from .docker_cleanup import (
@@ -30,8 +33,9 @@ from .results import (
 )
 from .runner import cancel_run, create_run, get_run, list_runs, reap_orphaned_runs, run_log, shutdown_processes
 from .schemas import (
-    MAX_CONCURRENCY_PER_RUN, BaselineDraft, CompareRequest, DockerCleanupRequest,
-    RestorePayload, RunDraft, SettingsUpdate, concurrency_advice, total_parallel_tasks,
+    MAX_CONCURRENCY_PER_RUN, BaselineDraft, CompareAnalysisRequest, CompareRequest,
+    DockerCleanupRequest, RestorePayload, RunDraft, SettingsUpdate, concurrency_advice,
+    total_parallel_tasks,
 )
 from .security import is_safe_job_name, read_credential
 
@@ -273,6 +277,16 @@ def compare_options():
 @app.post("/api/compare")
 def compare_selected(payload: CompareRequest):
     return compare_runs([], _parse_compare_items(payload.items) or None)
+
+@app.post("/api/compare/analyze")
+def analyze_selected_comparison(payload: CompareAnalysisRequest):
+    selections = _parse_compare_items(payload.items)
+    try:
+        return analyze_compare_items(selections)
+    except CompareAnalysisInputError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except CompareAnalysisProviderError as exc:
+        raise HTTPException(502, str(exc)) from exc
 
 def _parse_compare_items(items: list[str]) -> list[tuple[int, str]]:
     selections=[]

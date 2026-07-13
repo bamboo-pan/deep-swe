@@ -101,6 +101,12 @@ def test_compare_rejects_invalid_item_key():
         assert client.get("/api/compare", params={"items":"not-a-pair"}).status_code == 422
         assert client.post("/api/compare", json={"items":["not-a-pair"]}).status_code == 422
 
+def test_compare_analysis_is_unavailable_without_selected_results():
+    with TestClient(app) as client:
+        response = client.post("/api/compare/analyze", json={"items": []})
+        assert response.status_code == 422
+        assert "没有可分析" in response.json()["detail"]
+
 def test_delete_terminal_run_and_reject_active_run():
     with TestClient(app) as client:
         with SessionLocal() as db:
