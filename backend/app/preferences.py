@@ -10,7 +10,7 @@ from .security import read_credential
 KEYS = (
     "credential_file", "jobs_dir", "default_agent", "default_model", "default_effort", "default_concurrency",
     "docker_cleanup_after_run", "docker_cleanup_on_delete", "docker_cache_retention_hours", "docker_cache_warning_gb",
-    "run_budget_usd",
+    "run_budget_usd", "trial_budget_usd",
 )
 
 def _defaults() -> dict:
@@ -26,6 +26,7 @@ def _defaults() -> dict:
         "docker_cache_retention_hours": settings.docker_cache_retention_hours,
         "docker_cache_warning_gb": settings.docker_cache_warning_gb,
         "run_budget_usd": settings.run_budget_usd,
+        "trial_budget_usd": settings.trial_budget_usd,
     }
 
 def get_preferences() -> dict:

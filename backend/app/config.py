@@ -17,6 +17,7 @@ class AppSettings(BaseSettings):
     docker_cleanup_on_delete: bool = True
     docker_cache_retention_hours: int = 168
     docker_cache_warning_gb: int = 20
-    run_budget_usd: float = 10.0  # 单次 Run 的费用熔断上限，0 表示禁用（失控体量护栏不受此开关影响）
+    run_budget_usd: float = 10.0  # 整个 Run 累计费用的兜底熔断，0 表示禁用（失控体量护栏不受此开关影响）
+    trial_budget_usd: float = 8.0  # 单个 Trial（一个任务的一次执行）的费用熔断，0 表示禁用
 
 settings = AppSettings()

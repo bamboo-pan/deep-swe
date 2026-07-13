@@ -14,6 +14,8 @@ from .security import redact
 
 TIER_MULTIPLIER = {"standard": 1.0, "batch": 0.5, "priority": 2.0}
 CONTROL_TASK = "actionlint-action-pinning-lint"
+TRIAL_TERMINAL_STATES = {"completed", "failed", "cancelled", "interrupted"}
+
 def run_code(run_id: int) -> str:
     return f"RUN-{run_id:06d}"
 
@@ -138,6 +140,23 @@ def _trial(folder: Path, include_patch: bool = True, expected_tasks: list[str] |
         failure_type, f"{failure_message or ''}\n{agent_log_tail}"
     ):
         failure_type = "InfrastructureNetworkError"
+    # 守护线程按单 Trial 限额掐容器时会留下 guard.json；容器被杀的报错样子像
+    # 基础设施故障，必须让护栏原因盖过 transient 归类，避免误导排障
+    guard_reason = _json(folder / "guard.json").get("reason")
+    if guard_reason:
+        failure_type = "UsageGuardTerminated"
+        failure_message = guard_reason + (f"；{failure_message}" if failure_message else "")
+    reward = rewards.get("reward")
+    if not failure_type and reward is not None and reward < 1:
+        failure_type = "VerificationFailed"
+        score_parts = []
+        for label in ("f2p", "p2p"):
+            passed, total = rewards.get(f"{label}_passed"), rewards.get(f"{label}_total")
+            if passed is not None and total is not None:
+                score_parts.append(f"{label.upper()} {passed}/{total}")
+        failure_message = "验证未通过" + (f"：{'，'.join(score_parts)}" if score_parts else f"（reward {reward}）")
+    redacted_failure = redact(str(failure_message), current_secrets())[:4000] if failure_message else None
+    collapsed_failure = " ".join(redacted_failure.split()) if redacted_failure else None
     return {
         "id": folder.name,
         **task_identity(task_name),
@@ -146,7 +165,7 @@ def _trial(folder: Path, include_patch: bool = True, expected_tasks: list[str] |
         "finished_at": data.get("finished_at"),
         "duration_seconds": _seconds(data.get("started_at"), data.get("finished_at")),
         "agent_duration_seconds": _seconds(agent_execution.get("started_at"), agent_execution.get("finished_at")),
-        "reward": rewards.get("reward"),
+        "reward": reward,
         "partial": rewards.get("partial"),
         "f2p": rewards.get("f2p"),
         "f2p_passed": rewards.get("f2p_passed"),
@@ -161,7 +180,11 @@ def _trial(folder: Path, include_patch: bool = True, expected_tasks: list[str] |
         "steps": data.get("n_agent_steps") or agent.get("n_agent_steps"),
         "agent_version": info.get("version"),
         "failure_type": failure_type,
-        "failure_message": (redact(str(failure_message), current_secrets())[:4000] if failure_message else None),
+        "failure_message": redacted_failure,
+        "failure_summary": (
+            f"{failure_type}: {collapsed_failure}"[:320]
+            if failure_type and collapsed_failure else failure_type or collapsed_failure
+        ),
         "patch": patch[-100000:],
         "patch_bytes": patch_path.stat().st_size if patch_path.exists() else 0,
     }
@@ -170,12 +193,41 @@ def _enrich_trials(run: Run, trials: list[dict]) -> list[dict]:
     attempts: dict[str, int] = {}
     for trial in trials:
         task = trial["task"]
-        attempts[task] = attempts.get(task, 0) + 1
-        trial["attempt"] = attempts[task]
+        attempt = trial.get("attempt")
+        if not isinstance(attempt, int) or attempt < 1:
+            attempt = attempts.get(task, 0) + 1
+            trial["attempt"] = attempt
+        attempts[task] = max(attempts.get(task, 0), attempt)
         trial["run_code"] = run_code(run.id)
-        trial["trial_code"] = f"{run_code(run.id)} / {trial['task_code']} / A{attempts[task]:02d}"
+        trial["trial_code"] = f"{run_code(run.id)} / {trial['task_code']} / A{attempt:02d}"
         trial["resource_name"] = trial["id"] if "#" not in trial["id"] else None
     return trials
+
+def deleted_trial_entries(run: Run) -> list[dict]:
+    """Validated tombstones for Trial rows intentionally removed from a terminal Run."""
+    try:
+        raw = json.loads(run.deleted_trials_json or "[]")
+        expected_tasks = set(json.loads(run.tasks_json))
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    result, seen_ids, seen_slots = [], set(), set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        trial_id, task, attempt = item.get("id"), item.get("task"), item.get("attempt")
+        if (
+            not isinstance(trial_id, str) or not trial_id or len(trial_id) > 300
+            or task not in expected_tasks or not isinstance(attempt, int)
+            or attempt < 1 or attempt > run.attempts_per_task
+            or trial_id in seen_ids or (task, attempt) in seen_slots
+        ):
+            continue
+        result.append({"id": trial_id, "task": task, "attempt": attempt})
+        seen_ids.add(trial_id)
+        seen_slots.add((task, attempt))
+    return result
 
 def trial_folder(run: Run, trial_id: str) -> Path | None:
     root = jobs_root_for(run) / run.job_name
@@ -184,17 +236,20 @@ def trial_folder(run: Run, trial_id: str) -> Path | None:
     return next((p for p in root.iterdir() if p.is_dir() and p.name == trial_id), None)
 
 def trial_detail(run: Run, trial_id: str) -> dict | None:
+    summary = next((trial for trial in run_detail(run, include_patches=False)["trials"] if trial["id"] == trial_id), None)
+    if not summary:
+        return None
     folder = trial_folder(run, trial_id)
     if not folder:
-        return None
-    expected_tasks = json.loads(run.tasks_json)
-    root = jobs_root_for(run) / run.job_name
-    folders = sorted((p for p in root.iterdir() if p.is_dir() and "__" in p.name), key=lambda p: p.name)
-    trials = [_trial(item, include_patch=item == folder, expected_tasks=expected_tasks) for item in folders]
-    _enrich_trials(run, trials)
-    return next((trial for trial in trials if trial["id"] == trial_id), None)
+        return summary
+    detailed = _trial(folder, include_patch=True, expected_tasks=json.loads(run.tasks_json))
+    for key in ("attempt", "run_code", "trial_code", "resource_name"):
+        detailed[key] = summary.get(key)
+    return detailed
 
 def trial_log(run: Run, trial_id: str) -> str:
+    if trial_id in {item["id"] for item in deleted_trial_entries(run)}:
+        return ""
     folder = trial_folder(run, trial_id)
     if not folder:
         return ""
@@ -205,15 +260,29 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
     root = jobs_root_for(run) / run.job_name
     job = _json(root / "result.json")
     stats = job.get("stats") or {}
-    trial_folders = sorted((p for p in root.iterdir() if p.is_dir() and "__" in p.name), key=lambda p: p.name) if root.exists() else []
     expected_tasks = json.loads(run.tasks_json)
+    deleted_entries = deleted_trial_entries(run)
+    deleted_ids = {item["id"] for item in deleted_entries}
+    deleted_attempts = {(item["task"], item["attempt"]) for item in deleted_entries}
+    trial_folders = sorted(
+        (p for p in root.iterdir() if p.is_dir() and "__" in p.name and p.name not in deleted_ids),
+        key=lambda p: p.name,
+    ) if root.exists() else []
     trials = [_trial(folder, include_patch=include_patches, expected_tasks=expected_tasks) for folder in trial_folders]
-    if run.status in {"failed", "cancelled", "interrupted"}:
+    terminal_defaults = {
+        "failed": ("failed", "RunFailed", "Run 失败，Trial 未完成"),
+        "cancelled": ("cancelled", "RunCancelled", "Run 已取消，Trial 未完成"),
+        "interrupted": ("interrupted", "RunInterrupted", "Run 被中断，Trial 未完成"),
+        "completed": ("failed", "ResultMissing", "Run 已结束，但 Trial 结果缺失"),
+    }
+    if run.status in terminal_defaults:
+        status, failure_type, default_message = terminal_defaults[run.status]
         for trial in trials:
-            if trial["status"] not in {"completed", "failed"}:
-                trial["status"] = "failed"
-                trial["failure_type"] = trial.get("failure_type") or "RunTerminated"
-                trial["failure_message"] = trial.get("failure_message") or run.error
+            if trial["status"] not in TRIAL_TERMINAL_STATES:
+                trial["status"] = status
+                trial["failure_type"] = trial.get("failure_type") or failure_type
+                trial["failure_message"] = trial.get("failure_message") or run.error or default_message
+                trial["failure_summary"] = f"{trial['failure_type']}: {trial['failure_message']}"[:320]
     # result.json 尚未写出时 trial 任务名回退到目录名（32 字符截断），归一回全名，
     # 否则占位补齐会产生幽灵 trial、compare 出现假任务行
     prefix_map = {}
@@ -224,24 +293,54 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
             full = prefix_map.get(trial["task"])
             if full:
                 trial.update(task_identity(full))
-    expected = [(task, attempt) for task in expected_tasks for attempt in range(1, run.attempts_per_task + 1)]
-    existing_tasks = [trial["task"] for trial in trials]
-    for task, attempt in expected:
-        if existing_tasks.count(task) < attempt:
-            terminal = run.status in {"failed", "cancelled", "interrupted"}
-            trials.append({"id": f"{task}#{attempt}", **task_identity(task), "status": "failed" if terminal else "queued", "reward": None, "partial": None, "duration_seconds": None, "agent_duration_seconds": None, "input_tokens": None, "cached_tokens": None, "output_tokens": None, "reported_cost_usd": None, "steps": None, "patch": "", "patch_bytes": 0, "failure_type": "RunTerminated" if terminal else None, "failure_message": run.error if terminal else None})
+    for task in expected_tasks:
+        task_trials = [trial for trial in trials if trial["task"] == task]
+        available_attempts = [
+            attempt for attempt in range(1, run.attempts_per_task + 1)
+            if (task, attempt) not in deleted_attempts
+        ]
+        for index, trial in enumerate(task_trials):
+            trial["attempt"] = available_attempts[index] if index < len(available_attempts) else run.attempts_per_task + index + 1
+        for attempt in available_attempts[len(task_trials):]:
+            if run.status in terminal_defaults:
+                status, failure_type, default_message = terminal_defaults[run.status]
+                failure_message = run.error or default_message
+            else:
+                status, failure_type, failure_message = "queued", None, None
+            trials.append({
+                "id": f"{task}#{attempt}", **task_identity(task), "attempt": attempt,
+                "status": status, "reward": None, "partial": None, "f2p": None, "p2p": None,
+                "duration_seconds": None, "agent_duration_seconds": None,
+                "input_tokens": None, "cached_tokens": None, "output_tokens": None,
+                "reported_cost_usd": None, "steps": None, "patch": "", "patch_bytes": 0,
+                "failure_type": failure_type, "failure_message": failure_message,
+                "failure_summary": f"{failure_type}: {failure_message}"[:320] if failure_type and failure_message else failure_type,
+            })
+    task_order = {task: index for index, task in enumerate(expected_tasks)}
+    trials.sort(key=lambda trial: (task_order.get(trial["task"], len(task_order)), trial.get("attempt", 0), trial["id"]))
     _enrich_trials(run, trials)
-    completed = sum(t["status"] in {"completed", "failed"} for t in trials)
+    completed = sum(t["status"] in TRIAL_TERMINAL_STATES for t in trials)
     passed = sum(t.get("reward") == 1 for t in trials)
+    remaining_tasks = {trial["task"] for trial in trials}
     passed_tasks = sum(
         any(t.get("reward") == 1 for t in trials if t["task"] == task)
-        for task in expected_tasks
+        for task in expected_tasks if task in remaining_tasks
     )
-    stage = "completed" if run.status == "completed" else "failed" if run.status in {"failed", "cancelled", "interrupted"} else next((t["status"] for t in trials if t["status"] not in {"queued", "completed", "failed"}), run.status)
-    total = len(expected)
-    input_tokens = stats.get("n_input_tokens", run.input_tokens)
-    cached_tokens = stats.get("n_cache_tokens", run.cached_tokens)
-    output_tokens = stats.get("n_output_tokens", run.output_tokens)
+    stage = run.status if run.status in terminal_defaults else next((t["status"] for t in trials if t["status"] not in {"queued", "completed", "failed"}), run.status)
+    total = len(trials)
+    if deleted_entries:
+        def visible_total(field: str):
+            values = [trial.get(field) for trial in trials if trial.get(field) is not None]
+            return sum(values) if values else None
+        input_tokens = visible_total("input_tokens")
+        cached_tokens = visible_total("cached_tokens")
+        output_tokens = visible_total("output_tokens")
+        reported_cost = visible_total("reported_cost_usd")
+    else:
+        input_tokens = stats.get("n_input_tokens", run.input_tokens)
+        cached_tokens = stats.get("n_cache_tokens", run.cached_tokens)
+        output_tokens = stats.get("n_output_tokens", run.output_tokens)
+        reported_cost = stats.get("cost_usd", run.cost_usd)
     with SessionLocal() as db:
         baseline = db.scalar(select(Baseline).where(Baseline.run_id == run.id))
     return {
@@ -254,7 +353,7 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
         "agent_timeout_seconds": run.agent_timeout_seconds, "verifier_timeout_seconds": run.verifier_timeout_seconds,
         "verification": run.verification, "retry_infrastructure_errors": run.retry_infrastructure_errors,
         "infrastructure_max_retries": run.infrastructure_max_retries,
-        "claude_max_turns": run.claude_max_turns,
+        "agent_max_steps": run.agent_max_steps,
         "codex_request_max_retries": run.codex_request_max_retries,
         "codex_stream_max_retries": run.codex_stream_max_retries,
         "codex_stream_idle_timeout_seconds": run.codex_stream_idle_timeout_seconds,
@@ -262,10 +361,11 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
         "created_at": run.created_at, "finished_at": run.finished_at, "passed": run.passed, "reward": run.reward,
         "input_tokens": input_tokens, "cached_tokens": cached_tokens, "uncached_input_tokens": max((input_tokens or 0) - (cached_tokens or 0), 0),
         "cache_write_tokens": None,  # Pier 未返回该字段，按约定存 null
-        "output_tokens": output_tokens, "reported_cost_usd": stats.get("cost_usd", run.cost_usd),
+        "output_tokens": output_tokens, "reported_cost_usd": reported_cost,
         "estimated_cost_usd": estimate_cost(input_tokens, cached_tokens, output_tokens, run.service_tier),
         "error": run.error, "progress": {"completed": completed, "total": total, "passed": passed, "percent": round(completed / total * 100) if total else 0},
-        "task_progress": {"passed": passed_tasks, "total": len(expected_tasks)},
+        "task_progress": {"passed": passed_tasks, "total": len(remaining_tasks)},
+        "deleted_trials": len(deleted_entries),
         "job_stats": {key: stats.get(key) for key in ("n_completed_trials", "n_errored_trials", "n_running_trials", "n_pending_trials", "n_cancelled_trials", "n_retries")},
         "trials": trials, "is_baseline": bool(baseline), "baseline_name": baseline.name if baseline else None,
     }
@@ -274,14 +374,46 @@ def run_task_progress(run: Run) -> dict:
     """Return task-level pass counts without building the full run detail payload."""
     expected_tasks = json.loads(run.tasks_json)
     root = jobs_root_for(run) / run.job_name
+    deleted_entries = deleted_trial_entries(run)
+    deleted_ids = {item["id"] for item in deleted_entries}
+    deleted_slots = {(item["task"], item["attempt"]) for item in deleted_entries}
+    remaining_tasks = {
+        task for task in expected_tasks
+        if any((task, attempt) not in deleted_slots for attempt in range(1, run.attempts_per_task + 1))
+    }
     passed_tasks: set[str] = set()
     if root.exists():
-        for folder in (p for p in root.iterdir() if p.is_dir() and "__" in p.name):
+        for folder in (p for p in root.iterdir() if p.is_dir() and "__" in p.name and p.name not in deleted_ids):
             data = _json(folder / "result.json")
             reward = ((data.get("verifier_result") or {}).get("rewards") or {}).get("reward")
             if reward == 1:
                 passed_tasks.add(_canonical_task_name(folder, data, expected_tasks))
-    return {"passed": sum(task in passed_tasks for task in expected_tasks), "total": len(expected_tasks)}
+    return {"passed": sum(task in passed_tasks for task in remaining_tasks), "total": len(remaining_tasks)}
+
+def run_trial_progress(run: Run) -> dict:
+    """Return configured Trial-level progress for lightweight run history rows."""
+    expected_tasks = json.loads(run.tasks_json)
+    deleted_ids = {item["id"] for item in deleted_trial_entries(run)}
+    total = max(len(expected_tasks) * run.attempts_per_task - len(deleted_ids), 0)
+    root = jobs_root_for(run) / run.job_name
+    passed = 0
+    completed = 0
+    if root.exists():
+        for folder in (p for p in root.iterdir() if p.is_dir() and "__" in p.name and p.name not in deleted_ids):
+            result_path = folder / "result.json"
+            data = _json(result_path)
+            reward = ((data.get("verifier_result") or {}).get("rewards") or {}).get("reward")
+            passed += reward == 1
+            completed += result_path.exists()
+    if run.status in {"failed", "cancelled", "interrupted", "completed"}:
+        completed = total
+    completed = min(completed, total)
+    return {
+        "completed": completed,
+        "total": total,
+        "passed": passed,
+        "percent": round(completed / total * 100) if total else 0,
+    }
 
 def list_details() -> list[dict]:
     with SessionLocal() as db:
@@ -289,14 +421,37 @@ def list_details() -> list[dict]:
         return [run_detail(row, include_patches=False) for row in rows]
 
 def compare_runs(run_ids: list[int], selections: list[tuple[int, str]] | None = None) -> dict:
-    selected_pairs = set(selections or [])
-    if selected_pairs:
-        run_ids = list(dict.fromkeys(run_id for run_id, _ in selections or []))
+    selection_pairs = list(dict.fromkeys(selections or []))
+    selected_pairs = set(selection_pairs)
+    if selection_pairs:
+        run_ids = list(dict.fromkeys(run_id for run_id, _ in selection_pairs))
     with SessionLocal() as db:
         rows = [db.get(Run, run_id) for run_id in run_ids]
     details = [run_detail(row, include_patches=False) for row in rows if row]
-    task_names = (sorted({task for _, task in selected_pairs}) if selected_pairs
-                  else sorted(set.intersection(*[set(detail["tasks"]) for detail in details])) if details else [])
+    selected_trials: dict[int, list[dict]] = {}
+    if selected_pairs:
+        for detail in details:
+            by_id = {trial["id"]: trial for trial in detail["trials"]}
+            chosen = []
+            seen_ids: set[str] = set()
+            for run_id, item_id in selection_pairs:
+                if run_id != detail["id"]:
+                    continue
+                # New selections identify one exact Trial. Task ids remain accepted so
+                # old URLs/API clients continue to select every attempt for that task.
+                candidates = [by_id[item_id]] if item_id in by_id else [
+                    trial for trial in detail["trials"] if trial["task"] == item_id
+                ]
+                for trial in candidates:
+                    if trial["id"] not in seen_ids:
+                        seen_ids.add(trial["id"])
+                        chosen.append(trial)
+            selected_trials[detail["id"]] = chosen
+    task_names = (
+        sorted({trial["task"] for trials in selected_trials.values() for trial in trials})
+        if selected_pairs
+        else sorted(set.intersection(*[set(detail["tasks"]) for detail in details])) if details else []
+    )
     official = load_official_stats()
     matrix = []
     for task in task_names:
@@ -304,7 +459,12 @@ def compare_runs(run_ids: list[int], selections: list[tuple[int, str]] | None = 
         item = {**task_identity(task), "runs": {}, "official": task_official, "official_configurations": []}
         seen_configurations: set[tuple[str, str]] = set()
         for detail in details:
-            if selected_pairs and (detail["id"], task) not in selected_pairs:
+            task_trials = (
+                [trial for trial in selected_trials.get(detail["id"], []) if trial["task"] == task]
+                if selected_pairs
+                else [trial for trial in detail["trials"] if trial["task"] == task]
+            )
+            if selected_pairs and not task_trials:
                 continue
             configuration_key = (normalize_model_name(detail["model"]), detail["reasoning_effort"].lower())
             if configuration_key not in seen_configurations:
@@ -316,7 +476,7 @@ def compare_runs(run_ids: list[int], selections: list[tuple[int, str]] | None = 
                     "available": exact is not None,
                     **(exact or {}),
                 })
-            values = [t for t in detail["trials"] if t["task"] == task and t.get("reward") is not None]
+            values = [trial for trial in task_trials if trial.get("reward") is not None]
             durations = [t["duration_seconds"] for t in values if t.get("duration_seconds") is not None]
             def average(field: str) -> float | None:
                 present = [t[field] for t in values if t.get(field) is not None]
@@ -327,8 +487,10 @@ def compare_runs(run_ids: list[int], selections: list[tuple[int, str]] | None = 
             ]
             estimated_costs = [value for value in estimated_costs if value is not None]
             item["runs"][str(detail["id"])] = {
-                "passed": any(t["reward"] == 1 for t in values),
-                "attempts": len(values),
+                "passed": any(t["reward"] == 1 for t in values) if values else None,
+                "attempts": len(task_trials),
+                "measured_attempts": len(values),
+                "trial_ids": [trial["id"] for trial in task_trials],
                 "pass_rate": mean(t["reward"] == 1 for t in values) if values else None,
                 "reward": mean(t["reward"] for t in values) if values else None,
                 "duration_seconds": mean(durations) if durations else None,
@@ -342,7 +504,7 @@ def compare_runs(run_ids: list[int], selections: list[tuple[int, str]] | None = 
                 "total_estimated_cost_usd": sum(estimated_costs) if estimated_costs else None,
             }
         matrix.append(item)
-    return {"runs": details, "tasks": matrix, "selections": [f"{run_id}:{task}" for run_id, task in selections or []]}
+    return {"runs": details, "tasks": matrix, "selections": [f"{run_id}:{item_id}" for run_id, item_id in selection_pairs]}
 
 def _pass_rate(detail: dict) -> float:
     total = detail["progress"]["total"]

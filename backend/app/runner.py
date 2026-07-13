@@ -19,8 +19,8 @@ from .docker_cleanup import DockerCleanupPolicy, cleanup_job_resources, docker_a
 from .models import ACTIVE_STATES, TERMINAL_STATES, Run
 from .preferences import credential_path, current_secrets, get_preferences, jobs_path
 from .pier_retry_patch.networking import trial_network_subnets
-from .results import _json as read_json, estimate_cost, jobs_root_for, run_code, run_task_progress
-from .schemas import RunDraft
+from .results import _json as read_json, estimate_cost, jobs_root_for, run_code, run_task_progress, run_trial_progress
+from .schemas import RunDraft, concurrency_advice, total_parallel_tasks
 from .security import read_credential, redact
 
 _processes: dict[int, subprocess.Popen] = {}
@@ -28,12 +28,19 @@ _lock = threading.Lock()
 # 取消与结果落库都要做「读状态→写状态」，用同一把锁避免最后写者赢
 _state_lock = threading.Lock()
 
-# 2026-07-12 试运行事故（单 Trial 烧掉约 $225）后引入的用量护栏，见 审查报告.md
-MINI_STEP_LIMIT = 250
+# 2026-07-12 试运行事故（单 Trial 烧掉约 $225）后引入的用量护栏，见 LESSONS-LEARNED.md §5
 GUARD_CHECK_INTERVAL_SEC = 20
+# mini（cost_limit/step_limit）与 claude-code（max_budget_usd/max_turns）有原生限额，
+# 兜底留出裕量避免和原生限额抢跑（原生触发是优雅停止，verifier 仍可产出 reward）；
+# codex 没有任何原生限额，兜底就是唯一防线，不留裕量
+TRIAL_GUARD_COST_MARGIN = 1.5
+TRIAL_GUARD_STEP_MARGIN = 30
+NATIVE_LIMIT_AGENTS = ("mini-swe-agent", "claude-code")
 RUNAWAY_AGENT_LOG_MB = 30       # 正常 Trial 的 agent 日志在个位数 MB；事故 Trial 43 分钟写了 278MB
 RUNAWAY_SUBAGENT_FILES = 60     # 禁用 Task/Agent 工具后应恒为 0；事故 Trial 产生了 5374 个会话文件
-INFRASTRUCTURE_RETRY_DELAYS_SEC = (2, 5, 15, 45, 135, 405)
+# 首档保持秒级应付瞬时抖动（apt 偶发 502），后段拉到分钟级覆盖 GitHub TLS
+# 封锁这类持续数分钟的故障（run-000001 四个镜像构建失败的教训）
+INFRASTRUCTURE_RETRY_DELAYS_SEC = (5, 30, 120, 300, 600, 900)
 DOCKER_CONNECTIVITY_IMAGE = "alpine:3.20"
 DOCKER_CONNECTIVITY_TIMEOUT_SEC = 8
 
@@ -146,16 +153,17 @@ def _codex_config(
         encoding="utf-8", newline="\n")
     return path
 
-def _mini_limits_config(folder: Path) -> Path:
-    """mini-swe-agent 的 cost_limit 走 litellm 价格表，自建网关模型算不出成本（恒为 0），
-    只有 step_limit 是确定性护栏；pier adapter 会把该文件内容写进容器再以 -c 追加。"""
+def _mini_limits_config(folder: Path, step_limit: int) -> Path:
+    """mini-swe-agent 的 step_limit 是确定性护栏；cost_limit 走 --agent-kwarg 单独传，
+    自建网关模型 litellm 算不出成本时恒为 0、不会触发，由守护线程按 token 估算兜底。
+    pier adapter 会把该文件内容写进容器再以 -c 追加。"""
     path = folder / "mini-limits.yaml"
     # mini-swe-agent/litellm otherwise creates a fresh prompt_cache_key for
     # every turn.  Keep one key for the whole trial so growing conversation
     # prefixes can hit the provider cache.
     cache_key = f"deepswe-{uuid.uuid4().hex}"
     path.write_text(
-        f"agent:\n  step_limit: {MINI_STEP_LIMIT}\n"
+        f"agent:\n  step_limit: {step_limit}\n"
         f"model:\n  model_kwargs:\n    prompt_cache_key: {cache_key}\n"
         "    prompt_cache_retention: 24h\n",
         encoding="utf-8", newline="\n")
@@ -190,8 +198,12 @@ def _declared_timeouts(tasks: list[str]) -> tuple[float, float]:
     return max(agent_values, default=5400.0), max(verifier_values, default=1800.0)
 
 def create_run(draft: RunDraft) -> Run:
-    if draft.concurrency > 4 or (draft.concurrency == 4 and not draft.confirm_high_concurrency):
-        raise ValueError("并发配置未获允许")
+    parallel_tasks = total_parallel_tasks(draft)
+    advice = concurrency_advice(parallel_tasks)
+    if advice["level"] == "blocked":
+        raise ValueError(advice["message"])
+    if advice["requires_confirmation"] and not draft.confirm_high_concurrency:
+        raise ValueError(f"总并行 Trial 数 {parallel_tasks} 需要高负载确认")
     with SessionLocal() as db:
         mapping = "thinking=disabled" if draft.agent == "claude-code" and draft.reasoning_effort == "none" else ("model_reasoning_effort=" + draft.reasoning_effort if draft.agent == "codex" else "reasoning_effort=" + draft.reasoning_effort)
         run = Run(
@@ -203,7 +215,7 @@ def create_run(draft: RunDraft) -> Run:
             verifier_timeout_seconds=draft.verifier_timeout_seconds,
             retry_infrastructure_errors=draft.retry_infrastructure_errors,
             infrastructure_max_retries=draft.infrastructure_max_retries,
-            claude_max_turns=draft.claude_max_turns,
+            agent_max_steps=draft.agent_max_steps,
             codex_request_max_retries=draft.codex_request_max_retries,
             codex_stream_max_retries=draft.codex_stream_max_retries,
             codex_stream_idle_timeout_seconds=draft.codex_stream_idle_timeout_seconds,
@@ -364,23 +376,96 @@ def _terminate_tree(pid: int) -> None:
         except (ProcessLookupError, PermissionError):
             pass
 
-def _wait_with_guard(proc: subprocess.Popen, job_dir: Path, service_tier: str) -> str | None:
-    """等待 pier 结束，期间周期核查用量；触发护栏时终止进程树并返回原因。"""
+def _trial_usage(trial: Path, service_tier: str) -> tuple[float | None, int | None]:
+    """进行中 Trial 的实时费用与步数；已落盘（有 result.json）的返回空，由 Run 级累计覆盖。
+    容器内 agent 会在运行期间持续更新 ATIF 格式的 agent/trajectory.json（三个 agent 通用）；
+    cost_usd 缺失（自建网关无价格表）时按 token 估算，mini 原生 trajectory 作最后兜底。"""
+    if (trial / "result.json").exists():
+        return None, None
+    data = read_json(trial / "agent" / "trajectory.json")
+    final = data.get("final_metrics") or {}
+    steps = data.get("steps") or []
+    total_steps = final.get("total_steps")
+    n_steps = total_steps if isinstance(total_steps, int) else (len(steps) or None)
+    cost = final.get("total_cost_usd")
+    if not isinstance(cost, (int, float)):
+        cost = estimate_cost(final.get("total_prompt_tokens"), final.get("total_cached_tokens"),
+                             final.get("total_completion_tokens"), service_tier)
+    if cost is None:
+        stats = ((read_json(trial / "agent" / "mini-swe-agent.trajectory.json").get("info") or {})
+                 .get("model_stats") or {})
+        raw = stats.get("instance_cost")
+        if isinstance(raw, (int, float)) and raw > 0:
+            cost = float(raw)
+        if n_steps is None and isinstance(stats.get("api_calls"), int):
+            n_steps = stats["api_calls"]
+    return (float(cost) if isinstance(cost, (int, float)) else None), n_steps
+
+def _terminate_trial(trial: Path, reason: str) -> bool:
+    """只掐超限 Trial 的容器（compose project 即小写 trial 名），
+    pier 会把该 Trial 记为失败并继续其余任务；掐失败则下个周期重试。"""
+    docker = shutil.which("docker") or "docker"
     try:
-        budget = float(get_preferences().get("run_budget_usd") or 0)
-    except (TypeError, ValueError):
-        budget = 0.0
+        listed = subprocess.run(
+            [docker, "ps", "-q", "--filter", f"label=com.docker.compose.project={trial.name.lower()}"],
+            capture_output=True, text=True, timeout=20)
+        containers = listed.stdout.split()
+        if listed.returncode != 0 or not containers:
+            return False
+        killed = subprocess.run([docker, "kill", *containers], capture_output=True, timeout=60)
+        if killed.returncode != 0:
+            return False
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    try:
+        (trial / "guard.json").write_text(json.dumps(
+            {"reason": f"用量护栏终止该 Trial：{reason}",
+             "terminated_at": datetime.now(UTC).isoformat()}, ensure_ascii=False),
+            encoding="utf-8", newline="\n")
+    except OSError:
+        pass
+    return True
+
+def _wait_with_guard(proc: subprocess.Popen, job_dir: Path, service_tier: str,
+                     agent: str, max_steps: int) -> str | None:
+    """等待 pier 结束，期间周期核查用量。单 Trial 超限只掐该 Trial 的容器，
+    其余任务继续；Run 级累计超限或失控体征才终止整个进程树。"""
+    prefs = get_preferences()
+    def _budget(key: str) -> float:
+        try:
+            return float(prefs.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    run_budget, trial_budget = _budget("run_budget_usd"), _budget("trial_budget_usd")
+    native = agent in NATIVE_LIMIT_AGENTS
+    trial_cost_line = trial_budget * (TRIAL_GUARD_COST_MARGIN if native else 1.0)
+    trial_step_line = max_steps + (TRIAL_GUARD_STEP_MARGIN if native else 0)
+    terminated: set[str] = set()
     while True:
         try:
             proc.wait(timeout=GUARD_CHECK_INTERVAL_SEC)
             return None
         except subprocess.TimeoutExpired:
             pass
+        inflight_cost = 0.0
+        if job_dir.is_dir():
+            for trial in job_dir.iterdir():
+                if not trial.is_dir() or trial.name in terminated:
+                    continue
+                cost, steps = _trial_usage(trial, service_tier)
+                inflight_cost += cost or 0.0
+                trial_reason = None
+                if trial_budget > 0 and cost is not None and cost >= trial_cost_line:
+                    trial_reason = f"费用 ${cost:.2f} 达到单 Trial 上限 ${trial_budget:.2f}"
+                elif max_steps > 0 and steps is not None and steps >= trial_step_line:
+                    trial_reason = f"已执行 {steps} 步，达到最大步数 {max_steps}"
+                if trial_reason and _terminate_trial(trial, trial_reason):
+                    terminated.add(trial.name)
         reason = _runaway_reason(job_dir)
-        if not reason and budget > 0:
-            spent = _completed_trials_cost(job_dir, service_tier)
-            if spent >= budget:
-                reason = f"已落盘 Trial 累计费用 ${spent:.2f} 达到预算上限 ${budget:.2f}"
+        if not reason and run_budget > 0:
+            spent = _completed_trials_cost(job_dir, service_tier) + inflight_cost
+            if spent >= run_budget:
+                reason = f"累计费用 ${spent:.2f}（含进行中 Trial）达到 Run 预算上限 ${run_budget:.2f}"
         if reason:
             _terminate_tree(proc.pid)
             try:
@@ -424,6 +509,10 @@ def _execute(run_id: int):
         process_env["DEEPSWE_PIER_RETRY_DELAYS"] = ",".join(
             str(delay) for delay in INFRASTRUCTURE_RETRY_DELAYS_SEC
         )
+        try:
+            trial_budget = float(get_preferences().get("trial_budget_usd") or 0)
+        except (TypeError, ValueError):
+            trial_budget = 0.0
         if agent == "codex":
             config = _codex_config(
                 cred.url, secret_dir, model, effort,
@@ -434,17 +523,23 @@ def _execute(run_id: int):
             args += ["--agent-env", f"CODEX_AUTH_JSON_PATH={auth}", "--agent-kwarg", f"config_toml_file={config}", "--agent-kwarg", f"reasoning_effort={effort}"]
         elif agent == "mini-swe-agent":
             process_env.update({"OPENAI_API_KEY": cred.token, "OPENAI_BASE_URL": _docker_url(cred.url)})
-            limits = _mini_limits_config(secret_dir)
+            limits = _mini_limits_config(secret_dir, run.agent_max_steps)
             # litellm_response（Responses API 桥）顶层 import litellm.proxy，
             # 需要完整 proxy extras（fastapi/orjson/pyjwt 等），agent 容器默认没装
             args += ["--agent-kwarg", f"reasoning_effort={effort}", "--agent-kwarg", f"config_file={limits}",
                      "--agent-kwarg", 'extra_python_packages=["litellm[proxy]"]']
+            if trial_budget > 0:
+                # mini 原生单 Trial 费用限额（agent.cost_limit，0 = 禁用），到限优雅停止
+                args += ["--agent-kwarg", f"cost_limit={trial_budget}"]
         elif agent == "claude-code":
             process_env.update({"ANTHROPIC_API_KEY": cred.token, "ANTHROPIC_BASE_URL": _anthropic_url(cred.url)})
             # 覆盖 pier 默认的 disallowed_tools=EnterPlanMode，追加 Task/Agent 禁用容器内 subagent：
             # 2026-07-12 事故中主 agent 43 分钟 spawn 2687 个 subagent（6663 万输入 token），
             # max_turns 只约束主对话轮数，对 subagent 无效
-            args += ["--agent-kwarg", f"max_turns={run.claude_max_turns}", "--agent-kwarg", "disallowed_tools=EnterPlanMode,Task,Agent"]
+            args += ["--agent-kwarg", f"max_turns={run.agent_max_steps}", "--agent-kwarg", "disallowed_tools=EnterPlanMode,Task,Agent"]
+            if trial_budget > 0:
+                # claude-code 原生单 Trial 费用限额（--max-budget-usd），到限优雅停止
+                args += ["--agent-kwarg", f"max_budget_usd={trial_budget}"]
             if effort == "none":
                 args += ["--agent-kwarg", "thinking=disabled"]
             else:
@@ -461,7 +556,7 @@ def _execute(run_id: int):
             with _lock: _processes[run_id] = proc
             with SessionLocal() as db:
                 run = db.get(Run, run_id); run.status = "running"; run.pid = proc.pid; db.commit()
-            guard_error = _wait_with_guard(proc, jobs_root / job_name, service_tier)
+            guard_error = _wait_with_guard(proc, jobs_root / job_name, service_tier, agent, run.agent_max_steps)
         if guard_error:
             with _state_lock, SessionLocal() as db:
                 run = db.get(Run, run_id)
@@ -607,7 +702,8 @@ def shutdown_processes() -> None:
             _terminate_tree(proc.pid)
 
 def serialize(run: Run) -> dict:
-    return {"id":run.id,"run_code":run_code(run.id),"job_name":run.job_name,"status":run.status,"agent":run.agent,"model":run.model,"reasoning_effort":run.reasoning_effort,"reasoning_effort_adapter":run.reasoning_effort_adapter,"reasoning_effort_effective":run.reasoning_effort_effective,"pier_version":run.pier_version,"tasks":json.loads(run.tasks_json),"attempts_per_task":run.attempts_per_task,"concurrency":run.concurrency,"agent_timeout_seconds":run.agent_timeout_seconds,"verifier_timeout_seconds":run.verifier_timeout_seconds,"retry_infrastructure_errors":run.retry_infrastructure_errors,"infrastructure_max_retries":run.infrastructure_max_retries,"claude_max_turns":run.claude_max_turns,"codex_request_max_retries":run.codex_request_max_retries,"codex_stream_max_retries":run.codex_stream_max_retries,"codex_stream_idle_timeout_seconds":run.codex_stream_idle_timeout_seconds,"created_at":run.created_at,"finished_at":run.finished_at,"passed":run.passed,"reward":run.reward,"task_progress":run_task_progress(run),"input_tokens":run.input_tokens,"cached_tokens":run.cached_tokens,"uncached_input_tokens":max((run.input_tokens or 0)-(run.cached_tokens or 0),0),"output_tokens":run.output_tokens,"cost_usd":run.cost_usd,"reported_cost_usd":run.cost_usd,"estimated_cost_usd":estimate_cost(run.input_tokens,run.cached_tokens,run.output_tokens,run.service_tier),"service_tier":run.service_tier,"error":run.error}
+    progress = run_trial_progress(run)
+    return {"id":run.id,"run_code":run_code(run.id),"job_name":run.job_name,"status":run.status,"agent":run.agent,"model":run.model,"reasoning_effort":run.reasoning_effort,"reasoning_effort_adapter":run.reasoning_effort_adapter,"reasoning_effort_effective":run.reasoning_effort_effective,"pier_version":run.pier_version,"tasks":json.loads(run.tasks_json),"attempts_per_task":run.attempts_per_task,"concurrency":run.concurrency,"agent_timeout_seconds":run.agent_timeout_seconds,"verifier_timeout_seconds":run.verifier_timeout_seconds,"retry_infrastructure_errors":run.retry_infrastructure_errors,"infrastructure_max_retries":run.infrastructure_max_retries,"agent_max_steps":run.agent_max_steps,"codex_request_max_retries":run.codex_request_max_retries,"codex_stream_max_retries":run.codex_stream_max_retries,"codex_stream_idle_timeout_seconds":run.codex_stream_idle_timeout_seconds,"created_at":run.created_at,"finished_at":run.finished_at,"passed":run.passed,"reward":run.reward,"progress":progress,"task_progress":run_task_progress(run),"input_tokens":run.input_tokens,"cached_tokens":run.cached_tokens,"uncached_input_tokens":max((run.input_tokens or 0)-(run.cached_tokens or 0),0),"output_tokens":run.output_tokens,"cost_usd":run.cost_usd,"reported_cost_usd":run.cost_usd,"estimated_cost_usd":estimate_cost(run.input_tokens,run.cached_tokens,run.output_tokens,run.service_tier),"service_tier":run.service_tier,"error":run.error}
 
 def list_runs() -> list[dict]:
     with SessionLocal() as db: return [serialize(r) for r in db.scalars(select(Run).order_by(Run.id.desc())).all()]

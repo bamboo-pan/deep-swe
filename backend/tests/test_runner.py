@@ -8,7 +8,7 @@ from app import runner
 from app import results
 from app.pier_retry_patch.transient import is_transient_agent_failure
 from app.pier_retry_patch.networking import DEFAULT_NETWORK_POOL, trial_network_subnets
-from app.schemas import RunDraft
+from app.schemas import RunDraft, concurrency_advice, total_parallel_tasks
 
 def make_run(job_name: str, **extra) -> int:
     init_db()
@@ -82,14 +82,14 @@ def test_codex_run_passes_reasoning_effort(tmp_path: Path):
     assert "stream_idle_timeout_ms = 600000" in text
 
 def test_mini_limits_config_sets_step_limit(tmp_path: Path):
-    # cost_limit 对自建网关模型算不出成本，step_limit 是唯一确定性护栏
-    path=runner._mini_limits_config(tmp_path)
+    # step_limit 是运行配置里的最大步数；cost_limit 走 --agent-kwarg 单独传
+    path=runner._mini_limits_config(tmp_path, 180)
     text=path.read_text(encoding="utf-8")
-    assert f"step_limit: {runner.MINI_STEP_LIMIT}" in text and text.startswith("agent:")
+    assert "step_limit: 180" in text and text.startswith("agent:")
     assert "prompt_cache_key: deepswe-" in text and "prompt_cache_retention: 24h" in text
 
 def test_infrastructure_retry_args_are_bounded_and_typed():
-    assert runner.INFRASTRUCTURE_RETRY_DELAYS_SEC == (2, 5, 15, 45, 135, 405)
+    assert runner.INFRASTRUCTURE_RETRY_DELAYS_SEC == (5, 30, 120, 300, 600, 900)
     enabled=runner._pier_retry_args(True, 3)
     assert enabled[:2] == ["--max-retries", "3"]
     assert enabled.count("--retry-include") == 1
@@ -171,6 +171,16 @@ def test_transient_agent_failure_classification_is_selective():
         "NonZeroAgentExitCodeError", "API Error: The operation timed out."
     )
     assert is_transient_agent_failure("ConnectionError", "socket closed")
+    # 2026-07-12 run-000001 实测漏网的两条镜像构建失败（原样字符串，防回归）：
+    # apt 输出 502 与 Bad Gateway 之间是双空格，单空格标记词曾匹配不上
+    assert is_transient_agent_failure(
+        "RuntimeError",
+        "E: Failed to fetch http://deb.debian.org/debian/dists/bookworm/InRelease  502  Bad Gateway [IP: 146.75.46.132 80]",
+    )
+    assert is_transient_agent_failure(
+        "RuntimeError",
+        "curl: (35) OpenSSL SSL_connect: SSL_ERROR_SYSCALL in connection to github.com:443",
+    )
     assert not is_transient_agent_failure(
         "NonZeroAgentExitCodeError", 'terminal_reason":"max_turns"'
     )
@@ -180,14 +190,49 @@ def test_transient_agent_failure_classification_is_selective():
 
 def test_run_draft_exposes_retry_and_agent_limits():
     draft=RunDraft(agent="claude-code", tasks=["actionlint-action-pinning-lint"],
-                   infrastructure_max_retries=4, claude_max_turns=150,
+                   infrastructure_max_retries=4, agent_max_steps=150,
                    codex_request_max_retries=7, codex_stream_max_retries=8,
                    codex_stream_idle_timeout_seconds=900)
     assert draft.infrastructure_max_retries == 4
-    assert draft.claude_max_turns == 150
+    assert draft.agent_max_steps == 150
     assert draft.codex_request_max_retries == 7
     assert draft.codex_stream_max_retries == 8
     assert draft.codex_stream_idle_timeout_seconds == 900
+
+def test_parallel_task_count_uses_actual_trial_capacity():
+    draft = RunDraft(
+        tasks=["task-a", "task-b", "task-c"], attempts_per_task=2,
+        concurrency=72, parallel_agent_count=3,
+    )
+    assert total_parallel_tasks(draft) == 18
+    assert concurrency_advice(18)["level"] == "warning"
+    assert concurrency_advice(19)["requires_confirmation"] is True
+    assert concurrency_advice(72)["level"] == "danger"
+
+    allowed = RunDraft(
+        tasks=["task-a", "task-b", "task-c"], attempts_per_task=8,
+        concurrency=24, parallel_agent_count=3,
+    )
+    blocked = RunDraft(
+        tasks=["task-a", "task-b", "task-c"], attempts_per_task=9,
+        concurrency=25, parallel_agent_count=3,
+    )
+    assert total_parallel_tasks(allowed) == 72
+    assert concurrency_advice(total_parallel_tasks(allowed))["level"] == "danger"
+    assert total_parallel_tasks(blocked) == 75
+    assert concurrency_advice(total_parallel_tasks(blocked))["level"] == "blocked"
+
+def test_create_run_rejects_unconfirmed_high_parallel_count():
+    draft = RunDraft(
+        tasks=["task-a", "task-b", "task-c"], attempts_per_task=8,
+        concurrency=24, parallel_agent_count=3,
+    )
+    try:
+        runner.create_run(draft)
+    except ValueError as exc:
+        assert "72" in str(exc) and "确认" in str(exc)
+    else:
+        raise AssertionError("high parallel run must require confirmation")
 
 def test_trial_classifies_transient_repository_failure(tmp_path: Path):
     folder=tmp_path/"task-a__x"; folder.mkdir()
@@ -231,8 +276,8 @@ def test_compare_uses_exact_configuration_and_task_averages(monkeypatch):
         "reasoning_effort": "xhigh",
         "service_tier": "standard",
         "trials": [
-            {"task": "task-a", "reward": 1, "duration_seconds": 60.0, "input_tokens": 100, "cached_tokens": 50, "output_tokens": 10, "reported_cost_usd": 1.0, "steps": 10},
-            {"task": "task-a", "reward": 0, "duration_seconds": 120.0, "input_tokens": 300, "cached_tokens": 150, "output_tokens": 30, "reported_cost_usd": 3.0, "steps": 30},
+            {"id": "task-a__pass", "task": "task-a", "reward": 1, "duration_seconds": 60.0, "input_tokens": 100, "cached_tokens": 50, "output_tokens": 10, "reported_cost_usd": 1.0, "steps": 10},
+            {"id": "task-a__fail", "task": "task-a", "reward": 0, "duration_seconds": 120.0, "input_tokens": 300, "cached_tokens": 150, "output_tokens": 30, "reported_cost_usd": 3.0, "steps": 30},
         ],
     }
     class FakeSession:
@@ -258,6 +303,36 @@ def test_compare_uses_exact_configuration_and_task_averages(monkeypatch):
     assert local["input_tokens"] == 200 and local["total_input_tokens"] == 400
     assert local["cost_usd"] == 2.0 and local["total_cost_usd"] == 4.0
 
+    exact_trial = results.compare_runs([7], [(7, "task-a__pass")])["tasks"][0]["runs"]["7"]
+    assert exact_trial["attempts"] == 1 and exact_trial["pass_rate"] == 1
+    assert exact_trial["input_tokens"] == 100 and exact_trial["trial_ids"] == ["task-a__pass"]
+
+def test_trial_progress_counts_attempts_instead_of_distinct_tasks(tmp_path: Path, monkeypatch):
+    job="test-"+uuid.uuid4().hex; run_id=make_run(job)
+    with SessionLocal() as db:
+        row=db.get(Run,run_id)
+        row.status="cancelled"
+        row.tasks_json='["task-a", "task-b"]'
+        row.attempts_per_task=2
+        db.commit()
+    for folder, task, reward in (
+        ("task-a__one", "task-a", 1),
+        ("task-a__two", "task-a", 0),
+        ("task-b__one", "task-b", 1),
+        ("task-b__two", "task-b", 1),
+    ):
+        write_result(tmp_path/job/folder, {
+            "task_name": task,
+            "verifier_result": {"rewards": {"reward": reward}},
+        })
+    monkeypatch.setattr(runner.settings,"jobs_dir",tmp_path)
+    summary=runner.get_run(run_id)
+    assert summary["progress"] == {"completed": 4, "total": 4, "passed": 3, "percent": 100}
+    assert summary["task_progress"] == {"passed": 2, "total": 2}
+    with SessionLocal() as db:
+        detail=results.run_detail(db.get(Run,run_id), include_patches=False)
+    assert detail["progress"]["passed"] == 3 and detail["progress"]["total"] == 4
+
 def test_preflight_rejects_crlf_scripts(tmp_path: Path, monkeypatch):
     # CRLF 的 shebang 在容器内无法执行，verifier 必然失败，agent 费用全部报废（2026-07-12 事故）
     monkeypatch.setattr(runner.settings, "tasks_dir", tmp_path)
@@ -278,6 +353,96 @@ def test_completed_trials_cost_prefers_reported_then_estimates(tmp_path: Path):
     (t2/"result.json").write_text(json.dumps({"agent_result":{"n_input_tokens":1_000_000,"n_cache_tokens":0,"n_output_tokens":0}}), encoding="utf-8")
     total=runner._completed_trials_cost(tmp_path, "standard")
     assert total == 2.5 + 5.0  # 报告值 + 按 $5/1M 未缓存输入估算
+
+def test_trial_usage_reads_inflight_atif_trajectory(tmp_path: Path):
+    trial=tmp_path/"task-a__x1"; (trial/"agent").mkdir(parents=True)
+    (trial/"agent"/"trajectory.json").write_text(json.dumps({
+        "final_metrics":{"total_cost_usd":4.06,"total_steps":52}}), encoding="utf-8")
+    assert runner._trial_usage(trial, "standard") == (4.06, 52)
+    # 已落盘 Trial 交给 Run 级累计，不再按进行中口径计费
+    (trial/"result.json").write_text("{}", encoding="utf-8")
+    assert runner._trial_usage(trial, "standard") == (None, None)
+
+def test_trial_usage_estimates_when_gateway_reports_no_cost(tmp_path: Path):
+    # 自建网关 litellm 价格表缺失时 cost_usd 为空，按 token 估算兜底
+    trial=tmp_path/"task-a__x1"; (trial/"agent").mkdir(parents=True)
+    (trial/"agent"/"trajectory.json").write_text(json.dumps({
+        "final_metrics":{"total_cost_usd":None,"total_prompt_tokens":1_000_000,
+                         "total_cached_tokens":0,"total_completion_tokens":0,"total_steps":9}}), encoding="utf-8")
+    assert runner._trial_usage(trial, "standard") == (5.0, 9)
+
+def test_trial_usage_falls_back_to_mini_trajectory(tmp_path: Path):
+    trial=tmp_path/"task-a__x1"; (trial/"agent").mkdir(parents=True)
+    (trial/"agent"/"mini-swe-agent.trajectory.json").write_text(json.dumps({
+        "info":{"model_stats":{"instance_cost":1.75,"api_calls":30}}}), encoding="utf-8")
+    assert runner._trial_usage(trial, "standard") == (1.75, 30)
+
+def test_terminate_trial_kills_compose_containers_and_writes_marker(tmp_path: Path, monkeypatch):
+    trial=tmp_path/"Task-A__X1"; trial.mkdir()
+    calls=[]
+    def fake_run(args, **_kwargs):
+        calls.append(args)
+        if "ps" in args:
+            return SimpleNamespace(returncode=0, stdout="abc123\ndef456\n")
+        return SimpleNamespace(returncode=0, stdout="")
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    assert runner._terminate_trial(trial, "费用 $9.00 达到单 Trial 上限 $8.00")
+    assert any("label=com.docker.compose.project=task-a__x1" in " ".join(args) for args in calls)
+    assert calls[-1][-3:] == ["kill", "abc123", "def456"]
+    marker=json.loads((trial/"guard.json").read_text(encoding="utf-8"))
+    assert "单 Trial 上限" in marker["reason"]
+
+def test_terminate_trial_retries_when_no_container_found(tmp_path: Path, monkeypatch):
+    trial=tmp_path/"task-a__x1"; trial.mkdir()
+    monkeypatch.setattr(runner.subprocess, "run", lambda *_a, **_k: SimpleNamespace(returncode=0, stdout=""))
+    assert not runner._terminate_trial(trial, "any")
+    assert not (trial/"guard.json").exists()
+
+def test_trial_surfaces_guard_termination_reason(tmp_path: Path):
+    folder=tmp_path/"task-a__x1"; folder.mkdir(parents=True)
+    write_result(folder, {"task_name":"task-a","exception_info":{
+        "exception_type":"NonZeroAgentExitCodeError",
+        "exception_message":"Command failed (exit 137)",
+    }})
+    (folder/"guard.json").write_text(json.dumps({"reason":"用量护栏终止该 Trial：费用 $9.00 达到单 Trial 上限 $8.00"}, ensure_ascii=False), encoding="utf-8")
+    trial=results._trial(folder)
+    assert trial["failure_type"] == "UsageGuardTerminated"
+    assert "单 Trial 上限" in trial["failure_message"]
+
+def test_verification_failure_has_actionable_reason(tmp_path: Path):
+    folder=tmp_path/"task-a__x1"; folder.mkdir(parents=True)
+    write_result(folder, {"task_name":"task-a","verifier_result":{"rewards":{
+        "reward":0,"f2p_passed":7,"f2p_total":9,"p2p_passed":12,"p2p_total":12,
+    }}})
+    trial=results._trial(folder)
+    assert trial["status"] == "failed"
+    assert trial["failure_type"] == "VerificationFailed"
+    assert "F2P 7/9" in trial["failure_message"]
+    assert trial["failure_summary"].startswith("VerificationFailed:")
+
+def test_cancelled_run_marks_only_unfinished_trials_cancelled(tmp_path: Path, monkeypatch):
+    job="test-"+uuid.uuid4().hex; run_id=make_run(job)
+    with SessionLocal() as db:
+        row=db.get(Run,run_id)
+        row.status="cancelled"
+        row.error="用量护栏终止 Run"
+        row.tasks_json='["task-a", "task-b"]'
+        db.commit()
+    failed=tmp_path/job/"task-a__failed"; failed.mkdir(parents=True)
+    write_result(failed, {"task_name":"task-a","exception_info":{
+        "exception_type":"RuntimeError","exception_message":"build failed",
+    }})
+    unfinished=tmp_path/job/"task-b__unfinished"; unfinished.mkdir(parents=True)
+    (unfinished/"config.json").write_text("{}",encoding="utf-8")
+    monkeypatch.setattr(runner.settings,"jobs_dir",tmp_path)
+    with SessionLocal() as db:
+        detail=results.run_detail(db.get(Run,run_id),include_patches=False)
+    by_task={trial["task"]:trial for trial in detail["trials"]}
+    assert by_task["task-a"]["status"] == "failed"
+    assert by_task["task-a"]["failure_type"] == "RuntimeError"
+    assert by_task["task-b"]["status"] == "cancelled"
+    assert by_task["task-b"]["failure_type"] == "RunCancelled"
+    assert by_task["task-b"]["failure_message"] == "用量护栏终止 Run"
 
 def test_runaway_reason_detects_log_size_and_subagent_count(tmp_path: Path):
     agent_dir=tmp_path/"task-a__x1"/"agent"; agent_dir.mkdir(parents=True)
@@ -311,7 +476,7 @@ def test_new_pier_job_name_uses_public_run_identity(monkeypatch):
     monkeypatch.setattr(runner.threading, "Thread", NoopThread)
     row = runner.create_run(RunDraft(
         agent="codex", tasks=["actionlint-action-pinning-lint"],
-        infrastructure_max_retries=3, claude_max_turns=140,
+        infrastructure_max_retries=3, agent_max_steps=140,
         codex_request_max_retries=7, codex_stream_max_retries=8,
         codex_stream_idle_timeout_seconds=900,
     ))
@@ -319,7 +484,7 @@ def test_new_pier_job_name_uses_public_run_identity(monkeypatch):
         assert row.job_name == f"run-{row.id:06d}-codex"
         assert runner.serialize(row)["run_code"] == f"RUN-{row.id:06d}"
         assert row.infrastructure_max_retries == 3
-        assert row.claude_max_turns == 140
+        assert row.agent_max_steps == 140
         assert row.codex_request_max_retries == 7
         assert row.codex_stream_max_retries == 8
         assert row.codex_stream_idle_timeout_seconds == 900

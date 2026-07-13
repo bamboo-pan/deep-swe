@@ -6,6 +6,8 @@ import {
   Box,
   CheckCircle2,
   CheckSquare2,
+  ChevronLeft,
+  ChevronRight,
   ClipboardList,
   Database,
   Download,
@@ -82,6 +84,7 @@ type Trial = {
   patch_bytes: number;
   failure_type?: string;
   failure_message?: string;
+  failure_summary?: string;
 };
 type Run = {
   id: number;
@@ -101,15 +104,15 @@ type Run = {
   attempts_per_task: number;
   concurrency: number;
   infrastructure_max_retries?: number;
-  claude_max_turns?: number;
+  agent_max_steps?: number;
   codex_request_max_retries?: number;
   codex_stream_max_retries?: number;
   codex_stream_idle_timeout_seconds?: number;
   progress?: {
-    completed: number;
+    completed?: number;
     total: number;
     passed: number;
-    percent: number;
+    percent?: number;
   };
   task_progress?: {
     passed: number;
@@ -149,6 +152,7 @@ type Prefs = {
   docker_cache_retention_hours: number;
   docker_cache_warning_gb: number;
   run_budget_usd: number;
+  trial_budget_usd: number;
 };
 type DockerStorage = {
   available: boolean;
@@ -196,6 +200,7 @@ const percent = (value: number | null | undefined) =>
   value == null ? "—" : `${(value * 100).toFixed(2)}%`;
 const score = (value: number | null | undefined) =>
   value == null ? "—" : Number.isInteger(value) ? String(value) : value.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+const statusLabel = (value: string) => value.replaceAll("_", " ").toUpperCase();
 const duration = (seconds: number | null | undefined) =>
   seconds == null
     ? "—"
@@ -208,15 +213,18 @@ const parseCompareSelection = (key: string) => {
   if (separator <= 0 || separator === key.length - 1) return null;
   const runId = Number(key.slice(0, separator));
   return Number.isInteger(runId)
-    ? { runId, task: key.slice(separator + 1) }
+    ? { runId, itemId: key.slice(separator + 1) }
     : null;
 };
 const pruneCompareSelections = (selected: string[], runs: Run[]) => {
-  const tasksByRun = new Map(runs.map((run) => [run.id, new Set(run.tasks)]));
+  const itemsByRun = new Map(runs.map((run) => [
+    run.id,
+    new Set([...(run.trials || []).map((trial) => trial.id), ...run.tasks]),
+  ]));
   const seen = new Set<string>();
   const next = selected.filter((key) => {
     const parsed = parseCompareSelection(key);
-    if (!parsed || seen.has(key) || !tasksByRun.get(parsed.runId)?.has(parsed.task))
+    if (!parsed || seen.has(key) || !itemsByRun.get(parsed.runId)?.has(parsed.itemId))
       return false;
     seen.add(key);
     return true;
@@ -271,12 +279,16 @@ function App() {
   const [checks, setChecks] = useState<Check[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
   const [tab, setTab] = useState("dashboard");
+  const [navigationCollapsed, setNavigationCollapsed] = useState(
+    () => localStorage.getItem("deepswe-navigation-collapsed") === "true",
+  );
   const [selectedRun, setSelectedRun] = useState<number | null>(null);
   const [detail, setDetail] = useState<Run | null>(null);
   const [trialLog, setTrialLog] = useState("");
   const [activeTrial, setActiveTrial] = useState<Trial | null>(null);
   const [selectedResults, setSelectedResults] = useState<number[]>([]);
   const [compareIds, setCompareIds] = useState<string[]>([]);
+  const [compareRuns, setCompareRuns] = useState<Run[]>([]);
   const [comparison, setComparison] = useState<any>();
   const [tasks, setTasks] = useState<TaskInfo[]>([]);
   const [prefs, setPrefs] = useState<Prefs>();
@@ -292,8 +304,8 @@ function App() {
   const [selectedTasks, setSelectedTasks] = useState<string[]>([]);
   const [agentTimeout, setAgentTimeout] = useState("5400");
   const [verifierTimeout, setVerifierTimeout] = useState("1800");
-  const [infrastructureMaxRetries, setInfrastructureMaxRetries] = useState("2");
-  const [claudeMaxTurns, setClaudeMaxTurns] = useState("120");
+  const [infrastructureMaxRetries, setInfrastructureMaxRetries] = useState("4");
+  const [agentMaxSteps, setAgentMaxSteps] = useState("120");
   const [codexRequestMaxRetries, setCodexRequestMaxRetries] = useState("6");
   const [codexStreamMaxRetries, setCodexStreamMaxRetries] = useState("6");
   const [codexStreamIdleTimeout, setCodexStreamIdleTimeout] = useState("600");
@@ -304,15 +316,28 @@ function App() {
     request<Run[]>("/api/runs")
       .then((nextRuns) => {
         setRuns(nextRuns);
+      })
+      .catch(() => {});
+  const refreshCompareRuns = () =>
+    request<Run[]>("/api/compare/options")
+      .then((nextRuns) => {
+        setCompareRuns(nextRuns);
         setCompareIds((current) => pruneCompareSelections(current, nextRuns));
       })
       .catch(() => {});
   const refresh = () => {
     refreshRuns();
+    if (tab === "compare") refreshCompareRuns();
     request<{ checks: Check[] }>("/api/diagnostics")
       .then((x) => setChecks(x.checks))
       .catch(() => {});
   };
+  useEffect(() => {
+    localStorage.setItem(
+      "deepswe-navigation-collapsed",
+      String(navigationCollapsed),
+    );
+  }, [navigationCollapsed]);
   useEffect(() => {
     request<Boot>("/api/bootstrap").then((x) => {
       setBoot(x);
@@ -373,6 +398,7 @@ function App() {
     };
   }, [selectedRun, tab]);
   useEffect(() => {
+    if (tab === "compare") refreshCompareRuns();
     if (tab === "tasks" && !tasks.length)
       request<TaskInfo[]>("/api/tasks").then(setTasks);
     if (tab === "settings" && !prefs)
@@ -389,13 +415,24 @@ function App() {
   }, [compareIds]);
   const latest = runs[0];
   const attemptsNum = parseInt(attempts, 10);
+  const trialCount =
+    selectedTasks.length * (Number.isFinite(attemptsNum) ? attemptsNum : 0);
+  const parallelAgentCount = allAgents ? boot?.agents.length || 0 : 1;
+  const activeWorkersPerAgent = Math.min(concurrency, trialCount);
+  const totalParallelTasks = activeWorkersPerAgent * parallelAgentCount;
+  const parallelRisk =
+    totalParallelTasks <= 12
+      ? { className: "normal", label: "正常" }
+      : totalParallelTasks <= 18
+        ? { className: "warning", label: "资源峰值警告" }
+        : { className: "danger", label: "需要高负载确认" };
   const start = async () => {
     if (starting) return;
     if (!selectedTasks.length) return setNotice("至少选择一个任务");
     const agentTimeoutNum = parseInt(agentTimeout, 10);
     const verifierTimeoutNum = parseInt(verifierTimeout, 10);
     const infrastructureMaxRetriesNum = parseInt(infrastructureMaxRetries, 10);
-    const claudeMaxTurnsNum = parseInt(claudeMaxTurns, 10);
+    const agentMaxStepsNum = parseInt(agentMaxSteps, 10);
     const codexRequestMaxRetriesNum = parseInt(codexRequestMaxRetries, 10);
     const codexStreamMaxRetriesNum = parseInt(codexStreamMaxRetries, 10);
     const codexStreamIdleTimeoutNum = parseInt(codexStreamIdleTimeout, 10);
@@ -415,24 +452,30 @@ function App() {
       return setNotice("Verifier 超时需为 60-7200 秒");
     if (!Number.isFinite(infrastructureMaxRetriesNum) || infrastructureMaxRetriesNum < 0 || infrastructureMaxRetriesNum > 6)
       return setNotice("基础设施重试次数需为 0-6 的整数");
-    if (!Number.isFinite(claudeMaxTurnsNum) || claudeMaxTurnsNum < 20 || claudeMaxTurnsNum > 200)
-      return setNotice("Claude 最大轮数需为 20-200 的整数");
+    if (!Number.isFinite(agentMaxStepsNum) || agentMaxStepsNum < 10 || agentMaxStepsNum > 500)
+      return setNotice("最大步数需为 10-500 的整数");
     if (!Number.isFinite(codexRequestMaxRetriesNum) || codexRequestMaxRetriesNum < 0 || codexRequestMaxRetriesNum > 10)
       return setNotice("Codex HTTP 重试次数需为 0-10 的整数");
     if (!Number.isFinite(codexStreamMaxRetriesNum) || codexStreamMaxRetriesNum < 0 || codexStreamMaxRetriesNum > 10)
       return setNotice("Codex 流重试次数需为 0-10 的整数");
     if (!Number.isFinite(codexStreamIdleTimeoutNum) || codexStreamIdleTimeoutNum < 30 || codexStreamIdleTimeoutNum > 1800)
       return setNotice("Codex 流空闲超时需为 30-1800 秒");
+    if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 72)
+      return setNotice("每 Agent 并发数需为 1-72 的整数");
+    const agents = allAgents ? boot!.agents : [agent];
+    const parallelTasks =
+      Math.min(concurrency, selectedTasks.length * attemptsNum) * agents.length;
+    if (parallelTasks > 72)
+      return setNotice("总并行 Trial 数不能超过 72");
     if (
-      concurrency >= 4 &&
+      parallelTasks >= 19 &&
       !confirm(
-        "并发 4 属于高资源占用（每个 Trial 声明 2 CPU / 8 GB 内存），可能导致本机过载。\n确认继续？",
+        `将同时运行最多 ${parallelTasks} 个 Trial。模型调用阶段通常资源占用较低，但集中构建和验证可能造成 CPU、磁盘与内存峰值。\n确认继续？`,
       )
     )
       return;
     setStarting(true);
     setNotice("正在创建运行…");
-    const agents = allAgents ? boot!.agents : [agent];
     const results = await Promise.allSettled(
       agents.map((current) =>
         request<Run>("/api/runs", {
@@ -445,12 +488,13 @@ function App() {
             tasks: selectedTasks,
             attempts_per_task: attemptsNum,
             concurrency,
-            confirm_high_concurrency: concurrency >= 4,
+            parallel_agent_count: agents.length,
+            confirm_high_concurrency: parallelTasks >= 19,
             agent_timeout_seconds: agentTimeoutNum,
             verifier_timeout_seconds: verifierTimeoutNum,
             retry_infrastructure_errors: retry,
             infrastructure_max_retries: infrastructureMaxRetriesNum,
-            claude_max_turns: claudeMaxTurnsNum,
+            agent_max_steps: agentMaxStepsNum,
             codex_request_max_retries: codexRequestMaxRetriesNum,
             codex_stream_max_retries: codexStreamMaxRetriesNum,
             codex_stream_idle_timeout_seconds: codexStreamIdleTimeoutNum,
@@ -483,7 +527,7 @@ function App() {
     } else {
       setNotice(
         allAgents
-          ? `已并行创建 ${created.length} 个 Agent 运行（总 worker 上限 ${created.length * concurrency}）`
+          ? `已并行创建 ${created.length} 个 Agent 运行（总并行 Trial 上限 ${created.length * Math.min(concurrency, selectedTasks.length * attemptsNum)}）`
           : "运行已创建",
       );
     }
@@ -631,6 +675,54 @@ function App() {
         : `已删除 ${ids.length} 条运行${cleanupSummary}`,
     );
   };
+  const deleteTrials = async (trialIds: string[]) => {
+    if (!detail || !trialIds.length) return trialIds;
+    const runId = detail.id;
+    if (
+      !confirm(
+        `删除选中的 ${trialIds.length} 条 Trial 记录、日志和结果文件？\n此操作不会删除整个 Run。`,
+      )
+    )
+      return trialIds;
+    const failures: { id: string; message: string }[] = [];
+    let removedImages = 0;
+    for (const trialId of trialIds) {
+      try {
+        const body = await request<{
+          docker_cleanup?: { removed_images?: string[] };
+        }>(
+          `/api/runs/${runId}/trials/${encodeURIComponent(trialId)}`,
+          { method: "DELETE" },
+        );
+        removedImages += body.docker_cleanup?.removed_images?.length ?? 0;
+      } catch (e) {
+        failures.push({ id: trialId, message: String(e) });
+      }
+    }
+    const failedIds = failures.map((item) => item.id);
+    const deletedIds = new Set(trialIds.filter((id) => !failedIds.includes(id)));
+    setCompareIds((current) => current.filter((key) => {
+      const parsed = parseCompareSelection(key);
+      return !(parsed?.runId === runId && deletedIds.has(parsed.itemId));
+    }));
+    if (activeTrial && deletedIds.has(activeTrial.id)) {
+      setActiveTrial(null);
+      setTrialLog("");
+    }
+    const [nextDetail, nextRuns] = await Promise.all([
+      request<Run>(`/api/runs/${runId}`),
+      request<Run[]>("/api/runs"),
+    ]);
+    setDetail(nextDetail);
+    setRuns(nextRuns);
+    refreshCompareRuns();
+    setNotice(
+      failures.length
+        ? `${trialIds.length - failures.length} 条 Trial 已删除，${failures.length} 条失败：${failures[0].message}`
+        : `已删除 ${trialIds.length} 条 Trial 记录${removedImages ? `，清理 ${removedImages} 个 Trial 镜像` : ""}`,
+    );
+    return failedIds;
+  };
   if (!boot)
     return <main className="loading">正在连接 DeepSWE Regression Lab…</main>;
   const nav = [
@@ -644,30 +736,43 @@ function App() {
     ["diagnostics", ShieldCheck],
   ] as const;
   return (
-    <div className="shell">
-      <aside>
+    <div className={`shell ${navigationCollapsed ? "navigationCollapsed" : ""}`}>
+      <aside className="appSidebar">
+        <button
+          className="sidebarToggle"
+          onClick={() => setNavigationCollapsed((collapsed) => !collapsed)}
+          aria-label={navigationCollapsed ? "展开主导航" : "收起主导航"}
+          aria-expanded={!navigationCollapsed}
+          aria-controls="primary-navigation"
+          title={navigationCollapsed ? "展开主导航" : "收起主导航"}
+        >
+          {navigationCollapsed ? <ChevronRight /> : <ChevronLeft />}
+        </button>
         <div className="brand">
           <Box />{" "}
           <span>
             DeepSWE<small>REGRESSION LAB</small>
           </span>
         </div>
-        <nav>
+        <nav id="primary-navigation">
           {nav.map(([name, Icon]) => (
             <button
               key={name}
               className={tab === name ? "active" : ""}
               onClick={() => setTab(name)}
+              title={navigationCollapsed ? name : undefined}
             >
               <Icon />
-              {name}
+              <span>{name}</span>
             </button>
           ))}
         </nav>
         <div className="local">
-          <ShieldCheck /> 仅本机访问
-          <br />
-          <span>127.0.0.1:8765</span>
+          <ShieldCheck />
+          <span>
+            仅本机访问
+            <small>127.0.0.1:8765</small>
+          </span>
         </div>
       </aside>
       <main>
@@ -708,8 +813,7 @@ function App() {
             <div>
               <h2>Agent 运行方式</h2>
               <p className="muted">
-                “并发数”是每个 Agent 的 worker 数；三 Agent
-                同跑会创建三条可独立查看和取消的运行。
+                三 Agent 同跑会创建三条可独立查看和取消的运行。
               </p>
             </div>
             <label>
@@ -729,9 +833,7 @@ function App() {
               三 Agent 同时跑
             </label>
             <b>
-              {allAgents
-                ? `总 worker 上限 ${boot.agents.length * concurrency}`
-                : `${concurrency} workers`}
+              总并行 Trial 上限 {totalParallelTasks}
             </b>
           </section>
         )}
@@ -743,9 +845,7 @@ function App() {
                 <p>所有选择都会记录在本次运行中，便于严格复现。</p>
               </div>
               <b>
-                {selectedTasks.length *
-                  (Number.isFinite(attemptsNum) ? attemptsNum : 0)}{" "}
-                TRIALS
+                {trialCount} TRIALS
               </b>
             </div>
             <div className="formgrid">
@@ -801,21 +901,17 @@ function App() {
                 />
               </label>
               <label>
-                并发数
-                <select
+                每 Agent 并发数
+                <input
+                  type="number"
+                  min="1"
+                  max="72"
+                  step="1"
                   value={concurrency}
                   onChange={(e) => setConcurrency(+e.target.value)}
-                >
-                  {boot.setting_options.concurrency.map((x) => (
-                    <option key={x}>{x}</option>
-                  ))}
-                </select>
-                <small className={`risk r${concurrency}`}>
-                  {concurrency <= 2
-                    ? "安全"
-                    : concurrency === 3
-                      ? "内存压力警告"
-                      : "需要高并发确认"}
+                />
+                <small className={`risk ${parallelRisk.className}`}>
+                  总并行 {totalParallelTasks} · {parallelRisk.label}
                 </small>
               </label>
               <label>
@@ -846,18 +942,16 @@ function App() {
                   onChange={(e) => setInfrastructureMaxRetries(e.target.value)}
                 />
               </label>
-              {(agent === "claude-code" || allAgents) && (
-                <label>
-                  Claude 最大轮数
-                  <input
-                    type="number"
-                    min="20"
-                    max="200"
-                    value={claudeMaxTurns}
-                    onChange={(e) => setClaudeMaxTurns(e.target.value)}
-                  />
-                </label>
-              )}
+              <label>
+                最大步数（全部 Agent）
+                <input
+                  type="number"
+                  min="10"
+                  max="500"
+                  value={agentMaxSteps}
+                  onChange={(e) => setAgentMaxSteps(e.target.value)}
+                />
+              </label>
               {(agent === "codex" || allAgents) && (
                 <>
                   <label>
@@ -1007,11 +1101,12 @@ function App() {
             selected={selectedResults}
             setSelected={setSelectedResults}
             remove={deleteResults}
+            removeTrials={deleteTrials}
           />
         )}
         {tab === "compare" && (
           <Compare
-            runs={runs}
+            runs={compareRuns}
             selected={compareIds}
             setSelected={setCompareIds}
             comparison={comparison}
@@ -1191,6 +1286,7 @@ function Results({
   selected,
   setSelected,
   remove,
+  removeTrials,
 }: {
   runs: Run[];
   detail: Run | null;
@@ -1201,62 +1297,126 @@ function Results({
   selected: number[];
   setSelected: (ids: number[]) => void;
   remove: () => void;
+  removeTrials: (ids: string[]) => Promise<string[]>;
 }) {
   const all = runs.length > 0 && selected.length === runs.length;
+  const [runListCollapsed, setRunListCollapsed] = useState(
+    () => localStorage.getItem("deepswe-run-list-collapsed") === "true",
+  );
+  const [selectedTrials, setSelectedTrials] = useState<string[]>([]);
+  const [deletingTrials, setDeletingTrials] = useState(false);
+  const [trialStatusFilter, setTrialStatusFilter] = useState("all");
+  const trials = detail?.trials || [];
+  const trialIds = trials.map((trial) => trial.id);
+  const trialStatuses = [...new Set(trials.map((trial) => trial.status))].sort();
+  const visibleTrials = trials.filter(
+    (trial) => trialStatusFilter === "all" || trial.status === trialStatusFilter,
+  );
+  const visibleTrialIds = visibleTrials.map((trial) => trial.id);
+  const allVisibleTrialsSelected = visibleTrialIds.length > 0 &&
+    visibleTrialIds.every((id) => selectedTrials.includes(id));
+  const canManageTrials = Boolean(detail && terminal.has(detail.status));
+  useEffect(() => {
+    setSelectedTrials([]);
+    setTrialStatusFilter("all");
+  }, [detail?.id]);
+  useEffect(() => {
+    setSelectedTrials((current) => current.filter((id) => trialIds.includes(id)));
+  }, [detail?.trials]);
+  useEffect(() => {
+    localStorage.setItem(
+      "deepswe-run-list-collapsed",
+      String(runListCollapsed),
+    );
+  }, [runListCollapsed]);
+  const deleteSelectedTrials = async () => {
+    if (!selectedTrials.length || deletingTrials) return;
+    setDeletingTrials(true);
+    try {
+      setSelectedTrials(await removeTrials(selectedTrials));
+    } finally {
+      setDeletingTrials(false);
+    }
+  };
   return (
-    <div className="resultsLayout">
-      <section className="panel runlist">
-        <div className="resulttools">
-          <label>
-            <input
-              type="checkbox"
-              checked={all}
-              onChange={() => setSelected(all ? [] : runs.map((r) => r.id))}
-            />
-            全选
-          </label>
-          <b>Job 历史</b>
+    <div className={`resultsLayout ${runListCollapsed ? "runlistCollapsed" : ""}`}>
+      <section className={`panel runlist ${runListCollapsed ? "isCollapsed" : ""}`}>
+        {runListCollapsed ? (
           <button
-            className="danger"
-            disabled={!selected.length}
-            onClick={remove}
+            className="paneToggle runlistExpand"
+            onClick={() => setRunListCollapsed(false)}
+            aria-label="展开 Job 历史"
+            aria-expanded={false}
+            title="展开 Job 历史"
           >
-            <Trash2 />
-            删除 {selected.length || ""}
+            <ChevronRight />
           </button>
-        </div>
-        {runs.length ? (
-          runs.map((r) => (
-            <div
-              className={`runrow ${detail?.id === r.id ? "selected" : ""}`}
-              key={r.id}
-            >
-              <input
-                type="checkbox"
-                checked={selected.includes(r.id)}
-                onChange={(e) =>
-                  setSelected(
-                    e.target.checked
-                      ? [...selected, r.id]
-                      : selected.filter((id) => id !== r.id),
-                  )
-                }
-              />
-              <button onClick={() => openRun(r.id)}>
-                <Status value={r.status} passed={r.passed} />
-                <b>{r.agent}</b>
-                <span>
-                  {r.run_code || `RUN-${String(r.id).padStart(6, "0")}`}
-                  <small>{r.job_name}</small>
-                </span>
-                <em className={r.status === "completed" ? (r.passed ? "success" : "failure") : "waiting"}>
-                  {r.task_progress ? `${r.task_progress.passed}/${r.task_progress.total}` : "—"}
-                </em>
+        ) : (
+          <>
+            <div className="resulttools">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={all}
+                  onChange={() => setSelected(all ? [] : runs.map((r) => r.id))}
+                />
+                全选
+              </label>
+              <b>Job 历史</b>
+              <button
+                className="paneToggle"
+                onClick={() => setRunListCollapsed(true)}
+                aria-label="收起 Job 历史"
+                aria-expanded={true}
+                title="收起 Job 历史"
+              >
+                <ChevronLeft />
+              </button>
+              <button
+                className="danger"
+                disabled={!selected.length}
+                onClick={remove}
+              >
+                <Trash2 />
+                删除 {selected.length || ""}
               </button>
             </div>
-          ))
-        ) : (
-          <Empty text="暂无运行" />
+            <div className="runlistContent">
+              {runs.length ? (
+                runs.map((r) => (
+                  <div
+                    className={`runrow ${detail?.id === r.id ? "selected" : ""}`}
+                    key={r.id}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selected.includes(r.id)}
+                      onChange={(e) =>
+                        setSelected(
+                          e.target.checked
+                            ? [...selected, r.id]
+                            : selected.filter((id) => id !== r.id),
+                        )
+                      }
+                    />
+                    <button onClick={() => openRun(r.id)}>
+                      <Status value={r.status} passed={r.passed} />
+                      <b>{r.agent}</b>
+                      <span>
+                        {r.run_code || `RUN-${String(r.id).padStart(6, "0")}`}
+                        <small>{r.job_name}</small>
+                      </span>
+                      <em className={r.status === "completed" ? (r.passed ? "success" : "failure") : "waiting"}>
+                        {r.progress ? `${r.progress.passed}/${r.progress.total}` : "—"}
+                      </em>
+                    </button>
+                  </div>
+                ))
+              ) : (
+                <Empty text="暂无运行" />
+              )}
+            </div>
+          </>
         )}
       </section>
       <div>
@@ -1264,8 +1424,8 @@ function Results({
           <>
             <section className="metrics">
               <Metric
-                label="通过任务"
-                value={`${detail.task_progress?.passed || 0}/${detail.task_progress?.total || detail.tasks.length}`}
+                label="通过 Trial"
+                value={`${detail.progress?.passed || 0}/${detail.progress?.total || detail.tasks.length * detail.attempts_per_task}`}
               />
               <Metric
                 label="Input / Cache"
@@ -1292,11 +1452,51 @@ function Results({
             <section className="panel">
               <div className="panelhead">
                 <h2>Trial 结果</h2>
+                <div className="trialresulttools">
+                  <select
+                    className="trialstatusfilter"
+                    value={trialStatusFilter}
+                    onChange={(event) => setTrialStatusFilter(event.target.value)}
+                    disabled={!trials.length}
+                    aria-label="按 Trial 状态筛选"
+                    title="按 Trial 状态筛选"
+                  >
+                    <option value="all">全部状态</option>
+                    {trialStatuses.map((status) => (
+                      <option key={status} value={status}>{statusLabel(status)}</option>
+                    ))}
+                  </select>
+                  <label title={canManageTrials ? "选择当前状态筛选下的全部 Trial" : "运行结束后才能管理 Trial"}>
+                    <input
+                      type="checkbox"
+                      checked={allVisibleTrialsSelected}
+                      disabled={!canManageTrials || !visibleTrialIds.length}
+                      onChange={() => setSelectedTrials((current) =>
+                        allVisibleTrialsSelected
+                          ? current.filter((id) => !visibleTrialIds.includes(id))
+                          : [...new Set([...current, ...visibleTrialIds])],
+                      )}
+                    />
+                    全选
+                  </label>
+                  <span>已选 {selectedTrials.length}</span>
+                  <button
+                    className="danger"
+                    disabled={!canManageTrials || !selectedTrials.length || deletingTrials}
+                    onClick={deleteSelectedTrials}
+                    title="删除选中的 Trial 记录、日志和结果文件"
+                  >
+                    <Trash2 />
+                    {deletingTrials ? "删除中…" : "删除"}
+                  </button>
+                </div>
               </div>
               <div className="table">
                 <div className="tr">
+                  <span />
                   <b>Task</b>
                   <b>Status</b>
+                  <b>失败原因</b>
                   <b>Reward</b>
                   <b>F2P / P2P</b>
                   <b>Duration</b>
@@ -1304,18 +1504,42 @@ function Results({
                   <b>Cost</b>
                   <b>Steps</b>
                 </div>
-                {detail.trials?.map((t) => (
-                  <button
-                    className="tr"
+                {visibleTrials.map((t) => (
+                  <div
+                    className="tr trialrow"
                     key={t.id}
                     onClick={() => openTrial(t)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") openTrial(t);
+                    }}
+                    role="button"
+                    tabIndex={0}
                   >
+                    <input
+                      type="checkbox"
+                      checked={selectedTrials.includes(t.id)}
+                      disabled={!canManageTrials}
+                      aria-label={`选择 ${t.trial_code || t.id}`}
+                      onClick={(event) => event.stopPropagation()}
+                      onChange={(event) => setSelectedTrials(
+                        event.target.checked
+                          ? [...selectedTrials, t.id]
+                          : selectedTrials.filter((id) => id !== t.id),
+                      )}
+                    />
                     <span className="tabletask">
                       <b>{t.task_code}</b>
                       <span>{t.task_title || t.task}</span>
                       <small>{t.task_slug || t.task}</small>
                     </span>
                     <Status value={t.status} reward={t.reward} />
+                    <span
+                      className={`failurecell ${t.failure_type || t.failure_message ? "hasfailure" : ""}`}
+                      title={[t.failure_type, t.failure_message].filter(Boolean).join(": ")}
+                    >
+                      {t.failure_type && <b>{t.failure_type}</b>}
+                      <span>{t.failure_message || "—"}</span>
+                    </span>
                     <span>{score(t.reward)}</span>
                     <span>
                       {score(t.f2p)} / {score(t.p2p)}
@@ -1328,8 +1552,13 @@ function Results({
                     </span>
                     <span>{money(t.reported_cost_usd)}</span>
                     <span>{t.steps ?? "—"}</span>
-                  </button>
+                  </div>
                 ))}
+                {!visibleTrials.length && (
+                  <div className="trialfilterempty">
+                    {trials.length ? "没有符合当前状态筛选的 Trial。" : "当前 Run 暂无 Trial 结果。"}
+                  </div>
+                )}
               </div>
             </section>
             {activeTrial && <TrialDetail trial={activeTrial} log={trialLog} />}
@@ -1357,10 +1586,13 @@ function TrialDetail({ trial, log }: { trial: Trial; log: string }) {
         <Metric label="Cost" value={money(trial.reported_cost_usd)} />
         <Metric label="Patch" value={`${number(trial.patch_bytes)} B`} />
       </div>
-      {trial.failure_message && (
-        <pre className="failure">
-          {trial.failure_type}: {trial.failure_message}
-        </pre>
+      {(trial.failure_type || trial.failure_message) && (
+        <div className="trialfailure">
+          <h3>失败原因</h3>
+          <pre className="failure">
+            {[trial.failure_type, trial.failure_message].filter(Boolean).join(": ")}
+          </pre>
+        </div>
       )}
       <div className="split">
         <div>
@@ -1410,33 +1642,57 @@ function Compare({
   const [agentFilter, setAgentFilter] = useState("all");
   const [modelFilter, setModelFilter] = useState("all");
   const [effortFilter, setEffortFilter] = useState("all");
-  const taskNames = [...new Set(runs.flatMap((run) => run.tasks))].sort();
+  const [statusFilter, setStatusFilter] = useState("all");
+  const taskNames = [...new Set(runs.flatMap((run) => (run.trials || []).map((trial) => trial.task)))].sort();
+  const trialStatuses = [...new Set(runs.flatMap((run) =>
+    (run.trials || []).map((trial) => trial.status),
+  ))].sort();
   const matchesRunFilters = (run: Run) =>
-    (taskFilter === "all" || run.tasks.includes(taskFilter)) &&
     (agentFilter === "all" || run.agent === agentFilter) &&
     (modelFilter === "all" || run.model === modelFilter) &&
     (effortFilter === "all" || run.reasoning_effort === effortFilter);
+  const matchesTrialFilters = (trial: Trial) =>
+    statusFilter === "all" || trial.status === statusFilter;
   const filteredRuns = runs.filter(matchesRunFilters);
-  const groupedRuns = taskNames.filter((task) => taskFilter === "all" || task === taskFilter).map((task) => ({task, runs: filteredRuns.filter((run) => run.tasks.includes(task))})).filter((group) => group.runs.length);
-  const visibleSelectionKeys = groupedRuns.flatMap((group) =>
-    group.runs.map((run) => `${run.id}:${group.task}`),
+  const groupedTrials = taskNames
+    .filter((task) => taskFilter === "all" || task === taskFilter)
+    .map((task) => ({
+      task,
+      items: filteredRuns.flatMap((run) =>
+        (run.trials || [])
+          .filter((trial) => trial.task === task && matchesTrialFilters(trial))
+          .map((trial) => ({ run, trial })),
+      ),
+    }))
+    .filter((group) => group.items.length);
+  const visibleSelectionKeys = groupedTrials.flatMap((group) =>
+    group.items.map(({ run, trial }) => `${run.id}:${trial.id}`),
   );
   const selectedSet = new Set(selected);
   const allVisibleSelected = visibleSelectionKeys.length > 0 &&
     visibleSelectionKeys.every((key) => selectedSet.has(key));
   const runById = new Map(runs.map((run) => [run.id, run]));
-  const visibleSelections = selected.filter((key) => {
+  const selectedEntries = selected.flatMap((key) => {
     const parsed = parseCompareSelection(key);
     const run = parsed ? runById.get(parsed.runId) : undefined;
-    return Boolean(run && matchesRunFilters(run) && (taskFilter === "all" || parsed?.task === taskFilter));
+    const trial = run?.trials?.find((item) => item.id === parsed?.itemId);
+    return run && trial ? [{ key, run, trial }] : [];
   });
-  const visibleSelectionSet = new Set(visibleSelections);
+  const visibleSelectedEntries = selectedEntries.filter(({ run, trial }) =>
+    matchesRunFilters(run) &&
+    matchesTrialFilters(trial) &&
+    (taskFilter === "all" || trial.task === taskFilter),
+  );
+  const visibleRunIds = new Set(visibleSelectedEntries.map(({ run }) => run.id));
+  const visibleTaskNames = new Set(visibleSelectedEntries.map(({ trial }) => trial.task));
   const visibleComparisonRuns = (comparison?.runs || []).filter((run: Run) =>
-    visibleSelections.some((key) => key.startsWith(`${run.id}:`)),
+    visibleRunIds.has(run.id),
   );
   const visibleTasks = (comparison?.tasks || []).filter((row: any) =>
-    visibleSelections.some((key) => key.endsWith(`:${row.task}`)),
+    visibleTaskNames.has(row.task),
   );
+  const runHasSelectedTask = (runId: number, task: string) =>
+    visibleSelectedEntries.some(({ run, trial }) => run.id === runId && trial.task === task);
   const exactBaseline = (row: any, run: Run) =>
     (row.official_configurations || []).find((item: any) =>
       modelKey(item.model) === modelKey(run.model) &&
@@ -1445,14 +1701,17 @@ function Compare({
   const visibleOfficialConfigurations = (row: any) =>
     (row.official_configurations || []).filter((item: any) =>
       visibleComparisonRuns.some((run: Run) =>
-        visibleSelectionSet.has(`${run.id}:${row.task}`) &&
+        runHasSelectedTask(run.id, row.task) &&
         modelKey(item.model) === modelKey(run.model) &&
         (item.reasoning_effort || "none").toLowerCase() === (run.reasoning_effort || "none").toLowerCase(),
       ),
     );
   const summaries = visibleComparisonRuns.map((run: Run) => {
+    const selectedTrials = visibleSelectedEntries
+      .filter((entry) => entry.run.id === run.id)
+      .map((entry) => entry.trial);
     const values = visibleTasks
-      .filter((row: any) => visibleSelectionSet.has(`${run.id}:${row.task}`))
+      .filter((row: any) => runHasSelectedTask(run.id, row.task))
       .map((row: any) => row.runs[String(run.id)] || {});
     const total = (field: string) => {
       const present = values.map((value: any) => value[field]).filter((value: any) => value != null);
@@ -1460,8 +1719,8 @@ function Compare({
     };
     return {
       run,
-      passed: values.filter((value: any) => value.passed).length,
-      total: values.length,
+      passed: selectedTrials.filter((trial) => trial.reward === 1).length,
+      total: selectedTrials.length,
       cost: total("total_estimated_cost_usd"),
       input: total("total_input_tokens"),
     };
@@ -1479,7 +1738,7 @@ function Compare({
               className="secondary"
               disabled={!visibleSelectionKeys.length || allVisibleSelected}
               onClick={() => setSelected([...new Set([...selected, ...visibleSelectionKeys])])}
-              title="选择当前筛选条件下的全部 Run × Task 结果"
+              title="选择当前筛选条件下的全部 Trial 结果"
             >
               <CheckSquare2 />
               全选当前筛选
@@ -1500,9 +1759,10 @@ function Compare({
           <label>Agent<select value={agentFilter} onChange={(e)=>setAgentFilter(e.target.value)}><option value="all">全部 Agent</option>{[...new Set(runs.map(x=>x.agent))].map(x=><option key={x}>{x}</option>)}</select></label>
           <label>模型<select value={modelFilter} onChange={(e)=>setModelFilter(e.target.value)}><option value="all">全部模型</option>{[...new Set(runs.map(x=>x.model))].map(x=><option key={x}>{x}</option>)}</select></label>
           <label>思考强度<select value={effortFilter} onChange={(e)=>setEffortFilter(e.target.value)}><option value="all">全部强度</option>{[...new Set(runs.map(x=>x.reasoning_effort))].map(x=><option key={x}>{x}</option>)}</select></label>
+          <label>状态<select value={statusFilter} onChange={(e)=>setStatusFilter(e.target.value)}><option value="all">全部状态</option>{trialStatuses.map(status=><option key={status} value={status}>{statusLabel(status)}</option>)}</select></label>
         </div>
-        {groupedRuns.map(group=><div className="comparegroup" key={group.task}><h3>{group.task}</h3><div className="comparepick">
-          {group.runs.map((r) => { const selectionKey = `${r.id}:${group.task}`; return (
+        {groupedTrials.map(group=><div className="comparegroup" key={group.task}><h3>{group.task}</h3><div className="comparepick">
+          {group.items.map(({ run, trial }) => { const selectionKey = `${run.id}:${trial.id}`; return (
             <label key={selectionKey}>
               <input
                 type="checkbox"
@@ -1515,17 +1775,20 @@ function Compare({
                   )
                 }
               />
-              <Status value={r.status} passed={r.passed} />
+              <Status value={trial.status} reward={trial.reward} />
               <span>
-                {r.agent} · {r.model} · {r.reasoning_effort}
+                {run.agent} · {run.model} · {run.reasoning_effort}
               </span>
               <em>
-                <b>{r.run_code || `RUN-${String(r.id).padStart(6, "0")}`}</b>
-                <small>{r.job_name}</small>
+                <b>{trial.trial_code || `${run.run_code || `RUN-${String(run.id).padStart(6, "0")}`} / A${trial.attempt || 1}`}</b>
+                <small>reward {score(trial.reward)} · {duration(trial.duration_seconds)}</small>
               </em>
             </label>
           )})}
         </div></div>)}
+        {!groupedTrials.length && (
+          <div className="comparefilterempty">没有符合当前筛选条件的 Trial 结果。</div>
+        )}
       </section>
       {summaries.length > 0 && (
         <>
@@ -1546,7 +1809,7 @@ function Compare({
             </div>
             {visibleTasks.map((row: any) => {
               const localRuns = visibleComparisonRuns.filter((run: Run) =>
-                visibleSelectionSet.has(`${run.id}:${row.task}`) && Object.hasOwn(row.runs, String(run.id)),
+                runHasSelectedTask(run.id, row.task) && Object.hasOwn(row.runs, String(run.id)),
               );
               const configurations = visibleOfficialConfigurations(row);
               return (
@@ -1904,19 +2167,31 @@ function Settings({
           </label>
           <label>
             默认并发
-            <select
+            <input
+              type="number"
+              min="1"
+              max="72"
+              step="1"
               value={prefs.default_concurrency}
               onChange={(e) =>
                 setPrefs({ ...prefs, default_concurrency: +e.target.value })
               }
-            >
-              {boot.setting_options.concurrency.map((x) => (
-                <option key={x}>{x}</option>
-              ))}
-            </select>
+            />
           </label>
           <label>
-            单次 Run 费用熔断 (USD，0 禁用)
+            单个 Trial 费用熔断 (USD，0 禁用)
+            <input
+              type="number"
+              min={0}
+              step={0.5}
+              value={prefs.trial_budget_usd}
+              onChange={(e) =>
+                setPrefs({ ...prefs, trial_budget_usd: +e.target.value })
+              }
+            />
+          </label>
+          <label>
+            整个 Run 累计费用熔断 (USD，0 禁用)
             <input
               type="number"
               min={0}

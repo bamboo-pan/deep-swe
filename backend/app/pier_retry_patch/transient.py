@@ -25,6 +25,8 @@ _TRANSIENT_MARKERS = (
     "service unavailable",
     "server overloaded",
     "unexpected eof",
+    "ssl_error_syscall",  # curl: (35)，镜像构建下载 GitHub release 时 TLS 被重置
+    "curl: (35)",
 )
 
 
@@ -34,5 +36,6 @@ def is_transient_agent_failure(exception_type: str | None, message: str | None) 
         return True
     if exception_type not in {"NonZeroAgentExitCodeError", "RuntimeError"} or not message:
         return False
-    lowered = message.lower()
+    # apt 真实输出是「502  Bad Gateway」（双空格），归一空白后再做子串匹配
+    lowered = " ".join(message.lower().split())
     return any(marker in lowered for marker in _TRANSIENT_MARKERS)

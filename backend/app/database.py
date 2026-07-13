@@ -18,8 +18,8 @@ RUN_COLUMNS = {
     "agent_timeout_seconds": "INTEGER NOT NULL DEFAULT 5400",
     "verifier_timeout_seconds": "INTEGER NOT NULL DEFAULT 1800",
     "retry_infrastructure_errors": "BOOLEAN NOT NULL DEFAULT 1",
-    "infrastructure_max_retries": "INTEGER NOT NULL DEFAULT 2",
-    "claude_max_turns": "INTEGER NOT NULL DEFAULT 120",
+    "infrastructure_max_retries": "INTEGER NOT NULL DEFAULT 4",
+    "agent_max_steps": "INTEGER NOT NULL DEFAULT 120",
     "codex_request_max_retries": "INTEGER NOT NULL DEFAULT 6",
     "codex_stream_max_retries": "INTEGER NOT NULL DEFAULT 6",
     "codex_stream_idle_timeout_seconds": "INTEGER NOT NULL DEFAULT 600",
@@ -27,6 +27,7 @@ RUN_COLUMNS = {
     "service_tier": "VARCHAR(20) NOT NULL DEFAULT 'standard'",
     "jobs_dir": "VARCHAR(500)",
     "pier_version": "VARCHAR(60)",
+    "deleted_trials_json": "TEXT NOT NULL DEFAULT '[]'",
 }
 
 def init_db():
@@ -41,3 +42,6 @@ def init_db():
         for name, definition in RUN_COLUMNS.items():
             if name not in existing:
                 connection.execute(text(f"ALTER TABLE runs ADD COLUMN {name} {definition}"))
+        # 「Claude 最大轮数」升级为全 agent 通用的「最大步数」，历史值原样迁移
+        if "agent_max_steps" not in existing and "claude_max_turns" in existing:
+            connection.execute(text("UPDATE runs SET agent_max_steps = claude_max_turns"))

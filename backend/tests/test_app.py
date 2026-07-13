@@ -1,6 +1,7 @@
 import json
 import subprocess
 from pathlib import Path
+from urllib.parse import quote
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from app.main import app
@@ -45,8 +46,11 @@ def test_credential_and_redaction(tmp_path: Path):
 
 def test_concurrency_guard():
     with TestClient(app) as client:
-        assert client.get("/api/concurrency/3").json()["level"] == "warning"
-        assert client.get("/api/concurrency/5").json()["level"] == "blocked"
+        assert client.get("/api/concurrency/12").json()["level"] == "normal"
+        assert client.get("/api/concurrency/13").json()["level"] == "warning"
+        assert client.get("/api/concurrency/19").json()["level"] == "danger"
+        assert client.get("/api/concurrency/72").json()["level"] == "danger"
+        assert client.get("/api/concurrency/73").json()["level"] == "blocked"
 
 def test_missing_task_is_rejected_for_claude_adapter():
     with TestClient(app) as client:
@@ -60,8 +64,9 @@ def test_empty_task_list_is_rejected():
 
 def test_run_validation_counts_trials_and_rejects_missing_task():
     with TestClient(app) as client:
-        good=client.post("/api/runs/validate",json={"tasks":["actionlint-action-pinning-lint"],"attempts_per_task":4})
+        good=client.post("/api/runs/validate",json={"tasks":["actionlint-action-pinning-lint"],"attempts_per_task":4,"concurrency":72,"parallel_agent_count":3})
         assert good.status_code==200 and good.json()["trial_count"]==4
+        assert good.json()["total_parallel_tasks"]==12
         assert client.post("/api/runs/validate",json={"tasks":["not-a-real-task"]}).status_code==422
 
 def test_run_detail_404_and_cancel_inactive():
@@ -74,6 +79,12 @@ def test_compare_accepts_independent_run_task_items():
         response=client.get("/api/compare", params=[("items", "1:task-a"), ("items", "1:task-b")])
         assert response.status_code == 200
         assert response.json()["selections"] == ["1:task-a", "1:task-b"]
+
+def test_compare_options_exposes_trial_attempts():
+    with TestClient(app) as client:
+        response=client.get("/api/compare/options")
+        assert response.status_code == 200
+        assert all("trials" in run for run in response.json())
 
 def test_compare_accepts_unlimited_items_over_post_and_get():
     items = [f"{900000 + index}:task-{index}" for index in range(12)]
@@ -102,6 +113,55 @@ def test_delete_terminal_run_and_reject_active_run():
         assert body["deleted"] is True
         assert "docker_cleanup" in body  # Docker 清理发生在 artifacts 删除之前并返回摘要
         assert client.get(f"/api/runs/{done_id}").status_code==404
+
+def test_delete_individual_trials_persists_across_refresh(tmp_path: Path, monkeypatch):
+    from app import main
+    job="delete-trials"
+    root=tmp_path/job
+    trial_id="task-a__abc1234"
+    folder=root/trial_id
+    folder.mkdir(parents=True)
+    (folder/"result.json").write_text(json.dumps({
+        "task_name":"task-a",
+        "verifier_result":{"rewards":{"reward":1}},
+        "agent_result":{"n_input_tokens":100,"n_cache_tokens":50,"n_output_tokens":10},
+    }),encoding="utf-8")
+    monkeypatch.setattr(main,"cleanup_job_resources",lambda *_a,**_k:{
+        "removed_images":["task-a__abc1234-main:latest"],"skipped_images":[],"errors":[],
+    })
+    with TestClient(app) as client:
+        with SessionLocal() as db:
+            run=Run(status="cancelled",agent="codex",model="test",reasoning_effort="high",
+                    job_name=job,jobs_dir=str(tmp_path),tasks_json='["task-a"]',attempts_per_task=2,
+                    error="cancelled by user")
+            db.add(run); db.commit(); db.refresh(run); run_id=run.id
+
+        synthetic_id="task-a#2"
+        response=client.delete(f"/api/runs/{run_id}/trials/{quote(synthetic_id,safe='')}")
+        assert response.status_code == 200
+        detail=client.get(f"/api/runs/{run_id}").json()
+        assert [trial["id"] for trial in detail["trials"]] == [trial_id]
+        assert detail["progress"]["total"] == 1
+
+        response=client.delete(f"/api/runs/{run_id}/trials/{trial_id}")
+        assert response.status_code == 200
+        assert response.json()["docker_cleanup"]["removed_images"]
+        assert not folder.exists()
+        detail=client.get(f"/api/runs/{run_id}").json()
+        assert detail["trials"] == []
+        assert detail["progress"] == {"completed":0,"total":0,"passed":0,"percent":0}
+        assert detail["deleted_trials"] == 2
+        summary=next(run for run in client.get("/api/runs").json() if run["id"] == run_id)
+        assert summary["progress"]["total"] == 0
+
+def test_delete_trial_rejects_active_run():
+    with TestClient(app) as client:
+        with SessionLocal() as db:
+            run=Run(status="running",agent="codex",model="test",reasoning_effort="high",
+                    job_name="delete-active-trial",tasks_json='["task-a"]')
+            db.add(run); db.commit(); db.refresh(run); run_id=run.id
+        response=client.delete(f"/api/runs/{run_id}/trials/task-a%231")
+        assert response.status_code == 409
 
 def test_job_name_whitelist():
     assert is_safe_job_name("ui-20260711-123456-abc123")

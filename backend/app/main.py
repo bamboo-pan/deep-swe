@@ -19,17 +19,20 @@ from .diagnostics import run_checks
 from .docker_cleanup import (
     DockerCleanupPolicy, cleanup_job_resources, docker_storage_summary, expired_jobs,
     image_unique_sizes, managed_image_inventory, preview_builder_cleanup, preview_job_cleanup,
-    prune_builder_cache, remove_orphaned_images,
+    prune_builder_cache, remove_orphaned_images, sanitize_compose_project_name,
 )
 from .models import ACTIVE_STATES, TERMINAL_STATES, Baseline, Run, Setting
 from .official_stats import load_official_stats, official_stats_meta, sync_official_stats
 from .preferences import KEYS as PREFERENCE_KEYS, get_preferences, update_preferences
 from .results import (
-    compare_runs, jobs_root_for, parse_timestamp,
-    run_detail as parsed_run_detail, task_catalog, trial_detail, trial_log,
+    compare_runs, deleted_trial_entries, jobs_root_for, list_details, parse_timestamp,
+    run_detail as parsed_run_detail, task_catalog, trial_detail, trial_folder, trial_log,
 )
 from .runner import cancel_run, create_run, get_run, list_runs, reap_orphaned_runs, run_log, shutdown_processes
-from .schemas import BaselineDraft, CompareRequest, DockerCleanupRequest, RestorePayload, RunDraft, SettingsUpdate, concurrency_advice
+from .schemas import (
+    MAX_CONCURRENCY_PER_RUN, BaselineDraft, CompareRequest, DockerCleanupRequest,
+    RestorePayload, RunDraft, SettingsUpdate, concurrency_advice, total_parallel_tasks,
+)
 from .security import is_safe_job_name, read_credential
 
 DEFAULT_TASKS = ["dasel-html-document-format", "igel-persist-feature-schema", "csstree-shorthand-expansion-compression", "happy-dom-deterministic-intersectionobserver", "superjson-error-stack-serialization", "dateutil-rfc5545-timezone-interop", "actionlint-action-pinning-lint"]
@@ -74,7 +77,7 @@ def bootstrap():
         stats = official_stats.get(task) or {}
         task_number = task_numbers.get(task)
         task_choices.append({"id": task, "task_number": task_number, "suite_id": f"TASK-{task_number:03d}" if task_number else f"T{index:02d}", "external_id": metadata.get("ext_id"), "title": metadata.get("display_title") or task, "language": metadata.get("language"), "category": metadata.get("category"), "available": task in available, "official_pass_rate": stats.get("pass_rate"), "official_avg_duration_seconds": stats.get("avg_duration_seconds")})
-    return {"defaults": {"agent": preferences["default_agent"], "model": preferences["default_model"], "reasoning_effort": preferences["default_effort"], "concurrency": preferences["default_concurrency"]}, "agents": ["mini-swe-agent", "codex", "claude-code"], "models":["gpt-5.6-sol"], "efforts": ["none", "low", "medium", "high", "xhigh", "max"], "service_tiers": ["standard", "batch", "priority"], "setting_options":{"credential_files":credential_options,"jobs_dirs":job_options,"concurrency":[1,2,3,4]}, "task_suite": {"name": "regression-standard-7", "tasks": task_choices}}
+    return {"defaults": {"agent": preferences["default_agent"], "model": preferences["default_model"], "reasoning_effort": preferences["default_effort"], "concurrency": preferences["default_concurrency"]}, "agents": ["mini-swe-agent", "codex", "claude-code"], "models":["gpt-5.6-sol"], "efforts": ["none", "low", "medium", "high", "xhigh", "max"], "service_tiers": ["standard", "batch", "priority"], "setting_options":{"credential_files":credential_options,"jobs_dirs":job_options,"concurrency":list(range(1, MAX_CONCURRENCY_PER_RUN + 1))}, "task_suite": {"name": "regression-standard-7", "tasks": task_choices}}
 
 @app.get("/api/diagnostics")
 def diagnostics(): return run_checks()
@@ -85,9 +88,10 @@ def concurrency(value: int): return concurrency_advice(value)
 @app.post("/api/runs/validate")
 def validate_run(draft: RunDraft):
     missing = [task for task in draft.tasks if not (settings.tasks_dir / task).is_dir()]
-    advice = concurrency_advice(draft.concurrency)
+    parallel_tasks = total_parallel_tasks(draft)
+    advice = concurrency_advice(parallel_tasks)
     if missing: raise HTTPException(422, detail={"missing_tasks": missing})
-    return {"valid": advice["level"] != "blocked", "trial_count": len(draft.tasks) * draft.attempts_per_task, "concurrency": advice}
+    return {"valid": advice["level"] != "blocked", "trial_count": len(draft.tasks) * draft.attempts_per_task, "total_parallel_tasks": parallel_tasks, "concurrency": advice}
 
 @app.post("/api/runs")
 def start_run(draft: RunDraft):
@@ -126,6 +130,57 @@ def get_trial_log(run_id:int, trial_id:str):
 
 @app.post("/api/runs/{run_id}/cancel")
 def cancel(run_id:int): return {"cancelled":cancel_run(run_id)}
+
+@app.delete("/api/runs/{run_id}/trials/{trial_id}")
+def delete_trial(run_id: int, trial_id: str):
+    with SessionLocal() as db:
+        run = db.get(Run, run_id)
+        if not run:
+            raise HTTPException(404, "run not found")
+        if run.status not in TERMINAL_STATES:
+            raise HTTPException(409, "运行中的 Trial 不允许删除，请先取消 Run")
+        trial = next(
+            (item for item in parsed_run_detail(run, include_patches=False)["trials"] if item["id"] == trial_id),
+            None,
+        )
+        if not trial:
+            raise HTTPException(404, "trial not found")
+        folder = trial_folder(run, trial_id)
+        job_name = run.job_name
+        jobs_root = jobs_root_for(run)
+
+    docker_report = None
+    if folder and get_preferences().get("docker_cleanup_on_delete", True):
+        try:
+            docker_report = cleanup_job_resources(
+                job_name, jobs_root, DockerCleanupPolicy(), trigger="delete-trial",
+                projects=[sanitize_compose_project_name(trial_id)],
+            )
+        except Exception as exc:
+            docker_report = {"available": False, "errors": [str(exc)]}
+    if folder:
+        try:
+            shutil.rmtree(folder)
+        except OSError as exc:
+            raise HTTPException(500, f"Trial 文件删除失败：{exc}") from exc
+
+    with SessionLocal() as db:
+        run = db.get(Run, run_id)
+        if not run:
+            raise HTTPException(404, "run not found")
+        deleted = deleted_trial_entries(run)
+        deleted.append({"id": trial_id, "task": trial["task"], "attempt": trial["attempt"]})
+        run.deleted_trials_json = json.dumps(deleted, ensure_ascii=False)
+        db.commit()
+
+    response = {"deleted": True, "run_id": run_id, "trial_id": trial_id}
+    if docker_report is not None:
+        response["docker_cleanup"] = {
+            "removed_images": docker_report.get("removed_images", []),
+            "skipped_images": docker_report.get("skipped_images", []),
+            "errors": docker_report.get("errors", []),
+        }
+    return response
 
 def _safe_job_dir(root: Path, job_name: str) -> Path | None:
     """rmtree 只允许作用于 jobs 根目录内的直接子目录。"""
@@ -210,6 +265,10 @@ async def run_events(run_id:int):
 @app.get("/api/compare")
 def compare(ids:list[int]=Query(default=[]), items:list[str]=Query(default=[])):
     return compare_runs(ids, _parse_compare_items(items) or None)
+
+@app.get("/api/compare/options")
+def compare_options():
+    return list_details()
 
 @app.post("/api/compare")
 def compare_selected(payload: CompareRequest):
