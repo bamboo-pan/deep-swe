@@ -48,7 +48,14 @@ type Boot = {
   };
   agents: string[];
   models: string[];
+  model_efforts: Record<string, string[]>;
+  model_defaults: Record<string, string>;
   efforts: string[];
+  provider_catalog: {
+    source: "provider" | "fallback";
+    models_authoritative: boolean;
+    error?: string | null;
+  };
   service_tiers: string[];
   setting_options: {
     credential_files: string[];
@@ -402,6 +409,13 @@ function App() {
     return () => clearInterval(id);
   }, []);
   useEffect(() => {
+    if (!boot) return;
+    const supported = boot.model_efforts[model] || boot.efforts;
+    if (!supported.includes(effort)) {
+      setEffort(boot.model_defaults[model] || supported[0]);
+    }
+  }, [boot, model, effort]);
+  useEffect(() => {
     if (!selectedRun) return;
     let closed = false;
     let source: EventSource | null = null;
@@ -476,6 +490,15 @@ function App() {
       : totalParallelTasks <= 18
         ? { className: "warning", label: "资源峰值警告" }
         : { className: "danger", label: "需要高负载确认" };
+  const selectModel = (nextModel: string) => {
+    const supported = boot?.model_efforts[nextModel] || boot?.efforts || [];
+    setModel(nextModel);
+    setEffort((current) =>
+      supported.includes(current)
+        ? current
+        : boot?.model_defaults[nextModel] || supported[0] || current,
+    );
+  };
   const start = async () => {
     if (starting) return;
     if (!selectedTasks.length) return setNotice("至少选择一个任务");
@@ -638,13 +661,18 @@ function App() {
   };
   const savePrefs = async () => {
     if (!prefs) return;
-    setPrefs(
-      await request<Prefs>("/api/settings", {
-        method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(prefs),
-      }),
-    );
+    const saved = await request<Prefs>("/api/settings", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(prefs),
+    });
+    const nextBoot = await request<Boot>("/api/bootstrap");
+    setPrefs(saved);
+    setBoot(nextBoot);
+    if (!nextBoot.models.includes(model)) {
+      setModel(nextBoot.defaults.model);
+      setEffort(nextBoot.defaults.reasoning_effort);
+    }
     setNotice("设置已保存");
   };
   const restore = async (file: File) => {
@@ -914,7 +942,7 @@ function App() {
                 模型
                 <select
                   value={model}
-                  onChange={(e) => setModel(e.target.value)}
+                  onChange={(e) => selectModel(e.target.value)}
                 >
                   {boot.models.map((x) => (
                     <option key={x}>{x}</option>
@@ -927,7 +955,7 @@ function App() {
                   value={effort}
                   onChange={(e) => setEffort(e.target.value)}
                 >
-                  {boot.efforts.map((x) => (
+                  {(boot.model_efforts[model] || boot.efforts).map((x) => (
                     <option key={x}>{x}</option>
                   ))}
                 </select>
@@ -2241,6 +2269,18 @@ function Settings({
   notify: (message: string) => void;
 }) {
   if (!prefs) return <Empty text="正在读取设置…" />;
+  const defaultEfforts =
+    boot.model_efforts[prefs.default_model] || boot.efforts;
+  const selectDefaultModel = (nextModel: string) => {
+    const supported = boot.model_efforts[nextModel] || boot.efforts;
+    setPrefs({
+      ...prefs,
+      default_model: nextModel,
+      default_effort: supported.includes(prefs.default_effort)
+        ? prefs.default_effort
+        : boot.model_defaults[nextModel] || supported[0],
+    });
+  };
   return (
     <>
       <section className="panel form">
@@ -2287,9 +2327,7 @@ function Settings({
             默认模型
             <select
               value={prefs.default_model}
-              onChange={(e) =>
-                setPrefs({ ...prefs, default_model: e.target.value })
-              }
+              onChange={(e) => selectDefaultModel(e.target.value)}
             >
               {boot.models.map((x) => (
                 <option key={x}>{x}</option>
@@ -2304,7 +2342,7 @@ function Settings({
                 setPrefs({ ...prefs, default_effort: e.target.value })
               }
             >
-              {boot.efforts.map((x) => (
+              {defaultEfforts.map((x) => (
                 <option key={x}>{x}</option>
               ))}
             </select>

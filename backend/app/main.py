@@ -27,6 +27,7 @@ from .docker_cleanup import (
 from .models import ACTIVE_STATES, TERMINAL_STATES, Baseline, Run, Setting
 from .official_stats import load_official_stats, official_stats_meta, sync_official_stats
 from .preferences import KEYS as PREFERENCE_KEYS, get_preferences, update_preferences
+from .provider_catalog import EFFORT_ORDER, get_provider_catalog
 from .results import (
     compare_runs, deleted_trial_entries, jobs_root_for, list_details, parse_timestamp,
     run_detail as parsed_run_detail, task_catalog, trial_detail, trial_folder, trial_log,
@@ -53,6 +54,55 @@ app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http
 
 @app.get("/api/health")
 def health(): return {"status": "ok", "version": app.version}
+
+def _provider_bootstrap(preferences: dict, *, force_refresh: bool = False) -> dict:
+    catalog = get_provider_catalog(
+        preferences["default_model"],
+        preferences["default_effort"],
+        force_refresh=force_refresh,
+    )
+    model_entries = catalog["models"]
+    model_ids = [entry["id"] for entry in model_entries]
+    default_model = preferences["default_model"] if preferences["default_model"] in model_ids else model_ids[0]
+    model_efforts = {entry["id"]: entry["reasoning_efforts"] for entry in model_entries}
+    model_defaults = {
+        entry["id"]: entry["default_reasoning_effort"] or entry["reasoning_efforts"][0]
+        for entry in model_entries
+    }
+    selected_efforts = model_efforts[default_model]
+    preferred_effort = preferences["default_effort"]
+    default_effort = preferred_effort if preferred_effort in selected_efforts else model_defaults[default_model]
+    available_efforts = {
+        effort
+        for efforts in model_efforts.values()
+        for effort in efforts
+    }
+    return {
+        "models": model_ids,
+        "model_efforts": model_efforts,
+        "model_defaults": model_defaults,
+        "efforts": [effort for effort in EFFORT_ORDER if effort in available_efforts],
+        "default_model": default_model,
+        "default_effort": default_effort,
+        "provider_catalog": {
+            "source": catalog["source"],
+            "models_authoritative": catalog["models_authoritative"],
+            "error": catalog.get("error"),
+        },
+    }
+
+def _provider_selection_error(draft: RunDraft) -> str | None:
+    preferences = get_preferences()
+    catalog = get_provider_catalog(preferences["default_model"], preferences["default_effort"])
+    if not catalog["models_authoritative"]:
+        return None
+    selected = next((entry for entry in catalog["models"] if entry["id"] == draft.model), None)
+    if not selected:
+        return f"模型 {draft.model} 当前不在 provider 的可用模型列表中"
+    if selected["reasoning_efforts_known"] and draft.reasoning_effort not in selected["reasoning_efforts"]:
+        supported = ", ".join(selected["reasoning_efforts"])
+        return f"模型 {draft.model} 不支持 reasoning effort {draft.reasoning_effort}；支持：{supported}"
+    return None
 
 @app.get("/api/bootstrap")
 def bootstrap():
@@ -81,7 +131,28 @@ def bootstrap():
         stats = official_stats.get(task) or {}
         task_number = task_numbers.get(task)
         task_choices.append({"id": task, "task_number": task_number, "suite_id": f"TASK-{task_number:03d}" if task_number else f"T{index:02d}", "external_id": metadata.get("ext_id"), "title": metadata.get("display_title") or task, "language": metadata.get("language"), "category": metadata.get("category"), "available": task in available, "official_pass_rate": stats.get("pass_rate"), "official_avg_duration_seconds": stats.get("avg_duration_seconds")})
-    return {"defaults": {"agent": preferences["default_agent"], "model": preferences["default_model"], "reasoning_effort": preferences["default_effort"], "concurrency": preferences["default_concurrency"]}, "agents": ["mini-swe-agent", "codex", "claude-code"], "models":["gpt-5.6-sol"], "efforts": ["none", "low", "medium", "high", "xhigh", "max"], "service_tiers": ["standard", "batch", "priority"], "setting_options":{"credential_files":credential_options,"jobs_dirs":job_options,"concurrency":list(range(1, MAX_CONCURRENCY_PER_RUN + 1))}, "task_suite": {"name": "regression-standard-7", "tasks": task_choices}}
+    provider = _provider_bootstrap(preferences, force_refresh=True)
+    return {
+        "defaults": {
+            "agent": preferences["default_agent"],
+            "model": provider["default_model"],
+            "reasoning_effort": provider["default_effort"],
+            "concurrency": preferences["default_concurrency"],
+        },
+        "agents": ["mini-swe-agent", "codex", "claude-code"],
+        "models": provider["models"],
+        "model_efforts": provider["model_efforts"],
+        "model_defaults": provider["model_defaults"],
+        "efforts": provider["efforts"],
+        "provider_catalog": provider["provider_catalog"],
+        "service_tiers": ["standard", "batch", "priority"],
+        "setting_options": {
+            "credential_files": credential_options,
+            "jobs_dirs": job_options,
+            "concurrency": list(range(1, MAX_CONCURRENCY_PER_RUN + 1)),
+        },
+        "task_suite": {"name": "regression-standard-7", "tasks": task_choices},
+    }
 
 @app.get("/api/diagnostics")
 def diagnostics(): return run_checks()
@@ -95,12 +166,16 @@ def validate_run(draft: RunDraft):
     parallel_tasks = total_parallel_tasks(draft)
     advice = concurrency_advice(parallel_tasks)
     if missing: raise HTTPException(422, detail={"missing_tasks": missing})
+    if selection_error := _provider_selection_error(draft):
+        raise HTTPException(422, detail=selection_error)
     return {"valid": advice["level"] != "blocked", "trial_count": len(draft.tasks) * draft.attempts_per_task, "total_parallel_tasks": parallel_tasks, "concurrency": advice}
 
 @app.post("/api/runs")
 def start_run(draft: RunDraft):
     missing=[task for task in draft.tasks if not (settings.tasks_dir/task).is_dir()]
     if missing: raise HTTPException(422,detail={"missing_tasks":missing})
+    if selection_error := _provider_selection_error(draft):
+        raise HTTPException(422, detail=selection_error)
     try: return create_run(draft)
     except ValueError as exc: raise HTTPException(422,detail=str(exc))
 
@@ -341,7 +416,15 @@ def sync_official():
 def read_settings(): return get_preferences()
 
 @app.put("/api/settings")
-def save_settings(payload:SettingsUpdate): return update_preferences(payload)
+def save_settings(payload: SettingsUpdate):
+    preferences = update_preferences(payload)
+    provider = _provider_bootstrap(preferences, force_refresh=True)
+    corrections = {}
+    if preferences["default_model"] != provider["default_model"]:
+        corrections["default_model"] = provider["default_model"]
+    if preferences["default_effort"] != provider["default_effort"]:
+        corrections["default_effort"] = provider["default_effort"]
+    return update_preferences(SettingsUpdate(**corrections)) if corrections else preferences
 
 def _active_run_count() -> int:
     with SessionLocal() as db:

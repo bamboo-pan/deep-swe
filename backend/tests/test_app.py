@@ -30,6 +30,60 @@ def test_bootstrap_has_seven_tasks():
         assert len(tasks) == 7
         assert all(task["suite_id"].startswith("TASK-") for task in tasks if task["available"])
 
+def test_bootstrap_uses_provider_model_efforts_and_validates_selection(monkeypatch):
+    from app import main
+
+    original_preferences = main.get_preferences
+    monkeypatch.setattr(
+        main,
+        "get_preferences",
+        lambda: {
+            **original_preferences(),
+            "default_model": "gpt-5.6-sol",
+            "default_effort": "high",
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "get_provider_catalog",
+        lambda default_model, default_effort, force_refresh=False: {
+            "source": "provider",
+            "models_authoritative": True,
+            "error": None,
+            "models": [
+                {
+                    "id": "gpt-5.6-sol",
+                    "reasoning_efforts": ["low", "medium", "high", "xhigh", "max"],
+                    "default_reasoning_effort": "medium",
+                    "reasoning_efforts_known": True,
+                },
+                {
+                    "id": "deepseek-v4-flash",
+                    "reasoning_efforts": ["low", "medium", "high"],
+                    "default_reasoning_effort": "medium",
+                    "reasoning_efforts_known": True,
+                },
+            ],
+        },
+    )
+
+    with TestClient(app) as client:
+        bootstrap = client.get("/api/bootstrap").json()
+        invalid = client.post(
+            "/api/runs/validate",
+            json={
+                "model": "deepseek-v4-flash",
+                "reasoning_effort": "xhigh",
+                "tasks": ["actionlint-action-pinning-lint"],
+            },
+        )
+
+    assert bootstrap["models"] == ["gpt-5.6-sol", "deepseek-v4-flash"]
+    assert bootstrap["model_efforts"]["deepseek-v4-flash"] == ["low", "medium", "high"]
+    assert bootstrap["defaults"]["reasoning_effort"] == "high"
+    assert invalid.status_code == 422
+    assert "支持：low, medium, high" in invalid.json()["detail"]
+
 def test_task_catalog_has_stable_management_numbers():
     with TestClient(app) as client:
         tasks = client.get("/api/tasks").json()

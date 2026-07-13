@@ -153,10 +153,13 @@ def _codex_config(
         encoding="utf-8", newline="\n")
     return path
 
-def _mini_limits_config(folder: Path, step_limit: int) -> Path:
+def _mini_limits_config(folder: Path, step_limit: int, reasoning_effort: str) -> Path:
     """mini-swe-agent 的 step_limit 是确定性护栏；cost_limit 走 --agent-kwarg 单独传，
     自建网关模型 litellm 算不出成本时恒为 0、不会触发，由守护线程按 token 估算兜底。
-    pier adapter 会把该文件内容写进容器再以 -c 追加。"""
+    pier adapter 会把该文件内容写进容器再以 -c 追加。
+
+    LiteLLM Responses 的字符串 reasoning_effort 映射不认识 provider 扩展档位 max，
+    会在 drop_params=true 时静默丢弃。直接配置原生 reasoning.effort，确保请求体透传。"""
     path = folder / "mini-limits.yaml"
     # mini-swe-agent/litellm otherwise creates a fresh prompt_cache_key for
     # every turn.  Keep one key for the whole trial so growing conversation
@@ -164,10 +167,21 @@ def _mini_limits_config(folder: Path, step_limit: int) -> Path:
     cache_key = f"deepswe-{uuid.uuid4().hex}"
     path.write_text(
         f"agent:\n  step_limit: {step_limit}\n"
-        f"model:\n  model_kwargs:\n    prompt_cache_key: {cache_key}\n"
+        "model:\n  model_kwargs:\n"
+        f"    reasoning:\n      effort: {json.dumps(reasoning_effort)}\n"
+        f"    prompt_cache_key: {cache_key}\n"
         "    prompt_cache_retention: 24h\n",
         encoding="utf-8", newline="\n")
     return path
+
+def _reasoning_effort_adapter(agent: str, effort: str) -> str:
+    if agent == "codex":
+        return f"model_reasoning_effort={effort}"
+    if agent == "mini-swe-agent":
+        return f"reasoning.effort={effort}"
+    if agent == "claude-code" and effort == "none":
+        return "thinking=disabled"
+    return f"reasoning_effort={effort}"
 
 def _pier_version() -> str | None:
     executable = shutil.which("pier")
@@ -205,7 +219,7 @@ def create_run(draft: RunDraft) -> Run:
     if advice["requires_confirmation"] and not draft.confirm_high_concurrency:
         raise ValueError(f"总并行 Trial 数 {parallel_tasks} 需要高负载确认")
     with SessionLocal() as db:
-        mapping = "thinking=disabled" if draft.agent == "claude-code" and draft.reasoning_effort == "none" else ("model_reasoning_effort=" + draft.reasoning_effort if draft.agent == "codex" else "reasoning_effort=" + draft.reasoning_effort)
+        mapping = _reasoning_effort_adapter(draft.agent, draft.reasoning_effort)
         run = Run(
             status="queued", job_name=f"pending-{uuid.uuid4().hex}", jobs_dir=str(jobs_path()), agent=draft.agent, model=draft.model,
             reasoning_effort=draft.reasoning_effort, reasoning_effort_adapter=mapping,
@@ -282,14 +296,27 @@ def _network_failure_summary(text: str) -> str | None:
     if status:
         return f"模型代理请求失败：HTTP {status.group(1)} server_error"
     lowered = text.lower()
-    markers = (
-        ("api error: the operation timed out", "模型 API 请求超时"),
+    if "api error: the operation timed out" in lowered:
+        return "模型 API 请求超时"
+    error_context = re.compile(
+        r"(?:\b[a-z]*(?:connection|protocol|transport|read|write|timeout|network|api)[a-z]*error\b"
+        r"|\b(?:exception|traceback|failed|failure)\b)",
+        re.IGNORECASE,
+    )
+    contextual_markers = (
         ("connection timed out", "模型代理连接超时"),
         ("connection refused", "模型代理拒绝连接"),
         ("connection reset", "模型代理连接被重置"),
         ("unexpected eof", "模型代理连接意外中断"),
     )
-    return next((message for marker, message in markers if marker in lowered), None)
+    for line in text.splitlines():
+        lowered_line = line.lower()
+        if not error_context.search(line):
+            continue
+        for marker, message in contextual_markers:
+            if marker in lowered_line:
+                return message
+    return None
 
 def _run_failure_summary(job_dir: Path, supervisor_log: Path | None = None) -> str | None:
     """Extract an actionable failure instead of exposing only Pier's exit code."""
@@ -523,10 +550,10 @@ def _execute(run_id: int):
             args += ["--agent-env", f"CODEX_AUTH_JSON_PATH={auth}", "--agent-kwarg", f"config_toml_file={config}", "--agent-kwarg", f"reasoning_effort={effort}"]
         elif agent == "mini-swe-agent":
             process_env.update({"OPENAI_API_KEY": cred.token, "OPENAI_BASE_URL": _docker_url(cred.url)})
-            limits = _mini_limits_config(secret_dir, run.agent_max_steps)
+            limits = _mini_limits_config(secret_dir, run.agent_max_steps, effort)
             # litellm_response（Responses API 桥）顶层 import litellm.proxy，
             # 需要完整 proxy extras（fastapi/orjson/pyjwt 等），agent 容器默认没装
-            args += ["--agent-kwarg", f"reasoning_effort={effort}", "--agent-kwarg", f"config_file={limits}",
+            args += ["--agent-kwarg", f"config_file={limits}",
                      "--agent-kwarg", 'extra_python_packages=["litellm[proxy]"]']
             if trial_budget > 0:
                 # mini 原生单 Trial 费用限额（agent.cost_limit，0 = 禁用），到限优雅停止

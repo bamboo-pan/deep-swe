@@ -81,12 +81,19 @@ def test_codex_run_passes_reasoning_effort(tmp_path: Path):
     assert "stream_max_retries = 6" in text
     assert "stream_idle_timeout_ms = 600000" in text
 
-def test_mini_limits_config_sets_step_limit(tmp_path: Path):
+def test_mini_limits_config_sets_native_responses_reasoning(tmp_path: Path):
     # step_limit 是运行配置里的最大步数；cost_limit 走 --agent-kwarg 单独传
-    path=runner._mini_limits_config(tmp_path, 180)
+    path=runner._mini_limits_config(tmp_path, 180, "max")
     text=path.read_text(encoding="utf-8")
     assert "step_limit: 180" in text and text.startswith("agent:")
+    assert 'reasoning:\n      effort: "max"' in text
+    assert "reasoning_effort:" not in text
     assert "prompt_cache_key: deepswe-" in text and "prompt_cache_retention: 24h" in text
+
+def test_reasoning_effort_adapter_records_native_mini_mapping():
+    assert runner._reasoning_effort_adapter("mini-swe-agent", "max") == "reasoning.effort=max"
+    assert runner._reasoning_effort_adapter("codex", "xhigh") == "model_reasoning_effort=xhigh"
+    assert runner._reasoning_effort_adapter("claude-code", "none") == "thinking=disabled"
 
 def test_infrastructure_retry_args_are_bounded_and_typed():
     assert runner.INFRASTRUCTURE_RETRY_DELAYS_SEC == (5, 30, 120, 300, 600, 900)
@@ -163,6 +170,11 @@ def test_squid_connect_failure_summary_is_actionable():
     summary=runner._network_failure_summary(message)
     assert summary == "模型代理连接失败：192.168.0.108（Docker/Squid：Connection timed out）"
 
+def test_unexpected_eof_requires_network_error_context():
+    source = 'return nil, fmt.Errorf("unexpected EOF")'
+    assert runner._network_failure_summary(source) is None
+    assert runner._network_failure_summary("APIConnectionError: unexpected EOF") == "模型代理连接意外中断"
+
 def test_transient_agent_failure_classification_is_selective():
     assert is_transient_agent_failure(
         "NonZeroAgentExitCodeError", "unexpected status 503 Service Unavailable"
@@ -171,6 +183,12 @@ def test_transient_agent_failure_classification_is_selective():
         "NonZeroAgentExitCodeError", "API Error: The operation timed out."
     )
     assert is_transient_agent_failure("ConnectionError", "socket closed")
+    assert is_transient_agent_failure(
+        "NonZeroAgentExitCodeError", "APIConnectionError: unexpected EOF"
+    )
+    assert not is_transient_agent_failure(
+        "NonZeroAgentExitCodeError", 'return nil, fmt.Errorf("unexpected EOF")'
+    )
     # 2026-07-12 run-000001 实测漏网的两条镜像构建失败（原样字符串，防回归）：
     # apt 输出 502 与 Bad Gateway 之间是双空格，单空格标记词曾匹配不上
     assert is_transient_agent_failure(
