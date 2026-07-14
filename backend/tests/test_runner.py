@@ -8,7 +8,11 @@ from app import runner
 from app import results
 from app.pier_retry_patch.transient import is_transient_agent_failure
 from app.pier_retry_patch.networking import DEFAULT_NETWORK_POOL, trial_network_subnets
-from app.schemas import RunDraft, concurrency_advice, total_parallel_tasks
+from app.pier_retry_patch.runtime import (
+    install_retry_trial_names,
+    install_safe_metric_display,
+)
+from app.schemas import RunDraft, SettingsUpdate, concurrency_advice, total_parallel_tasks
 
 def make_run(job_name: str, **extra) -> int:
     init_db()
@@ -206,13 +210,20 @@ def test_transient_agent_failure_classification_is_selective():
         "NonZeroAgentExitCodeError", "tests failed with exit code 1"
     )
 
-def test_run_draft_exposes_retry_and_agent_limits():
+def test_runtime_retry_and_agent_limits_live_in_settings():
+    update=SettingsUpdate(
+        agent_timeout_seconds=7200, verifier_timeout_seconds=2400,
+        infrastructure_max_retries=4, agent_max_steps=150,
+    )
     draft=RunDraft(agent="claude-code", tasks=["actionlint-action-pinning-lint"],
-                   infrastructure_max_retries=4, agent_max_steps=150,
                    codex_request_max_retries=7, codex_stream_max_retries=8,
                    codex_stream_idle_timeout_seconds=900)
-    assert draft.infrastructure_max_retries == 4
-    assert draft.agent_max_steps == 150
+    assert update.agent_timeout_seconds == 7200
+    assert update.verifier_timeout_seconds == 2400
+    assert update.infrastructure_max_retries == 4
+    assert update.agent_max_steps == 150
+    assert "infrastructure_max_retries" not in RunDraft.model_fields
+    assert "agent_max_steps" not in RunDraft.model_fields
     assert draft.codex_request_max_retries == 7
     assert draft.codex_stream_max_retries == 8
     assert draft.codex_stream_idle_timeout_seconds == 900
@@ -285,6 +296,39 @@ def test_official_regression_contains_baseline_values(monkeypatch):
     assert regression["current_duration_seconds"] == 80
     assert regression["baseline_duration_seconds"] == 100
     assert regression["baseline_trials"] == 40
+
+def test_frontier_regression_threshold_scales_to_sixteen_trial_baseline():
+    tasks = ["task-a", "task-b", "task-c", results.CONTROL_TASK]
+    baseline_trials = [
+        {"task": task, "reward": 1, "duration_seconds": 60.0}
+        for task in tasks
+        for _ in range(4)
+    ]
+    current_trials = [dict(trial) for trial in baseline_trials]
+    current_trials[0]["reward"] = 0
+    current_trials[4]["reward"] = 0
+    baseline = {"progress": {"total": 16, "passed": 16}, "trials": baseline_trials}
+    current = {"progress": {"total": 16, "passed": 14}, "trials": current_trials}
+
+    reasons = results._regression_reasons(current, baseline)
+
+    assert any("总通过率下降 12.5 个百分点" in reason for reason in reasons)
+
+def test_frontier_control_task_collapse_is_reported():
+    task = results.CONTROL_TASK
+    baseline_trials = [
+        {"task": task, "reward": 1, "duration_seconds": 60.0}
+        for _ in range(4)
+    ]
+    current_trials = [dict(trial) for trial in baseline_trials]
+    for trial in current_trials[:3]:
+        trial["reward"] = 0
+    baseline = {"progress": {"total": 4, "passed": 4}, "trials": baseline_trials}
+    current = {"progress": {"total": 4, "passed": 1}, "trials": current_trials}
+
+    reasons = results._regression_reasons(current, baseline)
+
+    assert any(task in reason and "1/4" in reason for reason in reasons)
 
 def test_compare_uses_exact_configuration_and_task_averages(monkeypatch):
     detail = {
@@ -438,6 +482,68 @@ def test_verification_failure_has_actionable_reason(tmp_path: Path):
     assert "F2P 7/9" in trial["failure_message"]
     assert trial["failure_summary"].startswith("VerificationFailed:")
 
+def test_empty_patch_from_cost_limit_is_not_reported_as_verification_failure(tmp_path: Path):
+    folder=tmp_path/"task-a__x1"
+    (folder/"agent").mkdir(parents=True)
+    (folder/"artifacts").mkdir()
+    (folder/"artifacts"/"model.patch").write_text("", encoding="utf-8")
+    (folder/"agent"/"mini-swe-agent.txt").write_text(
+        "working\nExit:\nLimitsExceeded\nSaved trajectory\n", encoding="utf-8"
+    )
+    write_result(folder, {
+        "task_name":"task-a",
+        "config":{"agent":{"kwargs":{"cost_limit":10.0}}},
+        "agent_result":{"cost_usd":10.05},
+        "verifier_result":{"rewards":{
+            "reward":0,"f2p_passed":0,"f2p_total":24,"p2p_passed":2,"p2p_total":2,
+        }},
+    })
+    trial=results._trial(folder)
+    assert trial["failure_type"] == "CostLimitExceeded"
+    assert "$10.05 / $10.00" in trial["failure_message"]
+    assert "model.patch" in trial["failure_message"]
+    assert "目标失败测试修复（F2P） 0/24" in trial["failure_message"]
+    assert "原有通过测试保持（P2P） 2/2" in trial["failure_message"]
+    assert trial["patch_bytes"] == 0
+
+def test_empty_patch_from_step_limit_has_readable_reason(tmp_path: Path):
+    folder=tmp_path/"task-a__x1"
+    (folder/"agent").mkdir(parents=True)
+    (folder/"artifacts").mkdir()
+    (folder/"artifacts"/"model.patch").write_text("", encoding="utf-8")
+    (folder/"agent"/"mini-swe-agent.txt").write_text(
+        "working\nExit:\nLimitsExceeded\nSaved trajectory\n", encoding="utf-8"
+    )
+    write_result(folder, {
+        "task_name":"task-a",
+        "config":{"agent":{"kwargs":{"cost_limit":20.0}}},
+        "agent_result":{"cost_usd":17.004086,"n_agent_steps":120},
+        "verifier_result":{"rewards":{
+            "reward":0,"f2p_passed":0,"f2p_total":55,"p2p_passed":145,"p2p_total":145,
+        }},
+    })
+    trial=results._trial(folder)
+    assert trial["failure_type"] == "AgentLimitExceeded"
+    assert "已执行 120 步" in trial["failure_message"]
+    assert "达到设置的步数上限后自动停止" in trial["failure_message"]
+    assert "目标失败测试修复（F2P） 0/55" in trial["failure_message"]
+    assert "原有通过测试保持（P2P） 145/145" in trial["failure_message"]
+
+def test_limit_marker_does_not_hide_failure_of_submitted_patch(tmp_path: Path):
+    folder=tmp_path/"task-a__x1"
+    (folder/"agent").mkdir(parents=True)
+    (folder/"artifacts").mkdir()
+    (folder/"artifacts"/"model.patch").write_text("non-empty", encoding="utf-8")
+    (folder/"agent"/"mini-swe-agent.txt").write_text(
+        "Exit:\nLimitsExceeded\n", encoding="utf-8"
+    )
+    write_result(folder, {"task_name":"task-a","verifier_result":{"rewards":{
+        "reward":0,"f2p_passed":0,"f2p_total":2,"p2p_passed":1,"p2p_total":1,
+    }}})
+    trial=results._trial(folder)
+    assert trial["failure_type"] == "VerificationFailed"
+    assert trial["patch_bytes"] == 9
+
 def test_cancelled_run_marks_only_unfinished_trials_cancelled(tmp_path: Path, monkeypatch):
     job="test-"+uuid.uuid4().hex; run_id=make_run(job)
     with SessionLocal() as db:
@@ -492,15 +598,24 @@ def test_new_pier_job_name_uses_public_run_identity(monkeypatch):
         def __init__(self, *args, **kwargs): pass
         def start(self): pass
     monkeypatch.setattr(runner.threading, "Thread", NoopThread)
+    current_preferences = runner.get_preferences()
+    monkeypatch.setattr(runner, "get_preferences", lambda: {
+        **current_preferences,
+        "agent_timeout_seconds": 7200,
+        "verifier_timeout_seconds": 2400,
+        "infrastructure_max_retries": 3,
+        "agent_max_steps": 140,
+    })
     row = runner.create_run(RunDraft(
         agent="codex", tasks=["actionlint-action-pinning-lint"],
-        infrastructure_max_retries=3, agent_max_steps=140,
         codex_request_max_retries=7, codex_stream_max_retries=8,
         codex_stream_idle_timeout_seconds=900,
     ))
     try:
         assert row.job_name == f"run-{row.id:06d}-codex"
         assert runner.serialize(row)["run_code"] == f"RUN-{row.id:06d}"
+        assert row.agent_timeout_seconds == 7200
+        assert row.verifier_timeout_seconds == 2400
         assert row.infrastructure_max_retries == 3
         assert row.agent_max_steps == 140
         assert row.codex_request_max_retries == 7
@@ -512,3 +627,641 @@ def test_new_pier_job_name_uses_public_run_identity(monkeypatch):
             if saved:
                 db.delete(saved)
                 db.commit()
+
+def test_atomic_json_write_retries_windows_replace_contention(tmp_path: Path, monkeypatch):
+    path = tmp_path / "retry-state.json"
+    original_replace = Path.replace
+    attempts = 0
+
+    def flaky_replace(source, target):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise PermissionError(5, "destination temporarily in use")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", flaky_replace)
+    monkeypatch.setattr(runner.time, "sleep", lambda _delay: None)
+
+    runner._write_json_atomic(path, {"status": "preflight"})
+
+    assert attempts == 3
+    assert json.loads(path.read_text(encoding="utf-8")) == {"status": "preflight"}
+    assert list(tmp_path.glob("*.tmp")) == []
+
+def test_retry_marker_state_write_failure_does_not_abort_execution(tmp_path: Path, monkeypatch):
+    task = "actionlint-action-pinning-lint"
+    target_id = f"{task}__locked1"
+    marker = tmp_path / target_id
+    marker.mkdir()
+    spec = {
+        "trial_id": target_id,
+        "target_id": target_id,
+        "task": task,
+        "attempt": 1,
+        "task_config": {"path": str(runner.settings.tasks_dir / task), "source": "tasks"},
+    }
+    (marker / "config.json").write_text(
+        json.dumps(runner._retry_marker_config(tmp_path, spec)), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        runner,
+        "_write_json_atomic",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError(5, "locked")),
+    )
+
+    failures = runner._set_retry_marker_state(tmp_path, [spec], "preflight")
+
+    assert len(failures) == 1
+    assert target_id in failures[0]
+
+def test_pier_retry_runtime_assigns_deterministic_trial_names():
+    class FakeJob:
+        def __init__(self, job_name):
+            self.config = SimpleNamespace(job_name=job_name)
+            self._trial_configs = []
+
+        def _init_trial_configs(self):
+            self._trial_configs = [
+                SimpleNamespace(trial_name="random-a"),
+                SimpleNamespace(trial_name="random-b"),
+            ]
+
+    names = ["task-a__batch0001", "task-a__batch0002"]
+    install_retry_trial_names(FakeJob, names, "retry-run-1-batch")
+
+    retry_job = FakeJob("retry-run-1-batch")
+    retry_job._init_trial_configs()
+    other_job = FakeJob("run-2")
+    other_job._init_trial_configs()
+
+    assert [item.trial_name for item in retry_job._trial_configs] == names
+    assert [item.trial_name for item in other_job._trial_configs] == [
+        "random-a", "random-b"
+    ]
+
+def test_pier_metric_display_guard_never_aborts_trials():
+    event = SimpleNamespace(
+        config=SimpleNamespace(task=SimpleNamespace(source="tasks"))
+    )
+
+    class EmptyMetricJob:
+        def __init__(self):
+            self._metrics = {"tasks": []}
+            self.called = False
+
+        def _update_metric_display(self, *_args):
+            self.called = True
+            raise IndexError("empty metric list")
+
+    install_safe_metric_display(EmptyMetricJob)
+    empty = EmptyMetricJob()
+    empty._update_metric_display(event, None, None)
+    assert empty.called is False
+
+    class BrokenMetricJob:
+        def __init__(self):
+            self._metrics = {"tasks": [object()]}
+
+        def _update_metric_display(self, *_args):
+            raise ValueError("presentation-only metric failure")
+
+    install_safe_metric_display(BrokenMetricJob)
+    BrokenMetricJob()._update_metric_display(event, None, None)
+
+def test_retry_batch_identities_isolate_runs_and_serialise_each_run(tmp_path: Path):
+    first_batch = "d" * 32
+    second_batch = "e" * 32
+    first_run = Run(job_name="run-000201-mini-swe-agent")
+    second_run = Run(job_name="run-000202-mini-swe-agent")
+    base_spec = {
+        "trial_id": "task__old",
+        "target_id": "task__old",
+        "task": "task",
+        "attempt": 1,
+        "task_config": {"path": "C:/tasks/task", "source": "tasks"},
+    }
+    first = runner._bind_retry_specs(first_run, [base_spec], first_batch)[0]
+    second = runner._bind_retry_specs(second_run, [base_spec], second_batch)[0]
+
+    assert first["retry_job_name"] != second["retry_job_name"]
+    assert first["runtime_trial_id"] != second["runtime_trial_id"]
+    own_dir = tmp_path / first["retry_job_name"]
+    other_prefix_dir = tmp_path / runner.retry_job_name(
+        f"{first_run.job_name}-other", second_batch
+    )
+    own_dir.mkdir()
+    other_prefix_dir.mkdir()
+    (tmp_path / f"{first['retry_job_name']}.supervisor.log").write_text(
+        "log", encoding="utf-8"
+    )
+    assert runner.retry_job_dirs(tmp_path, first_run.job_name) == [own_dir]
+    assert first["retry_job_name"] in runner.retry_job_names(
+        tmp_path, first_run.job_name
+    )
+    assert runner._reserve_retry_batch(201, first_batch) is True
+    assert runner._reserve_retry_batch(201, second_batch) is False
+    assert runner._reserve_retry_batch(202, second_batch) is True
+    try:
+        assert runner._retrying[201] == first_batch
+        assert runner._retrying[202] == second_batch
+    finally:
+        runner._release_retry_batch(201, first_batch)
+        runner._release_retry_batch(202, second_batch)
+
+def test_stale_retry_batch_cannot_overwrite_new_marker(tmp_path: Path):
+    target_id = "task__target"
+    old_batch = "1" * 32
+    new_batch = "2" * 32
+    base = {
+        "trial_id": target_id,
+        "target_id": target_id,
+        "task": "task",
+        "attempt": 1,
+        "task_config": {"path": "C:/tasks/task", "source": "tasks"},
+    }
+    old_spec = {
+        **base,
+        "retry_batch_id": old_batch,
+        "retry_job_name": runner.retry_job_name("run-1", old_batch),
+        "runtime_trial_id": "task__old-runtime",
+    }
+    new_spec = {
+        **base,
+        "retry_batch_id": new_batch,
+        "retry_job_name": runner.retry_job_name("run-1", new_batch),
+        "runtime_trial_id": "task__new-runtime",
+    }
+    marker = tmp_path / target_id
+    marker.mkdir()
+    (marker / "config.json").write_text(
+        json.dumps(runner._retry_marker_config(tmp_path, new_spec)),
+        encoding="utf-8",
+    )
+    initial_state = {"status": "queued", "batch_id": new_batch}
+    (marker / "retry-state.json").write_text(
+        json.dumps(initial_state), encoding="utf-8"
+    )
+
+    runner._set_retry_marker_state(tmp_path, [old_spec], "failed", "old batch")
+
+    assert json.loads((marker / "retry-state.json").read_text(encoding="utf-8")) == initial_state
+
+def test_stale_retry_finalizer_does_not_remove_new_batch_process():
+    run_id = 303
+    old_batch = "3" * 32
+    new_batch = "4" * 32
+    old_proc = object()
+    new_proc = object()
+    with runner._lock:
+        runner._retrying[run_id] = new_batch
+        runner._processes[run_id] = new_proc
+    try:
+        runner._release_retry_batch(run_id, old_batch, old_proc)
+        assert runner._retrying[run_id] == new_batch
+        assert runner._processes[run_id] is new_proc
+    finally:
+        with runner._lock:
+            runner._retrying.pop(run_id, None)
+            runner._processes.pop(run_id, None)
+
+def test_retry_config_uses_latest_runtime_settings_and_expands_duplicate_tasks(tmp_path: Path, monkeypatch):
+    job = "run-000123-mini-swe-agent"
+    job_dir = tmp_path / job
+    job_dir.mkdir()
+    original = {
+        "job_name": job,
+        "jobs_dir": str(tmp_path),
+        "n_attempts": 2,
+        "n_concurrent_trials": 17,
+        "retry": {"max_retries": 3, "include_exceptions": ["TransientAgentInfrastructureError"]},
+        "environment": {"type": "docker", "delete": True},
+        "verifier": {"disable": False},
+        "metrics": [],
+        "agents": [{
+            "name": "mini-swe-agent",
+            "model_name": "openai/gpt-5.6-sol",
+            "kwargs": {"config_file": "stale.yaml", "cost_limit": 9.5},
+            "env": {},
+        }],
+        "datasets": [{"path": str(runner.settings.tasks_dir)}],
+        "tasks": [],
+    }
+    (job_dir / "config.json").write_text(json.dumps(original), encoding="utf-8")
+    secret_dir = tmp_path / "secrets"
+    secret_dir.mkdir()
+    auth = secret_dir / "auth.json"
+    auth.write_text("{}", encoding="utf-8")
+    run = Run(
+        job_name=job, jobs_dir=str(tmp_path), status="completed",
+        agent="mini-swe-agent", model="gpt-5.6-sol", reasoning_effort="max",
+        tasks_json='["actionlint-action-pinning-lint"]',
+        agent_timeout_seconds=7200, verifier_timeout_seconds=2700,
+        infrastructure_max_retries=1, agent_max_steps=155,
+    )
+    monkeypatch.setattr(runner, "_declared_timeouts", lambda _tasks: (3600.0, 900.0))
+    task_config = {"path": str(runner.settings.tasks_dir / "actionlint-action-pinning-lint"), "source": "tasks"}
+    specs = runner._bind_retry_specs(run, [
+        {"trial_id": "old-a", "target_id": "task__old-a", "attempt": 1, "task": "actionlint-action-pinning-lint", "task_config": task_config},
+        {"trial_id": "old-b", "target_id": "task__old-b", "attempt": 2, "task": "actionlint-action-pinning-lint", "task_config": task_config},
+    ], "a" * 32)
+
+    path, env = runner._prepare_retry_config(
+        run, specs, SimpleNamespace(url="http://127.0.0.1:9887/v1", token="secret"),
+        secret_dir, auth, tmp_path, {"trial_budget_usd": 3.25},
+    )
+    retry = json.loads(path.read_text(encoding="utf-8"))
+
+    assert retry["job_name"] == runner.retry_job_name(job, "a" * 32)
+    assert retry["n_attempts"] == 1
+    assert retry["n_concurrent_trials"] == 17
+    assert retry["agent_timeout_multiplier"] == 2
+    assert retry["verifier_timeout_multiplier"] == 3
+    assert retry["retry"]["max_retries"] == 1
+    assert retry["retry"]["include_exceptions"] == ["TransientAgentInfrastructureError"]
+    assert retry["datasets"] == []
+    assert retry["tasks"] == [
+        {**task_config, "source": None},
+        {**task_config, "source": None},
+    ]
+    assert retry["agents"][0]["kwargs"]["cost_limit"] == 3.25
+    assert retry["agents"][0]["kwargs"]["config_file"].endswith("mini-limits.yaml")
+    assert "step_limit: 155" in (secret_dir / "mini-limits.yaml").read_text(encoding="utf-8")
+    assert env["OPENAI_API_KEY"] == "secret"
+    assert env["DEEPSWE_RETRY_JOB_NAME"] == retry["job_name"]
+    assert json.loads(env["DEEPSWE_RETRY_TRIAL_NAMES"]) == [
+        spec["runtime_trial_id"] for spec in specs
+    ]
+
+    run.infrastructure_max_retries = 0
+    path, _ = runner._prepare_retry_config(
+        run, specs, SimpleNamespace(url="http://127.0.0.1:9887/v1", token="secret"),
+        secret_dir, auth, tmp_path, {"trial_budget_usd": 0},
+    )
+    disabled = json.loads(path.read_text(encoding="utf-8"))
+    assert disabled["retry"]["max_retries"] == 0
+    assert disabled["retry"]["include_exceptions"] == []
+    assert "cost_limit" not in disabled["agents"][0]["kwargs"]
+
+def test_retry_merge_replaces_markers_and_rewrites_identity(tmp_path: Path):
+    task = "actionlint-action-pinning-lint"
+    job = "run-000124-mini-swe-agent"
+    batch_id = "b" * 32
+    original_dir = tmp_path / job
+    original_dir.mkdir()
+    (original_dir / "result.json").write_text(json.dumps({"id": "original-job-id"}), encoding="utf-8")
+    retry_dir = tmp_path / runner.retry_job_name(job, batch_id)
+    retry_dir.mkdir()
+    supervisor = tmp_path / f"{retry_dir.name}.supervisor.log"
+    supervisor.write_text("retry log", encoding="utf-8")
+    run = Run(
+        id=124, job_name=job, jobs_dir=str(tmp_path), status="completed",
+        agent="mini-swe-agent", model="gpt-5.6-sol", reasoning_effort="max",
+        tasks_json=json.dumps([task]), attempts_per_task=2,
+    )
+    specs = []
+    runtime_names = (
+        f"{task}__runtime-z",
+        f"{task}__runtime-a",
+    )
+    for index, (suffix, name) in enumerate(
+        zip(("olda001", "oldb002"), runtime_names), start=1
+    ):
+        source_id = f"{task}__{suffix}"
+        folder = retry_dir / name
+        folder.mkdir()
+        task_config = {"path": str(runner.settings.tasks_dir / task), "source": "tasks"}
+        trial_config = {"task": task_config, "trial_name": name, "trials_dir": str(retry_dir), "job_id": "retry-job-id"}
+        (folder / "config.json").write_text(json.dumps(trial_config), encoding="utf-8")
+        (folder / "result.json").write_text(json.dumps({
+            "trial_name": name,
+            "task_name": f"datacurve/{task}",
+            "trial_uri": folder.resolve().as_uri(),
+            "config": trial_config,
+            "agent_result": {"n_input_tokens": index * 10},
+            "verifier_result": {"rewards": {"reward": index - 1}},
+        }), encoding="utf-8")
+        spec = {
+            "trial_id": source_id, "target_id": source_id, "task": task,
+            "attempt": index, "task_config": task_config,
+            "retry_batch_id": batch_id,
+            "retry_job_name": retry_dir.name,
+            "runtime_trial_id": name,
+        }
+        marker = original_dir / source_id
+        marker.mkdir()
+        (marker / "config.json").write_text(
+            json.dumps(runner._retry_marker_config(original_dir, spec)), encoding="utf-8"
+        )
+        (marker / "retry-state.json").write_text(json.dumps({"status": "running"}), encoding="utf-8")
+        specs.append(spec)
+    (retry_dir / "job.log").write_text("pier retry", encoding="utf-8")
+
+    moved = runner._merge_retry_trials(run, retry_dir, specs, supervisor)
+
+    assert set(moved) == {spec["target_id"] for spec in specs} and not retry_dir.exists()
+    assert sorted(path.name for path in original_dir.iterdir() if "__" in path.name) == sorted(moved)
+    merged = [
+        json.loads((original_dir / spec["target_id"] / "result.json").read_text(encoding="utf-8"))
+        for spec in specs
+    ]
+    assert all("deepswe_retry_of" not in item for item in merged)
+    assert [item["deepswe_attempt"] for item in merged] == [1, 2]
+    assert all(item["deepswe_replaced"] is True for item in merged)
+    assert [item["trial_name"] for item in merged] == [
+        spec["target_id"] for spec in specs
+    ]
+    assert all(item["config"]["trials_dir"] == str(original_dir) for item in merged)
+    assert all(item["config"]["job_id"] == "original-job-id" for item in merged)
+    assert all(item["trial_uri"].startswith(original_dir.resolve().as_uri()) for item in merged)
+    assert [item["verifier_result"]["rewards"]["reward"] for item in merged] == [0, 1]
+    assert [item["deepswe_retry_resource_id"] for item in merged] == list(runtime_names)
+    assert list((original_dir / ".retry-logs").glob("*/retry.json"))
+
+def test_retry_results_keep_progress_size_and_replace_visible_usage_totals(tmp_path: Path):
+    init_db()
+    task = "actionlint-action-pinning-lint"
+    job = "run-000125-mini-swe-agent"
+    job_dir = tmp_path / job
+    job_dir.mkdir()
+    (job_dir / "result.json").write_text(json.dumps({
+        "stats": {"n_input_tokens": 10, "n_cache_tokens": 1, "n_output_tokens": 2, "cost_usd": 0.1}
+    }), encoding="utf-8")
+    folder = job_dir / "actionlint-action-pinning-lint__try001"
+    write_result(folder, {
+        "task_name": task,
+        "deepswe_attempt": 1,
+        "deepswe_replaced": True,
+        "started_at": "2026-07-13T01:00:00Z",
+        "finished_at": "2026-07-13T01:01:00Z",
+        "agent_result": {
+            "n_input_tokens": 200,
+            "n_cache_tokens": 20,
+            "n_output_tokens": 10,
+            "cost_usd": 1.0,
+        },
+        "verifier_result": {"rewards": {"reward": 1}},
+    })
+    run = Run(
+        id=125, job_name=job, jobs_dir=str(tmp_path), status="completed",
+        agent="mini-swe-agent", model="gpt-5.6-sol", reasoning_effort="max",
+        tasks_json=json.dumps([task]), attempts_per_task=1,
+    )
+
+    detail = results.run_detail(run, include_patches=False)
+    aggregate = results.aggregate_trial_results(run)
+
+    assert detail["progress"] == {"completed": 1, "total": 1, "passed": 1, "percent": 100}
+    assert [trial["attempt"] for trial in detail["trials"]] == [1]
+    assert detail["input_tokens"] == 200 and detail["reported_cost_usd"] == 1.0
+    assert results.run_trial_progress(run)["total"] == 1
+    assert aggregate["reward"] == 1 and aggregate["passed"] is True
+
+def test_retry_marker_keeps_identity_while_overlaying_live_stage(tmp_path: Path):
+    init_db()
+    task = "actionlint-action-pinning-lint"
+    job = "run-000127-mini-swe-agent"
+    batch_id = "c" * 32
+    retry_name = runner.retry_job_name(job, batch_id)
+    original_dir = tmp_path / job
+    original_dir.mkdir()
+    first = original_dir / f"{task}__first01"
+    write_result(first, {
+        "task_name": task,
+        "started_at": "2026-07-13T01:00:00Z",
+        "verifier_result": {"rewards": {"reward": 1}},
+    })
+    target_id = f"{task}__second2"
+    task_config = {"path": str(runner.settings.tasks_dir / task), "source": "tasks"}
+    spec = {
+        "trial_id": target_id, "target_id": target_id, "task": task,
+        "attempt": 2, "task_config": task_config,
+        "retry_batch_id": batch_id,
+        "retry_job_name": retry_name,
+        "runtime_trial_id": f"{task}__runtime-live",
+    }
+    marker = original_dir / target_id
+    marker.mkdir()
+    (marker / "config.json").write_text(
+        json.dumps(runner._retry_marker_config(original_dir, spec)), encoding="utf-8"
+    )
+    (marker / "retry-state.json").write_text(
+        json.dumps({"status": "preflight"}), encoding="utf-8"
+    )
+    live = tmp_path / retry_name / spec["runtime_trial_id"]
+    (live / "agent").mkdir(parents=True)
+    (live / "config.json").write_text(json.dumps({"task": task_config}), encoding="utf-8")
+    (live / "agent" / "mini-swe-agent.txt").write_text("working", encoding="utf-8")
+    run = Run(
+        id=127, job_name=job, jobs_dir=str(tmp_path), status="running",
+        agent="mini-swe-agent", model="gpt-5.6-sol", reasoning_effort="max",
+        tasks_json=json.dumps([task]), attempts_per_task=2,
+    )
+
+    detail = results.run_detail(run, include_patches=False)
+    retried = next(trial for trial in detail["trials"] if trial["id"] == target_id)
+
+    assert retried["attempt"] == 2
+    assert retried["status"] == "agent_running"
+    assert retried["retrying"] is True and retried["replaced"] is True
+    assert detail["progress"]["total"] == 2
+    assert results.trial_log(run, target_id) == "working"
+    live_detail = results.trial_detail(run, target_id)
+    assert live_detail["id"] == target_id
+    assert live_detail["status"] == "agent_running"
+    assert live_detail["resource_name"] == live.name
+
+def test_retry_submission_deletes_selected_result_and_creates_marker(tmp_path: Path, monkeypatch):
+    class NoopThread:
+        def __init__(self, *args, **kwargs): pass
+        def start(self): pass
+
+    init_db()
+    task = "actionlint-action-pinning-lint"
+    job = f"retry-submit-{uuid.uuid4().hex}"
+    original_dir = tmp_path / job
+    first_id = f"{task}__first01"
+    second_id = f"{task}__second2"
+    for index, trial_id in enumerate((first_id, second_id), start=1):
+        write_result(original_dir / trial_id, {
+            "task_name": task,
+            "started_at": f"2026-07-13T0{index}:00:00Z",
+            "agent_result": {"cost_usd": float(index)},
+            "verifier_result": {"rewards": {"reward": index - 1}},
+        })
+    with SessionLocal() as db:
+        run = Run(
+            status="completed", job_name=job, jobs_dir=str(tmp_path),
+            agent="mini-swe-agent", model="gpt-5.6-sol", reasoning_effort="max",
+            tasks_json=json.dumps([task]), attempts_per_task=2,
+        )
+        db.add(run); db.commit(); db.refresh(run); run_id = run.id
+    current_preferences = runner.get_preferences()
+    monkeypatch.setattr(runner, "get_preferences", lambda: {
+        **current_preferences,
+        "run_budget_usd": 100,
+        "docker_cleanup_after_run": False,
+    })
+    monkeypatch.setattr(runner.threading, "Thread", NoopThread)
+    response = None
+    try:
+        response = runner.retry_trials(run_id, [first_id])
+
+        assert response["retry_count"] == 1
+        assert not (original_dir / first_id / "result.json").exists()
+        marker_config = json.loads((original_dir / first_id / "config.json").read_text(encoding="utf-8"))
+        marker_state = json.loads((original_dir / first_id / "retry-state.json").read_text(encoding="utf-8"))
+        assert marker_config["deepswe_attempt"] == 1
+        assert marker_config["deepswe_retrying"] is True
+        assert marker_config["deepswe_retry_batch"] == response["batch_id"]
+        assert marker_config["deepswe_retry_job_name"] == response["retry_job_name"]
+        assert marker_config["deepswe_retry_resource_id"]
+        assert marker_state["status"] == "queued"
+        assert marker_state["batch_id"] == response["batch_id"]
+        assert (original_dir / second_id / "result.json").exists()
+        metadata = json.loads(
+            (tmp_path / response["retry_job_name"] / ".deepswe-retry.json").read_text(encoding="utf-8")
+        )
+        assert metadata["specs"][0]["target_id"] == first_id
+        assert metadata["run_id"] == run_id
+        assert metadata["batch_id"] == response["batch_id"]
+        assert metadata["retry_job_name"] == response["retry_job_name"]
+        with SessionLocal() as db:
+            saved = db.get(Run, run_id)
+            assert saved.status == "queued"
+            assert saved.cost_usd == 2.0
+    finally:
+        if response:
+            runner._release_retry_batch(run_id, response["batch_id"])
+        with SessionLocal() as db:
+            saved = db.get(Run, run_id)
+            if saved:
+                db.delete(saved)
+                db.commit()
+
+def test_retry_submissions_for_multiple_runs_keep_separate_batches(tmp_path: Path, monkeypatch):
+    class NoopThread:
+        def __init__(self, *args, **kwargs): pass
+        def start(self): pass
+
+    init_db()
+    task = "actionlint-action-pinning-lint"
+    created = []
+    for suffix in ("one", "two"):
+        job = f"multi-retry-{suffix}-{uuid.uuid4().hex}"
+        trial_id = f"{task}__{suffix}001"
+        write_result(tmp_path / job / trial_id, {
+            "task_name": task,
+            "agent_result": {"cost_usd": 1.0},
+            "verifier_result": {"rewards": {"reward": 0}},
+        })
+        with SessionLocal() as db:
+            run = Run(
+                status="completed", job_name=job, jobs_dir=str(tmp_path),
+                agent="mini-swe-agent", model="gpt-5.6-sol", reasoning_effort="max",
+                tasks_json=json.dumps([task]), attempts_per_task=1,
+            )
+            db.add(run); db.commit(); db.refresh(run)
+            created.append((run.id, job, trial_id))
+    current_preferences = runner.get_preferences()
+    monkeypatch.setattr(runner, "get_preferences", lambda: {
+        **current_preferences,
+        "run_budget_usd": 100,
+        "docker_cleanup_after_run": False,
+    })
+    monkeypatch.setattr(runner.threading, "Thread", NoopThread)
+    responses = []
+    try:
+        for run_id, _job, trial_id in created:
+            responses.append(runner.retry_trials(run_id, [trial_id]))
+
+        assert responses[0]["batch_id"] != responses[1]["batch_id"]
+        assert responses[0]["retry_job_name"] != responses[1]["retry_job_name"]
+        for response, (run_id, job, _trial_id) in zip(responses, created):
+            retry_dir = tmp_path / response["retry_job_name"]
+            assert runner.retry_job_dirs(tmp_path, job) == [retry_dir]
+            metadata = json.loads(
+                (retry_dir / ".deepswe-retry.json").read_text(encoding="utf-8")
+            )
+            assert metadata["run_id"] == run_id
+            assert metadata["batch_id"] == response["batch_id"]
+    finally:
+        for response, (run_id, _job, _trial_id) in zip(responses, created):
+            runner._release_retry_batch(run_id, response["batch_id"])
+        with SessionLocal() as db:
+            for run_id, _job, _trial_id in created:
+                saved = db.get(Run, run_id)
+                if saved:
+                    db.delete(saved)
+            db.commit()
+
+def test_retry_budget_rejection_happens_before_selected_result_is_deleted(tmp_path: Path, monkeypatch):
+    class NoopThread:
+        def __init__(self, *args, **kwargs): pass
+        def start(self): pass
+
+    init_db()
+    task = "actionlint-action-pinning-lint"
+    job = f"retry-budget-{uuid.uuid4().hex}"
+    original_dir = tmp_path / job
+    selected_id = f"{task}__selected"
+    retained_id = f"{task}__retained"
+    for trial_id, cost in ((selected_id, 1.0), (retained_id, 3.0)):
+        write_result(original_dir / trial_id, {
+            "task_name": task,
+            "agent_result": {"cost_usd": cost},
+            "verifier_result": {"rewards": {"reward": 0}},
+        })
+    with SessionLocal() as db:
+        run = Run(
+            status="completed", job_name=job, jobs_dir=str(tmp_path),
+            agent="mini-swe-agent", model="gpt-5.6-sol", reasoning_effort="max",
+            tasks_json=json.dumps([task]), attempts_per_task=2,
+        )
+        db.add(run); db.commit(); db.refresh(run); run_id = run.id
+    current_preferences = runner.get_preferences()
+    monkeypatch.setattr(runner, "get_preferences", lambda: {
+        **current_preferences, "run_budget_usd": 3.0,
+    })
+    monkeypatch.setattr(runner.threading, "Thread", NoopThread)
+    try:
+        try:
+            runner.retry_trials(run_id, [selected_id])
+            assert False, "retained cost at the Run limit must reject retry"
+        except RuntimeError as exc:
+            assert "保留 Trial" in str(exc)
+        assert (original_dir / selected_id / "result.json").exists()
+        assert runner.retry_job_dirs(tmp_path, job) == []
+    finally:
+        with SessionLocal() as db:
+            saved = db.get(Run, run_id)
+            if saved:
+                db.delete(saved)
+                db.commit()
+
+def test_retry_supersedes_only_its_source_execution_error(tmp_path: Path):
+    task = "actionlint-action-pinning-lint"
+    job = "run-000126-mini-swe-agent"
+    job_dir = tmp_path / job
+    job_dir.mkdir()
+    payloads = {
+        "old-error": {"exception_info": {"exception_type": "AgentTimeoutError"}},
+        "other-error": {"exception_info": {"exception_type": "RuntimeError"}},
+        "retry-success": {
+            "deepswe_retry_of": f"{task}__old-error",
+            "verifier_result": {"rewards": {"reward": 1}},
+        },
+    }
+    for name, extra in payloads.items():
+        write_result(job_dir / f"{task}__{name}", {"task_name": task, **extra})
+    run = Run(
+        id=126, job_name=job, jobs_dir=str(tmp_path), status="completed",
+        agent="mini-swe-agent", model="gpt-5.6-sol", reasoning_effort="max",
+        tasks_json=json.dumps([task]), attempts_per_task=2,
+    )
+
+    aggregate = results.aggregate_trial_results(run)
+
+    assert aggregate["errored"] == 2
+    assert aggregate["effective_errored"] == 1
+    assert aggregate["missing_configured"] == 0

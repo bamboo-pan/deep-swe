@@ -13,6 +13,10 @@ class AppSettings(BaseSettings):
     default_model: str = "gpt-5.6-sol"
     default_effort: str = "high"
     default_concurrency: int = 2
+    agent_timeout_seconds: int = 5400
+    verifier_timeout_seconds: int = 1800
+    infrastructure_max_retries: int = 4
+    agent_max_steps: int = 120
     docker_cleanup_after_run: bool = True
     docker_cleanup_on_delete: bool = True
     docker_cache_retention_hours: int = 168

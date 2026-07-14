@@ -2,6 +2,7 @@ import asyncio
 import csv
 import io
 import json
+import os
 import shutil
 import time
 import tomllib
@@ -32,20 +33,23 @@ from .results import (
     compare_runs, deleted_trial_entries, jobs_root_for, list_details, parse_timestamp,
     run_detail as parsed_run_detail, task_catalog, trial_detail, trial_folder, trial_log,
 )
-from .runner import cancel_run, create_run, get_run, list_runs, reap_orphaned_runs, run_log, shutdown_processes
+from .runner import (
+    cancel_run, create_run, get_run, list_runs, reap_orphaned_runs,
+    retry_job_names, retry_trials, run_log, shutdown_processes,
+)
 from .schemas import (
     MAX_CONCURRENCY_PER_RUN, BaselineDraft, CompareAnalysisRequest, CompareRequest,
-    DockerCleanupRequest, RestorePayload, RunDraft, SettingsUpdate, concurrency_advice,
-    total_parallel_tasks,
+    DockerCleanupRequest, RestorePayload, RetryTrialsDraft, RunDraft, SettingsUpdate,
+    concurrency_advice, total_parallel_tasks,
 )
 from .security import is_safe_job_name, read_credential
-
-DEFAULT_TASKS = ["dasel-html-document-format", "igel-persist-feature-schema", "csstree-shorthand-expansion-compression", "happy-dom-deterministic-intersectionobserver", "superjson-error-stack-serialization", "dateutil-rfc5545-timezone-interop", "actionlint-action-pinning-lint"]
+from .task_suite import DEFAULT_TASKS, DEFAULT_TASK_SUITE_NAME
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    reap_orphaned_runs()
+    if os.environ.get("DEEPSWE_SKIP_STARTUP_REAP") != "1":
+        reap_orphaned_runs()
     yield
     shutdown_processes()
 
@@ -151,7 +155,7 @@ def bootstrap():
             "jobs_dirs": job_options,
             "concurrency": list(range(1, MAX_CONCURRENCY_PER_RUN + 1)),
         },
-        "task_suite": {"name": "regression-standard-7", "tasks": task_choices},
+        "task_suite": {"name": DEFAULT_TASK_SUITE_NAME, "tasks": task_choices},
     }
 
 @app.get("/api/diagnostics")
@@ -209,6 +213,23 @@ def get_trial_log(run_id:int, trial_id:str):
 
 @app.post("/api/runs/{run_id}/cancel")
 def cancel(run_id:int): return {"cancelled":cancel_run(run_id)}
+
+@app.post("/api/runs/{run_id}/trials/retry", status_code=202)
+def retry_run_trials(run_id: int, draft: RetryTrialsDraft):
+    with SessionLocal() as db:
+        run = db.get(Run, run_id)
+        if not run:
+            raise HTTPException(404, "run not found")
+        if run.status not in TERMINAL_STATES:
+            raise HTTPException(409, "Run 正在执行，不能同时提交 Trial 重试")
+    try:
+        return retry_trials(run_id, draft.trial_ids)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 @app.delete("/api/runs/{run_id}/trials/{trial_id}")
 def delete_trial(run_id: int, trial_id: str):
@@ -283,13 +304,24 @@ def delete_run(run_id:int):
             raise HTTPException(409,"运行中任务请先取消，再删除")
         job_name=run.job_name
         jobs_root=jobs_root_for(run)
+    retry_names = retry_job_names(jobs_root, job_name)
     # Docker 定向清理必须先于 artifacts 删除，否则失去 Trial 资源标识
     docker_report=None
     if get_preferences().get("docker_cleanup_on_delete", True):
-        try:
-            docker_report=cleanup_job_resources(job_name, jobs_root, DockerCleanupPolicy(), trigger="delete-run")
-        except Exception as exc:
-            docker_report={"available": False, "errors": [str(exc)]}
+        docker_report={"removed_images": [], "skipped_images": [], "errors": []}
+        for cleanup_name in (job_name, *retry_names):
+            try:
+                report=cleanup_job_resources(
+                    cleanup_name,
+                    jobs_root,
+                    DockerCleanupPolicy(),
+                    trigger="delete-run",
+                )
+                docker_report["removed_images"].extend(report.get("removed_images", []))
+                docker_report["skipped_images"].extend(report.get("skipped_images", []))
+                docker_report["errors"].extend(report.get("errors", []))
+            except Exception as exc:
+                docker_report["errors"].append(str(exc))
     with SessionLocal() as db:
         run=db.get(Run,run_id)
         if run:
@@ -300,6 +332,12 @@ def delete_run(run_id:int):
         shutil.rmtree(target, ignore_errors=True)
         (jobs_root/f"{job_name}.supervisor.log").unlink(missing_ok=True)
         (jobs_root/f"{job_name}.docker-cleanup.json").unlink(missing_ok=True)
+    for retry_name in retry_names:
+        retry_target = _safe_job_dir(jobs_root, retry_name)
+        if retry_target:
+            shutil.rmtree(retry_target, ignore_errors=True)
+        (jobs_root/f"{retry_name}.supervisor.log").unlink(missing_ok=True)
+        (jobs_root/f"{retry_name}.docker-cleanup.json").unlink(missing_ok=True)
     response={"deleted":True,"id":run_id}
     if docker_report is not None:
         response["docker_cleanup"]={

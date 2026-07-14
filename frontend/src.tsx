@@ -15,6 +15,7 @@ import {
   Gauge,
   Play,
   RefreshCw,
+  RotateCcw,
   Save,
   Settings as SettingsIcon,
   ShieldCheck,
@@ -93,6 +94,9 @@ type Trial = {
   failure_type?: string;
   failure_message?: string;
   failure_summary?: string;
+  retry_of?: string | null;
+  retrying?: boolean;
+  replaced?: boolean;
 };
 type Run = {
   id: number;
@@ -155,6 +159,10 @@ type Prefs = {
   default_model: string;
   default_effort: string;
   default_concurrency: number;
+  agent_timeout_seconds: number;
+  verifier_timeout_seconds: number;
+  infrastructure_max_retries: number;
+  agent_max_steps: number;
   docker_cleanup_after_run: boolean;
   docker_cleanup_on_delete: boolean;
   docker_cache_retention_hours: number;
@@ -247,6 +255,19 @@ const percent = (value: number | null | undefined) =>
 const score = (value: number | null | undefined) =>
   value == null ? "—" : Number.isInteger(value) ? String(value) : value.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
 const statusLabel = (value: string) => value.replaceAll("_", " ").toUpperCase();
+const failureTypeLabels: Record<string, string> = {
+  AgentLimitExceeded: "执行步数已用完",
+  CostLimitExceeded: "费用额度已用完",
+  InfrastructureNetworkError: "基础设施网络错误",
+  ResultMissing: "结果缺失",
+  RunCancelled: "运行已取消",
+  RunFailed: "运行失败",
+  RunInterrupted: "运行被中断",
+  UsageGuardTerminated: "用量护栏已终止",
+  VerificationFailed: "验证未通过",
+};
+const failureTypeLabel = (value: string | undefined) =>
+  value ? failureTypeLabels[value] || value : undefined;
 const duration = (seconds: number | null | undefined) =>
   seconds == null
     ? "—"
@@ -340,6 +361,7 @@ function App() {
     () => localStorage.getItem("deepswe-navigation-collapsed") === "true",
   );
   const [selectedRun, setSelectedRun] = useState<number | null>(null);
+  const [runStreamVersion, setRunStreamVersion] = useState(0);
   const [detail, setDetail] = useState<Run | null>(null);
   const [trialLog, setTrialLog] = useState("");
   const [activeTrial, setActiveTrial] = useState<Trial | null>(null);
@@ -359,14 +381,9 @@ function App() {
   // 自由数字输入以字符串保存，允许中途清空；提交时统一解析校验
   const [attempts, setAttempts] = useState("1");
   const [selectedTasks, setSelectedTasks] = useState<string[]>([]);
-  const [agentTimeout, setAgentTimeout] = useState("5400");
-  const [verifierTimeout, setVerifierTimeout] = useState("1800");
-  const [infrastructureMaxRetries, setInfrastructureMaxRetries] = useState("4");
-  const [agentMaxSteps, setAgentMaxSteps] = useState("120");
   const [codexRequestMaxRetries, setCodexRequestMaxRetries] = useState("6");
   const [codexStreamMaxRetries, setCodexStreamMaxRetries] = useState("6");
   const [codexStreamIdleTimeout, setCodexStreamIdleTimeout] = useState("600");
-  const [retry, setRetry] = useState(true);
   const [verification, setVerification] = useState(true);
   const [tier, setTier] = useState("standard");
   const refreshRuns = () =>
@@ -460,7 +477,7 @@ function App() {
       clearTimeout(retryTimer);
       source?.close();
     };
-  }, [selectedRun, tab]);
+  }, [selectedRun, tab, runStreamVersion]);
   useEffect(() => {
     if (tab === "compare") refreshCompareRuns();
     if (tab === "tasks" && !tasks.length)
@@ -502,31 +519,11 @@ function App() {
   const start = async () => {
     if (starting) return;
     if (!selectedTasks.length) return setNotice("至少选择一个任务");
-    const agentTimeoutNum = parseInt(agentTimeout, 10);
-    const verifierTimeoutNum = parseInt(verifierTimeout, 10);
-    const infrastructureMaxRetriesNum = parseInt(infrastructureMaxRetries, 10);
-    const agentMaxStepsNum = parseInt(agentMaxSteps, 10);
     const codexRequestMaxRetriesNum = parseInt(codexRequestMaxRetries, 10);
     const codexStreamMaxRetriesNum = parseInt(codexStreamMaxRetries, 10);
     const codexStreamIdleTimeoutNum = parseInt(codexStreamIdleTimeout, 10);
     if (!Number.isFinite(attemptsNum) || attemptsNum < 1 || attemptsNum > 10)
       return setNotice("每题次数需为 1-10 的整数");
-    if (
-      !Number.isFinite(agentTimeoutNum) ||
-      agentTimeoutNum < 60 ||
-      agentTimeoutNum > 21600
-    )
-      return setNotice("Agent 超时需为 60-21600 秒");
-    if (
-      !Number.isFinite(verifierTimeoutNum) ||
-      verifierTimeoutNum < 60 ||
-      verifierTimeoutNum > 7200
-    )
-      return setNotice("Verifier 超时需为 60-7200 秒");
-    if (!Number.isFinite(infrastructureMaxRetriesNum) || infrastructureMaxRetriesNum < 0 || infrastructureMaxRetriesNum > 6)
-      return setNotice("基础设施重试次数需为 0-6 的整数");
-    if (!Number.isFinite(agentMaxStepsNum) || agentMaxStepsNum < 10 || agentMaxStepsNum > 500)
-      return setNotice("最大步数需为 10-500 的整数");
     if (!Number.isFinite(codexRequestMaxRetriesNum) || codexRequestMaxRetriesNum < 0 || codexRequestMaxRetriesNum > 10)
       return setNotice("Codex HTTP 重试次数需为 0-10 的整数");
     if (!Number.isFinite(codexStreamMaxRetriesNum) || codexStreamMaxRetriesNum < 0 || codexStreamMaxRetriesNum > 10)
@@ -563,11 +560,6 @@ function App() {
             concurrency,
             parallel_agent_count: agents.length,
             confirm_high_concurrency: parallelTasks >= 19,
-            agent_timeout_seconds: agentTimeoutNum,
-            verifier_timeout_seconds: verifierTimeoutNum,
-            retry_infrastructure_errors: retry,
-            infrastructure_max_retries: infrastructureMaxRetriesNum,
-            agent_max_steps: agentMaxStepsNum,
             codex_request_max_retries: codexRequestMaxRetriesNum,
             codex_stream_max_retries: codexStreamMaxRetriesNum,
             codex_stream_idle_timeout_seconds: codexStreamIdleTimeoutNum,
@@ -661,6 +653,14 @@ function App() {
   };
   const savePrefs = async () => {
     if (!prefs) return;
+    if (!Number.isInteger(prefs.agent_timeout_seconds) || prefs.agent_timeout_seconds < 60 || prefs.agent_timeout_seconds > 21600)
+      return setNotice("Agent 超时需为 60-21600 秒");
+    if (!Number.isInteger(prefs.verifier_timeout_seconds) || prefs.verifier_timeout_seconds < 60 || prefs.verifier_timeout_seconds > 7200)
+      return setNotice("Verifier 超时需为 60-7200 秒");
+    if (!Number.isInteger(prefs.infrastructure_max_retries) || prefs.infrastructure_max_retries < 0 || prefs.infrastructure_max_retries > 6)
+      return setNotice("基础设施重试次数需为 0-6 的整数");
+    if (!Number.isInteger(prefs.agent_max_steps) || prefs.agent_max_steps < 10 || prefs.agent_max_steps > 500)
+      return setNotice("最大步数需为 10-500 的整数");
     const saved = await request<Prefs>("/api/settings", {
       method: "PUT",
       headers: { "content-type": "application/json" },
@@ -800,6 +800,42 @@ function App() {
         : `已删除 ${trialIds.length} 条 Trial 记录${removedImages ? `，清理 ${removedImages} 个 Trial 镜像` : ""}`,
     );
     return failedIds;
+  };
+  const retryTrials = async (trialIds: string[]) => {
+    if (!detail || !trialIds.length) return false;
+    const runId = detail.id;
+    if (
+      !confirm(
+        `重试选中的 ${trialIds.length} 条 Trial？\n旧结果会删除并在原 Trial 位置替换；任务、Agent 和模型沿用原 Run，运行时限制使用当前 Settings。`,
+      )
+    )
+      return false;
+    let result: { retry_count: number };
+    try {
+      result = await request<{ retry_count: number }>(
+        `/api/runs/${runId}/trials/retry`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ trial_ids: trialIds }),
+        },
+      );
+    } catch (error) {
+      setNotice(`Trial 重试提交失败：${String(error)}`);
+      return false;
+    }
+    setRunStreamVersion((version) => version + 1);
+    const [nextDetail, nextRuns] = await Promise.allSettled([
+      request<Run>(`/api/runs/${runId}`),
+      request<Run[]>("/api/runs"),
+    ]);
+    if (nextDetail.status === "fulfilled") setDetail(nextDetail.value);
+    if (nextRuns.status === "fulfilled") setRuns(nextRuns.value);
+    setActiveTrial(null);
+    setTrialLog("");
+    refreshCompareRuns();
+    setNotice(`已提交 ${result.retry_count} 条 Trial 重试，旧结果将原位替换`);
+    return true;
   };
   if (!boot)
     return <main className="loading">正在连接 DeepSWE Regression Lab…</main>;
@@ -992,44 +1028,6 @@ function App() {
                   总并行 {totalParallelTasks} · {parallelRisk.label}
                 </small>
               </label>
-              <label>
-                Agent 超时（秒）
-                <input
-                  type="number"
-                  min="60"
-                  value={agentTimeout}
-                  onChange={(e) => setAgentTimeout(e.target.value)}
-                />
-              </label>
-              <label>
-                Verifier 超时（秒）
-                <input
-                  type="number"
-                  min="60"
-                  value={verifierTimeout}
-                  onChange={(e) => setVerifierTimeout(e.target.value)}
-                />
-              </label>
-              <label>
-                基础设施重试次数
-                <input
-                  type="number"
-                  min="0"
-                  max="6"
-                  value={infrastructureMaxRetries}
-                  onChange={(e) => setInfrastructureMaxRetries(e.target.value)}
-                />
-              </label>
-              <label>
-                最大步数（全部 Agent）
-                <input
-                  type="number"
-                  min="10"
-                  max="500"
-                  value={agentMaxSteps}
-                  onChange={(e) => setAgentMaxSteps(e.target.value)}
-                />
-              </label>
               {(agent === "codex" || allAgents) && (
                 <>
                   <label>
@@ -1066,14 +1064,6 @@ function App() {
               )}
             </div>
             <div className="toggles">
-              <label>
-                <input
-                  type="checkbox"
-                  checked={retry}
-                  onChange={(e) => setRetry(e.target.checked)}
-                />
-                基础设施错误自动重试（仅限已识别的 429/5xx/连接中断/API 超时）
-              </label>
               <label>
                 <input
                   type="checkbox"
@@ -1180,6 +1170,7 @@ function App() {
             setSelected={setSelectedResults}
             remove={deleteResults}
             removeTrials={deleteTrials}
+            retryTrials={retryTrials}
           />
         )}
         {tab === "compare" && (
@@ -1365,6 +1356,7 @@ function Results({
   setSelected,
   remove,
   removeTrials,
+  retryTrials,
 }: {
   runs: Run[];
   detail: Run | null;
@@ -1376,6 +1368,7 @@ function Results({
   setSelected: (ids: number[]) => void;
   remove: () => void;
   removeTrials: (ids: string[]) => Promise<string[]>;
+  retryTrials: (ids: string[]) => Promise<boolean>;
 }) {
   const all = runs.length > 0 && selected.length === runs.length;
   const [runListCollapsed, setRunListCollapsed] = useState(
@@ -1383,6 +1376,7 @@ function Results({
   );
   const [selectedTrials, setSelectedTrials] = useState<string[]>([]);
   const [deletingTrials, setDeletingTrials] = useState(false);
+  const [submittingRetry, setSubmittingRetry] = useState(false);
   const [trialStatusFilter, setTrialStatusFilter] = useState("all");
   const trials = detail?.trials || [];
   const trialIds = trials.map((trial) => trial.id);
@@ -1414,6 +1408,15 @@ function Results({
       setSelectedTrials(await removeTrials(selectedTrials));
     } finally {
       setDeletingTrials(false);
+    }
+  };
+  const retrySelectedTrials = async () => {
+    if (!selectedTrials.length || submittingRetry) return;
+    setSubmittingRetry(true);
+    try {
+      if (await retryTrials(selectedTrials)) setSelectedTrials([]);
+    } finally {
+      setSubmittingRetry(false);
     }
   };
   return (
@@ -1559,8 +1562,17 @@ function Results({
                   </label>
                   <span>已选 {selectedTrials.length}</span>
                   <button
+                    className="secondary"
+                    disabled={!canManageTrials || !selectedTrials.length || submittingRetry || deletingTrials}
+                    onClick={retrySelectedTrials}
+                    title="沿用原 Run 的任务、Agent 和模型，使用最新 Settings 原位替换所选 Trial"
+                  >
+                    <RotateCcw />
+                    {submittingRetry ? "提交中…" : "重试"}
+                  </button>
+                  <button
                     className="danger"
-                    disabled={!canManageTrials || !selectedTrials.length || deletingTrials}
+                    disabled={!canManageTrials || !selectedTrials.length || deletingTrials || submittingRetry}
                     onClick={deleteSelectedTrials}
                     title="删除选中的 Trial 记录、日志和结果文件"
                   >
@@ -1613,9 +1625,9 @@ function Results({
                     <Status value={t.status} reward={t.reward} />
                     <span
                       className={`failurecell ${t.failure_type || t.failure_message ? "hasfailure" : ""}`}
-                      title={[t.failure_type, t.failure_message].filter(Boolean).join(": ")}
+                      title={[failureTypeLabel(t.failure_type), t.failure_message].filter(Boolean).join("：")}
                     >
-                      {t.failure_type && <b>{t.failure_type}</b>}
+                      {t.failure_type && <b>{failureTypeLabel(t.failure_type)}</b>}
                       <span>{t.failure_message || "—"}</span>
                     </span>
                     <span>{score(t.reward)}</span>
@@ -1668,7 +1680,7 @@ function TrialDetail({ trial, log }: { trial: Trial; log: string }) {
         <div className="trialfailure">
           <h3>失败原因</h3>
           <pre className="failure">
-            {[trial.failure_type, trial.failure_message].filter(Boolean).join(": ")}
+            {[failureTypeLabel(trial.failure_type), trial.failure_message].filter(Boolean).join("：")}
           </pre>
         </div>
       )}
@@ -2357,6 +2369,58 @@ function Settings({
               value={prefs.default_concurrency}
               onChange={(e) =>
                 setPrefs({ ...prefs, default_concurrency: +e.target.value })
+              }
+            />
+          </label>
+          <label>
+            Agent 超时（秒）
+            <input
+              type="number"
+              min={60}
+              max={21600}
+              step={1}
+              value={prefs.agent_timeout_seconds}
+              onChange={(e) =>
+                setPrefs({ ...prefs, agent_timeout_seconds: +e.target.value })
+              }
+            />
+          </label>
+          <label>
+            Verifier 超时（秒）
+            <input
+              type="number"
+              min={60}
+              max={7200}
+              step={1}
+              value={prefs.verifier_timeout_seconds}
+              onChange={(e) =>
+                setPrefs({ ...prefs, verifier_timeout_seconds: +e.target.value })
+              }
+            />
+          </label>
+          <label>
+            基础设施重试次数（0 禁用）
+            <input
+              type="number"
+              min={0}
+              max={6}
+              step={1}
+              value={prefs.infrastructure_max_retries}
+              onChange={(e) =>
+                setPrefs({ ...prefs, infrastructure_max_retries: +e.target.value })
+              }
+            />
+          </label>
+          <label>
+            最大步数（全部 Agent）
+            <input
+              type="number"
+              min={10}
+              max={500}
+              step={1}
+              value={prefs.agent_max_steps}
+              onChange={(e) =>
+                setPrefs({ ...prefs, agent_max_steps: +e.target.value })
               }
             />
           </label>

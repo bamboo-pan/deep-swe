@@ -6,8 +6,10 @@ import signal
 import subprocess
 import tempfile
 import threading
+import time
 import tomllib
 import uuid
+from collections import defaultdict, deque
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -15,15 +17,23 @@ import psutil
 from sqlalchemy import select
 from .config import settings
 from .database import SessionLocal
-from .docker_cleanup import DockerCleanupPolicy, cleanup_job_resources, docker_available
+from .docker_cleanup import (
+    DockerCleanupPolicy, cleanup_job_resources, docker_available,
+    sanitize_compose_project_name,
+)
 from .models import ACTIVE_STATES, TERMINAL_STATES, Run
 from .preferences import credential_path, current_secrets, get_preferences, jobs_path
 from .pier_retry_patch.networking import trial_network_subnets
-from .results import _json as read_json, estimate_cost, jobs_root_for, run_code, run_task_progress, run_trial_progress
+from .results import (
+    _json as read_json, aggregate_trial_results, estimate_cost, jobs_root_for,
+    pier_trial_prefix, run_code, run_detail as parsed_run_detail,
+    run_task_progress, run_trial_progress, trial_folder,
+)
 from .schemas import RunDraft, concurrency_advice, total_parallel_tasks
 from .security import read_credential, redact
 
 _processes: dict[int, subprocess.Popen] = {}
+_retrying: dict[int, str] = {}
 _lock = threading.Lock()
 # 取消与结果落库都要做「读状态→写状态」，用同一把锁避免最后写者赢
 _state_lock = threading.Lock()
@@ -43,6 +53,7 @@ RUNAWAY_SUBAGENT_FILES = 60     # 禁用 Task/Agent 工具后应恒为 0；事�
 INFRASTRUCTURE_RETRY_DELAYS_SEC = (5, 30, 120, 300, 600, 900)
 DOCKER_CONNECTIVITY_IMAGE = "alpine:3.20"
 DOCKER_CONNECTIVITY_TIMEOUT_SEC = 8
+ATOMIC_REPLACE_RETRY_DELAYS_SEC = (0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.8, 1.0)
 
 def _pier_retry_args(enabled: bool, max_retries: int) -> list[str]:
     """Retry trial-level infrastructure failures without retrying verifier/result errors."""
@@ -218,6 +229,8 @@ def create_run(draft: RunDraft) -> Run:
         raise ValueError(advice["message"])
     if advice["requires_confirmation"] and not draft.confirm_high_concurrency:
         raise ValueError(f"总并行 Trial 数 {parallel_tasks} 需要高负载确认")
+    preferences = get_preferences()
+    infrastructure_max_retries = int(preferences["infrastructure_max_retries"])
     with SessionLocal() as db:
         mapping = _reasoning_effort_adapter(draft.agent, draft.reasoning_effort)
         run = Run(
@@ -225,11 +238,12 @@ def create_run(draft: RunDraft) -> Run:
             reasoning_effort=draft.reasoning_effort, reasoning_effort_adapter=mapping,
             reasoning_effort_effective=None,  # 有效值只能来自运行后的观测，创建时未知
             tasks_json=json.dumps(draft.tasks), attempts_per_task=draft.attempts_per_task,
-            concurrency=draft.concurrency, agent_timeout_seconds=draft.agent_timeout_seconds,
-            verifier_timeout_seconds=draft.verifier_timeout_seconds,
-            retry_infrastructure_errors=draft.retry_infrastructure_errors,
-            infrastructure_max_retries=draft.infrastructure_max_retries,
-            agent_max_steps=draft.agent_max_steps,
+            concurrency=draft.concurrency,
+            agent_timeout_seconds=int(preferences["agent_timeout_seconds"]),
+            verifier_timeout_seconds=int(preferences["verifier_timeout_seconds"]),
+            retry_infrastructure_errors=infrastructure_max_retries > 0,
+            infrastructure_max_retries=infrastructure_max_retries,
+            agent_max_steps=int(preferences["agent_max_steps"]),
             codex_request_max_retries=draft.codex_request_max_retries,
             codex_stream_max_retries=draft.codex_stream_max_retries,
             codex_stream_idle_timeout_seconds=draft.codex_stream_idle_timeout_seconds,
@@ -454,7 +468,7 @@ def _terminate_trial(trial: Path, reason: str) -> bool:
     return True
 
 def _wait_with_guard(proc: subprocess.Popen, job_dir: Path, service_tier: str,
-                     agent: str, max_steps: int) -> str | None:
+                     agent: str, max_steps: int, base_cost_usd: float = 0.0) -> str | None:
     """等待 pier 结束，期间周期核查用量。单 Trial 超限只掐该 Trial 的容器，
     其余任务继续；Run 级累计超限或失控体征才终止整个进程树。"""
     prefs = get_preferences()
@@ -490,7 +504,7 @@ def _wait_with_guard(proc: subprocess.Popen, job_dir: Path, service_tier: str,
                     terminated.add(trial.name)
         reason = _runaway_reason(job_dir)
         if not reason and run_budget > 0:
-            spent = _completed_trials_cost(job_dir, service_tier) + inflight_cost
+            spent = base_cost_usd + _completed_trials_cost(job_dir, service_tier) + inflight_cost
             if spent >= run_budget:
                 reason = f"累计费用 ${spent:.2f}（含进行中 Trial）达到 Run 预算上限 ${run_budget:.2f}"
         if reason:
@@ -500,6 +514,19 @@ def _wait_with_guard(proc: subprocess.Popen, job_dir: Path, service_tier: str,
             except subprocess.TimeoutExpired:
                 pass
             return f"用量护栏自动终止：{reason}"
+
+def _pier_process_env() -> dict[str, str]:
+    process_env = os.environ.copy()
+    # Windows 的默认 locale 可能无法读取 UTF-8 trajectory 或输出 Unicode 状态字符。
+    process_env["PYTHONUTF8"] = "1"
+    retry_patch_dir = Path(__file__).with_name("pier_retry_patch")
+    process_env["PYTHONPATH"] = os.pathsep.join(
+        [str(retry_patch_dir), process_env.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+    process_env["DEEPSWE_PIER_RETRY_DELAYS"] = ",".join(
+        str(delay) for delay in INFRASTRUCTURE_RETRY_DELAYS_SEC
+    )
+    return process_env
 
 def _execute(run_id: int):
     secret_dir = None
@@ -523,19 +550,7 @@ def _execute(run_id: int):
         if not run.verification:
             args.append("--disable-verification")
         for task in tasks: args += ["-i", task]
-        process_env = os.environ.copy()
-        # pier 未显式指定编码：GBK locale 下读 UTF-8 trajectory.json（trial.py read_text）
-        # 与 rich 向控制台打印 '•' 都会 UnicodeError 崩溃，强制子进程走 UTF-8 模式
-        process_env["PYTHONUTF8"] = "1"
-        # pier exposes retry counts on its CLI, but not its backoff settings.
-        # A process-local sitecustomize keeps the installed package untouched.
-        retry_patch_dir = Path(__file__).with_name("pier_retry_patch")
-        process_env["PYTHONPATH"] = os.pathsep.join(
-            [str(retry_patch_dir), process_env.get("PYTHONPATH", "")]
-        ).rstrip(os.pathsep)
-        process_env["DEEPSWE_PIER_RETRY_DELAYS"] = ",".join(
-            str(delay) for delay in INFRASTRUCTURE_RETRY_DELAYS_SEC
-        )
+        process_env = _pier_process_env()
         try:
             trial_budget = float(get_preferences().get("trial_budget_usd") or 0)
         except (TypeError, ValueError):
@@ -601,6 +616,939 @@ def _execute(run_id: int):
         with _lock: _processes.pop(run_id, None)
         if secret_dir: shutil.rmtree(secret_dir, ignore_errors=True)
         _cleanup_after_run(run_id, job_name, jobs_root)
+
+def _valid_retry_batch_id(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value) is not None
+
+def retry_job_name(job_name: str, batch_id: str | None = None) -> str:
+    base = f"retry-{job_name}"
+    if batch_id is None:
+        return base
+    if not _valid_retry_batch_id(batch_id):
+        raise ValueError("Invalid retry batch id")
+    return f"{base}-{batch_id[:12]}"
+
+def _matches_retry_job_name(job_name: str, value: str) -> bool:
+    base = retry_job_name(job_name)
+    return value == base or re.fullmatch(
+        rf"{re.escape(base)}-[0-9a-f]{{12}}", value
+    ) is not None
+
+def retry_job_names(jobs_root: Path, job_name: str) -> list[str]:
+    names = {retry_job_name(job_name)}
+    try:
+        entries = list(jobs_root.resolve().iterdir())
+    except OSError:
+        return sorted(names)
+    for path in entries:
+        candidate = path.name
+        for suffix in (".supervisor.log", ".docker-cleanup.json"):
+            if candidate.endswith(suffix):
+                candidate = candidate.removesuffix(suffix)
+                break
+        if _matches_retry_job_name(job_name, candidate):
+            names.add(candidate)
+    return sorted(names)
+
+def retry_job_dirs(jobs_root: Path, job_name: str) -> list[Path]:
+    root = jobs_root.resolve()
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return []
+    return sorted(
+        (
+            path
+            for path in entries
+            if path.is_dir()
+            and path.resolve().parent == root
+            and _matches_retry_job_name(job_name, path.name)
+        ),
+        key=lambda path: path.name,
+    )
+
+def _retry_dir(jobs_root: Path, job_name: str, batch_id: str | None = None) -> Path:
+    root = jobs_root.resolve()
+    target = (jobs_root / retry_job_name(job_name, batch_id)).resolve()
+    if target.parent != root:
+        raise RuntimeError("重试工作目录不在 Jobs 根目录内")
+    return target
+
+def _retry_runtime_trial_id(task: str, batch_id: str, index: int) -> str:
+    if not _valid_retry_batch_id(batch_id) or index < 1:
+        raise ValueError("Invalid retry runtime identity")
+    return f"{pier_trial_prefix(task)}__{batch_id[:12]}{index:03d}"
+
+def _reserve_retry_batch(run_id: int, batch_id: str) -> bool:
+    with _lock:
+        if run_id in _retrying or run_id in _processes:
+            return False
+        _retrying[run_id] = batch_id
+        return True
+
+def _register_retry_process(
+    run_id: int,
+    batch_id: str,
+    proc: subprocess.Popen,
+) -> bool:
+    with _lock:
+        if _retrying.get(run_id) != batch_id:
+            return False
+        current = _processes.get(run_id)
+        if current is not None and current is not proc:
+            return False
+        _processes[run_id] = proc
+        return True
+
+def _release_retry_batch(
+    run_id: int,
+    batch_id: str,
+    proc: subprocess.Popen | None = None,
+) -> None:
+    with _lock:
+        if _retrying.get(run_id) != batch_id:
+            return
+        current = _processes.get(run_id)
+        if proc is None or current is proc:
+            _processes.pop(run_id, None)
+        _retrying.pop(run_id, None)
+
+def _retry_specs(run: Run, trial_ids: list[str]) -> list[dict]:
+    unique_ids = list(dict.fromkeys(trial_ids))
+    if len(unique_ids) != len(trial_ids):
+        raise ValueError("重试列表中存在重复 Trial")
+    detail = parsed_run_detail(run, include_patches=False)
+    by_id = {trial["id"]: trial for trial in detail["trials"]}
+    missing = [trial_id for trial_id in unique_ids if trial_id not in by_id]
+    if missing:
+        raise ValueError(f"Trial 不存在：{missing[0]}")
+
+    specs = []
+    for trial_id in unique_ids:
+        trial = by_id[trial_id]
+        folder = trial_folder(run, trial_id)
+        config = read_json(folder / "config.json") if folder else {}
+        task_config = config.get("task")
+        if not isinstance(task_config, dict):
+            task_config = {
+                "path": str(settings.tasks_dir / trial["task"]),
+                "source": settings.tasks_dir.name,
+            }
+        target_id = trial_id if "__" in trial_id else ""
+        while not target_id:
+            candidate = f"{pier_trial_prefix(trial['task'])}__{uuid.uuid4().hex[:7]}"
+            if not (jobs_root_for(run) / run.job_name / candidate).exists():
+                target_id = candidate
+        specs.append({
+            "trial_id": trial_id,
+            "target_id": target_id,
+            "task": trial["task"],
+            "attempt": trial["attempt"],
+            "reported_cost_usd": trial.get("reported_cost_usd"),
+            "task_config": task_config,
+        })
+    return specs
+
+def _bind_retry_specs(
+    run: Run,
+    specs: list[dict],
+    batch_id: str,
+) -> list[dict]:
+    retry_name = retry_job_name(run.job_name, batch_id)
+    return [
+        {
+            **spec,
+            "retry_batch_id": batch_id,
+            "retry_job_name": retry_name,
+            "runtime_trial_id": _retry_runtime_trial_id(
+                spec["task"], batch_id, index
+            ),
+        }
+        for index, spec in enumerate(specs, start=1)
+    ]
+
+def _prepare_retry_config(
+    run: Run,
+    specs: list[dict],
+    credential,
+    secret_dir: Path,
+    auth_path: Path,
+    jobs_root: Path,
+    preferences: dict | None = None,
+) -> tuple[Path, dict[str, str]]:
+    original_path = jobs_root / run.job_name / "config.json"
+    config = read_json(original_path)
+    if not config:
+        raise RuntimeError("原 Run 缺少 Pier config.json，无法按原参数重试")
+    agents = config.get("agents")
+    if not isinstance(agents, list) or not agents:
+        raise RuntimeError("原 Run 的 Agent 配置无效")
+    retry_names = {spec.get("retry_job_name") for spec in specs}
+    runtime_trial_ids = [spec.get("runtime_trial_id") for spec in specs]
+    if (
+        len(retry_names) != 1
+        or not isinstance(next(iter(retry_names)), str)
+        or not all(_valid_retry_target_id(value) for value in runtime_trial_ids)
+        or len(set(runtime_trial_ids)) != len(runtime_trial_ids)
+    ):
+        raise RuntimeError("重试批次身份无效")
+    retry_name = next(iter(retry_names))
+
+    config["job_name"] = retry_name
+    config["jobs_dir"] = str(jobs_root)
+    config["n_attempts"] = 1
+    config["datasets"] = []
+    retry_tasks = []
+    for spec in specs:
+        task_config = dict(spec["task_config"])
+        # Explicit tasks are ad-hoc inputs. Keeping the dataset source here makes
+        # Pier create an empty metric bucket and its progress hook can abort peers.
+        task_config["source"] = None
+        retry_tasks.append(task_config)
+    config["tasks"] = retry_tasks
+    tasks = list(dict.fromkeys(spec["task"] for spec in specs))
+    agent_divisor, verifier_divisor = _declared_timeouts(tasks)
+    config["agent_timeout_multiplier"] = run.agent_timeout_seconds / agent_divisor
+    config["verifier_timeout_multiplier"] = run.verifier_timeout_seconds / verifier_divisor
+    retry_config = config.setdefault("retry", {})
+    retry_config["max_retries"] = run.infrastructure_max_retries
+    retry_config["include_exceptions"] = (
+        ["TransientAgentInfrastructureError"]
+        if run.infrastructure_max_retries > 0 else []
+    )
+    process_env = _pier_process_env()
+    process_env["DEEPSWE_RETRY_JOB_NAME"] = retry_name
+    process_env["DEEPSWE_RETRY_TRIAL_NAMES"] = json.dumps(runtime_trial_ids)
+    current_preferences = preferences or get_preferences()
+    try:
+        trial_budget = float(current_preferences.get("trial_budget_usd") or 0)
+    except (TypeError, ValueError):
+        trial_budget = 0.0
+
+    matching_agents = [agent for agent in agents if agent.get("name") == run.agent]
+    if not matching_agents:
+        raise RuntimeError(f"原 Run 中找不到 Agent 配置：{run.agent}")
+    for agent_config in matching_agents:
+        kwargs = agent_config.setdefault("kwargs", {})
+        agent_env = agent_config.setdefault("env", {})
+        if run.agent == "mini-swe-agent":
+            process_env.update({
+                "OPENAI_API_KEY": credential.token,
+                "OPENAI_BASE_URL": _docker_url(credential.url),
+            })
+            kwargs["config_file"] = str(
+                _mini_limits_config(secret_dir, run.agent_max_steps, run.reasoning_effort)
+            )
+            if trial_budget > 0:
+                kwargs["cost_limit"] = trial_budget
+            else:
+                kwargs.pop("cost_limit", None)
+        elif run.agent == "codex":
+            kwargs["config_toml_file"] = str(_codex_config(
+                credential.url,
+                secret_dir,
+                run.model,
+                run.reasoning_effort,
+                request_max_retries=run.codex_request_max_retries,
+                stream_max_retries=run.codex_stream_max_retries,
+                stream_idle_timeout_seconds=run.codex_stream_idle_timeout_seconds,
+            ))
+            agent_env["CODEX_AUTH_JSON_PATH"] = str(auth_path)
+            process_env["CODEX_AUTH_JSON_PATH"] = str(auth_path)
+        elif run.agent == "claude-code":
+            process_env.update({
+                "ANTHROPIC_API_KEY": credential.token,
+                "ANTHROPIC_BASE_URL": _anthropic_url(credential.url),
+            })
+            kwargs["max_turns"] = run.agent_max_steps
+            if trial_budget > 0:
+                kwargs["max_budget_usd"] = trial_budget
+            else:
+                kwargs.pop("max_budget_usd", None)
+        else:
+            raise RuntimeError(f"不支持的 Agent：{run.agent}")
+
+    path = secret_dir / "retry-job.json"
+    path.write_text(
+        json.dumps(config, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+        newline="\n",
+    )
+    return path, process_env
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+            newline="\n",
+        )
+        for attempt in range(len(ATOMIC_REPLACE_RETRY_DELAYS_SEC) + 1):
+            try:
+                temporary.replace(path)
+                return
+            except PermissionError:
+                if attempt == len(ATOMIC_REPLACE_RETRY_DELAYS_SEC):
+                    raise
+                time.sleep(ATOMIC_REPLACE_RETRY_DELAYS_SEC[attempt])
+    finally:
+        temporary.unlink(missing_ok=True)
+
+def _retry_marker_config(original_dir: Path, spec: dict) -> dict:
+    return {
+        "task": spec["task_config"],
+        "trial_name": spec["target_id"],
+        "trials_dir": str(original_dir),
+        "deepswe_retrying": True,
+        "deepswe_replaced": True,
+        "deepswe_attempt": spec["attempt"],
+        "deepswe_original_trial_id": spec["trial_id"],
+        "deepswe_retry_batch": spec.get("retry_batch_id"),
+        "deepswe_retry_job_name": spec.get("retry_job_name"),
+        "deepswe_retry_resource_id": spec.get("runtime_trial_id"),
+    }
+
+def _valid_retry_target_id(value) -> bool:
+    return (
+        isinstance(value, str)
+        and "__" in value
+        and 1 <= len(value) <= 300
+        and value not in {".", ".."}
+        and Path(value).name == value
+    )
+
+def _retry_target_path(original_dir: Path, target_id: str) -> Path:
+    if not _valid_retry_target_id(target_id):
+        raise RuntimeError(f"重试 Trial 标识无效：{target_id}")
+    root = original_dir.resolve()
+    target = (original_dir / target_id).resolve()
+    if target.parent != root:
+        raise RuntimeError("重试 Trial 目录不在原 Run 内")
+    return target
+
+def _retry_failure_type(status: str) -> str:
+    return {
+        "cancelled": "RetryCancelled",
+        "interrupted": "RetryInterrupted",
+    }.get(status, "RetryFailed")
+
+def _set_retry_marker_state(
+    original_dir: Path,
+    specs: list[dict],
+    status: str,
+    message: str | None = None,
+) -> list[str]:
+    failures = []
+    for spec in specs:
+        marker = _retry_target_path(original_dir, spec["target_id"])
+        config = read_json(marker / "config.json")
+        if not config.get("deepswe_retrying"):
+            continue
+        expected_batch = spec.get("retry_batch_id")
+        if expected_batch and config.get("deepswe_retry_batch") != expected_batch:
+            # A stale batch must never overwrite the marker created by a newer retry.
+            continue
+        payload = {
+            "status": status,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        if expected_batch:
+            payload["batch_id"] = expected_batch
+        if status in {"failed", "cancelled", "interrupted"}:
+            payload["failure_type"] = _retry_failure_type(status)
+            payload["failure_message"] = message or {
+                "failed": "Trial 重试未产生可替换结果",
+                "cancelled": "Trial 重试已取消",
+                "interrupted": "Trial 重试因服务中断未完成",
+            }[status]
+        try:
+            _write_json_atomic(marker / "retry-state.json", payload)
+        except OSError as exc:
+            # 状态文件只是 UI 遥测，Windows 短暂占用不能中止真正的 Trial 执行。
+            failures.append(f"{spec['target_id']}: {exc}")
+    return failures
+
+def _copy_retry_diagnostics(source: Path, marker: Path) -> None:
+    for name in ("agent", "verifier", "artifacts"):
+        source_path = source / name
+        target_path = marker / name
+        if source_path.is_dir():
+            shutil.copytree(source_path, target_path, dirs_exist_ok=True)
+    for name in ("trial.log", "guard.json"):
+        source_path = source / name
+        if source_path.is_file():
+            shutil.copy2(source_path, marker / name)
+
+def _retry_request_metadata(retry_dir: Path) -> dict:
+    payload = read_json(retry_dir / ".deepswe-retry.json")
+    if not payload:
+        return {}
+    batch_id = payload.get("batch_id")
+    if batch_id is not None and not _valid_retry_batch_id(batch_id):
+        return {}
+    declared_name = payload.get("retry_job_name")
+    if declared_name is not None and declared_name != retry_dir.name:
+        return {}
+    return payload
+
+def _retry_request_specs(retry_dir: Path) -> list[dict]:
+    payload = _retry_request_metadata(retry_dir)
+    specs = payload.get("specs")
+    if not isinstance(specs, list):
+        return []
+    batch_id = payload.get("batch_id")
+    retry_name = payload.get("retry_job_name") or retry_dir.name
+    valid = []
+    for spec in specs:
+        if not (
+            isinstance(spec, dict)
+            and isinstance(spec.get("trial_id"), str)
+            and isinstance(spec.get("task"), str)
+            and isinstance(spec.get("task_config"), dict)
+        ):
+            continue
+        normalized = dict(spec)
+        target_id = normalized.get("target_id")
+        if not _valid_retry_target_id(target_id):
+            trial_id = normalized["trial_id"]
+            if not _valid_retry_target_id(trial_id):
+                continue
+            normalized["target_id"] = trial_id
+        attempt = normalized.get("attempt")
+        if not isinstance(attempt, int) or attempt < 1:
+            normalized["attempt"] = 1
+        if batch_id:
+            if normalized.get("retry_batch_id") not in {None, batch_id}:
+                continue
+            normalized["retry_batch_id"] = batch_id
+            normalized["retry_job_name"] = retry_name
+            runtime_trial_id = normalized.get("runtime_trial_id")
+            if not _valid_retry_target_id(runtime_trial_id):
+                continue
+        valid.append(normalized)
+    return valid
+
+def _retry_folder_task(folder: Path) -> str:
+    data = read_json(folder / "result.json")
+    task_name = data.get("task_name")
+    if isinstance(task_name, str) and task_name:
+        return task_name.split("/")[-1]
+    config = read_json(folder / "config.json")
+    task_path = ((config.get("task") or {}).get("path"))
+    return Path(task_path).name if isinstance(task_path, str) else folder.name.split("__", 1)[0]
+
+def _merge_retry_trials(
+    run: Run,
+    retry_dir: Path,
+    specs: list[dict],
+    supervisor_log: Path | None,
+    missing_status: str = "failed",
+    missing_message: str | None = None,
+) -> list[str]:
+    original_dir = jobs_root_for(run) / run.job_name
+    original_dir.mkdir(parents=True, exist_ok=True)
+    original_job_id = read_json(original_dir / "result.json").get("id")
+    source_specs: dict[str, deque[dict]] = defaultdict(deque)
+    runtime_specs: dict[str, dict] = {}
+    moved: list[str] = []
+    moved_ids: set[str] = set()
+    batch_ids = {
+        spec.get("retry_batch_id")
+        for spec in specs
+        if _valid_retry_batch_id(spec.get("retry_batch_id"))
+    }
+    if len(batch_ids) > 1:
+        raise RuntimeError("重试批次包含冲突的 batch id")
+    batch_id = next(iter(batch_ids), uuid.uuid4().hex)
+    declared_retry_names = {
+        spec.get("retry_job_name")
+        for spec in specs
+        if isinstance(spec.get("retry_job_name"), str)
+    }
+    if declared_retry_names and declared_retry_names != {retry_dir.name}:
+        raise RuntimeError("重试目录与批次 job name 不匹配")
+    for spec in sorted(specs, key=lambda item: (item["task"], item["attempt"], item["target_id"])):
+        target = _retry_target_path(original_dir, spec["target_id"])
+        target_config = read_json(target / "config.json")
+        if (
+            (target / "result.json").exists()
+            and target_config.get("deepswe_replaced")
+            and not target_config.get("deepswe_retrying")
+        ):
+            moved.append(spec["target_id"])
+            moved_ids.add(spec["target_id"])
+            continue
+        runtime_trial_id = spec.get("runtime_trial_id")
+        if _valid_retry_target_id(runtime_trial_id):
+            if runtime_trial_id in runtime_specs:
+                raise RuntimeError(f"重试运行时 Trial 重复：{runtime_trial_id}")
+            runtime_specs[runtime_trial_id] = spec
+        else:
+            source_specs[spec["task"]].append(spec)
+
+    trial_dirs = sorted(
+        (path for path in retry_dir.iterdir() if path.is_dir() and "__" in path.name),
+        key=lambda path: path.name,
+    ) if retry_dir.is_dir() else []
+    for source in trial_dirs:
+        spec = runtime_specs.pop(source.name, None)
+        if spec is None:
+            task = _retry_folder_task(source)
+            if not source_specs[task]:
+                raise RuntimeError(f"重试产生了无法映射的 Trial：{source.name}")
+            spec = source_specs[task].popleft()
+        target = _retry_target_path(original_dir, spec["target_id"])
+        marker_config = read_json(target / "config.json")
+        if not (
+            target.is_dir()
+            and marker_config.get("deepswe_retrying")
+            and marker_config.get("deepswe_replaced")
+        ):
+            raise RuntimeError(f"重试替换占位无效：{spec['target_id']}")
+        expected_batch = spec.get("retry_batch_id")
+        if expected_batch and marker_config.get("deepswe_retry_batch") != expected_batch:
+            raise RuntimeError(f"重试替换批次不匹配：{spec['target_id']}")
+        if not (source / "result.json").exists():
+            _copy_retry_diagnostics(source, target)
+            continue
+
+        trial_config = read_json(source / "config.json") or {
+            "task": spec["task_config"],
+        }
+        trial_config.update({
+            "trial_name": spec["target_id"],
+            "trials_dir": str(original_dir),
+            "deepswe_attempt": spec["attempt"],
+            "deepswe_replaced": True,
+            "deepswe_original_trial_id": spec["trial_id"],
+            "deepswe_retry_batch": batch_id,
+            "deepswe_retry_job_name": retry_dir.name,
+            "deepswe_retry_resource_id": source.name,
+        })
+        trial_config.pop("deepswe_retrying", None)
+        trial_config.pop("deepswe_retry_of", None)
+        if original_job_id:
+            trial_config["job_id"] = original_job_id
+        _write_json_atomic(source / "config.json", trial_config)
+        trial_result = read_json(source / "result.json")
+        trial_result.update({
+            "trial_name": spec["target_id"],
+            "trial_uri": target.resolve().as_uri(),
+            "config": trial_config,
+            "deepswe_attempt": spec["attempt"],
+            "deepswe_replaced": True,
+            "deepswe_original_trial_id": spec["trial_id"],
+            "deepswe_retry_batch": batch_id,
+            "deepswe_retry_job_name": retry_dir.name,
+            "deepswe_retry_resource_id": source.name,
+        })
+        trial_result.pop("deepswe_retrying", None)
+        trial_result.pop("deepswe_retry_of", None)
+        _write_json_atomic(source / "result.json", trial_result)
+        shutil.rmtree(target)
+        shutil.move(str(source), str(target))
+        moved.append(spec["target_id"])
+        moved_ids.add(spec["target_id"])
+
+    missing_specs = [spec for spec in specs if spec["target_id"] not in moved_ids]
+    _set_retry_marker_state(
+        original_dir,
+        missing_specs,
+        missing_status,
+        missing_message,
+    )
+
+    archive = original_dir / ".retry-logs" / (
+        datetime.now(UTC).strftime("%Y%m%d-%H%M%S") + f"-{batch_id[:8]}"
+    )
+    archive.mkdir(parents=True, exist_ok=True)
+    for source, name in (
+        (supervisor_log, "supervisor.log"),
+        (retry_dir / "job.log", "job.log"),
+        (retry_dir / "result.json", "result.json"),
+    ):
+        if source and source.exists():
+            shutil.copy2(source, archive / name)
+    _write_json_atomic(archive / "retry.json", {
+        "batch_id": batch_id,
+        "run_id": run.id,
+        "retry_job_name": retry_dir.name,
+        "requested_trial_ids": [spec["trial_id"] for spec in specs],
+        "replaced_trial_ids": moved,
+        "unreplaced_trial_ids": [spec["target_id"] for spec in missing_specs],
+        "finished_at": datetime.now(UTC).isoformat(),
+    })
+    shutil.rmtree(retry_dir, ignore_errors=True)
+    if supervisor_log:
+        supervisor_log.unlink(missing_ok=True)
+    (jobs_root_for(run) / f"{retry_dir.name}.docker-cleanup.json").unlink(missing_ok=True)
+    return moved
+
+def _apply_trial_aggregate(run: Run) -> dict:
+    aggregate = aggregate_trial_results(run)
+    if run.verification:
+        run.reward = aggregate["reward"]
+        run.passed = aggregate["passed"]
+    else:
+        run.reward = None
+        run.passed = None
+    run.input_tokens = aggregate["input_tokens"]
+    run.cached_tokens = aggregate["cached_tokens"]
+    run.output_tokens = aggregate["output_tokens"]
+    run.cost_usd = aggregate["cost_usd"]
+    return aggregate
+
+def _budget_value(preferences: dict, key: str) -> float:
+    try:
+        return float(preferences.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+def _visible_trial_cost(trial: dict, service_tier: str) -> float:
+    reported = trial.get("reported_cost_usd")
+    if isinstance(reported, (int, float)) and not isinstance(reported, bool):
+        return float(reported)
+    estimated = estimate_cost(
+        trial.get("input_tokens"),
+        trial.get("cached_tokens"),
+        trial.get("output_tokens"),
+        service_tier,
+    )
+    return float(estimated or 0)
+
+def _sync_retry_result(
+    run_id: int,
+    returncode: int,
+    retry_result: dict,
+    moved_count: int,
+    requested_count: int,
+    failure_summary: str | None,
+) -> None:
+    stats = retry_result.get("stats") or {}
+    with _state_lock, SessionLocal() as db:
+        run = db.get(Run, run_id)
+        if not run:
+            return
+        aggregate = _apply_trial_aggregate(run)
+        batch_succeeded = (
+            returncode == 0
+            and moved_count == requested_count
+            and not stats.get("n_errored_trials")
+        )
+        success = (
+            batch_succeeded
+            and not aggregate["effective_errored"]
+            and not aggregate["missing_configured"]
+        )
+        if run.status not in TERMINAL_STATES:
+            run.status = "completed" if success else "failed"
+            if success:
+                run.error = None
+            elif failure_summary:
+                run.error = redact(f"重试失败：{failure_summary}", current_secrets())[:4000]
+            elif returncode != 0:
+                run.error = f"重试 Pier 进程退出码 {returncode}"
+            elif stats.get("n_errored_trials"):
+                run.error = f"重试中有 {stats.get('n_errored_trials')} 个 Trial 执行失败"
+            elif aggregate["effective_errored"] or aggregate["missing_configured"]:
+                parts = []
+                if aggregate["effective_errored"]:
+                    parts.append(f"{aggregate['effective_errored']} 个 Trial 仍为执行错误")
+                if aggregate["missing_configured"]:
+                    parts.append(f"{aggregate['missing_configured']} 个配置 Trial 尚无结果")
+                run.error = "重试已完成，但 Run 仍未完整：" + "，".join(parts)
+            else:
+                run.error = "重试未产生可合并的 Trial 结果"
+        run.pid = None
+        run.finished_at = run.finished_at or datetime.now(UTC)
+        db.commit()
+
+def _execute_retry(run_id: int, specs: list[dict], batch_id: str) -> None:
+    secret_dir = None
+    retry_dir = None
+    supervisor_log = None
+    proc = None
+    original_dir = None
+    preferences = None
+    try:
+        preferences = get_preferences()
+        with SessionLocal() as db:
+            run = db.get(Run, run_id)
+            if not run:
+                return
+            infrastructure_max_retries = int(preferences["infrastructure_max_retries"])
+            run.agent_timeout_seconds = int(preferences["agent_timeout_seconds"])
+            run.verifier_timeout_seconds = int(preferences["verifier_timeout_seconds"])
+            run.retry_infrastructure_errors = infrastructure_max_retries > 0
+            run.infrastructure_max_retries = infrastructure_max_retries
+            run.agent_max_steps = int(preferences["agent_max_steps"])
+            run.status = "preflight"
+            run.pid = None
+            db.commit()
+            db.refresh(run)
+            jobs_root = jobs_root_for(run)
+            retry_dir = _retry_dir(jobs_root, run.job_name, batch_id)
+            retry_name = retry_job_name(run.job_name, batch_id)
+            service_tier = run.service_tier
+            agent = run.agent
+            max_steps = run.agent_max_steps
+            original_dir = jobs_root / run.job_name
+        if not retry_dir.is_dir():
+            raise RuntimeError("重试工作目录缺失")
+        metadata = _retry_request_metadata(retry_dir)
+        if (
+            metadata.get("run_id") != run_id
+            or metadata.get("batch_id") != batch_id
+            or metadata.get("retry_job_name") != retry_name
+        ):
+            raise RuntimeError("重试工作目录与当前批次不匹配")
+        _set_retry_marker_state(original_dir, specs, "preflight")
+        if preferences.get("docker_cleanup_after_run", True):
+            try:
+                cleanup_job_resources(
+                    run.job_name,
+                    jobs_root,
+                    DockerCleanupPolicy(),
+                    trigger="retry-replace-old",
+                    projects=[
+                        sanitize_compose_project_name(spec["target_id"])
+                        for spec in specs
+                    ],
+                )
+            except Exception:
+                pass
+
+        base_cost_usd = _completed_trials_cost(original_dir, service_tier)
+        run_budget = _budget_value(preferences, "run_budget_usd")
+        if run_budget > 0 and base_cost_usd >= run_budget:
+            raise RuntimeError(
+                f"保留 Trial 的累计费用 ${base_cost_usd:.2f} 已达到 Run 预算上限 ${run_budget:.2f}"
+            )
+
+        credential = read_credential(credential_path())
+        _preflight(list(dict.fromkeys(spec["task"] for spec in specs)), credential.url)
+        secret_dir, auth_path = _write_secret_auth(credential.token)
+        config_path, process_env = _prepare_retry_config(
+            run, specs, credential, secret_dir, auth_path, jobs_root, preferences
+        )
+        jobs_root.mkdir(parents=True, exist_ok=True)
+        supervisor_log = jobs_root / f"{retry_name}.supervisor.log"
+        args = [shutil.which("pier") or "pier", "run", "--config", str(config_path), "-y"]
+        with supervisor_log.open("w", encoding="utf-8") as log:
+            proc = subprocess.Popen(
+                args,
+                cwd=settings.tasks_dir.parent,
+                env=process_env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+                start_new_session=os.name != "nt",
+            )
+            _set_retry_marker_state(original_dir, specs, "preparing_environment")
+            if not _register_retry_process(run_id, batch_id, proc):
+                _terminate_tree(proc.pid)
+                raise RuntimeError("重试批次已被替换，拒绝登记旧进程")
+            with SessionLocal() as db:
+                current = db.get(Run, run_id)
+                if current:
+                    current.status = "running"
+                    current.pid = proc.pid
+                    db.commit()
+            guard_error = _wait_with_guard(
+                proc,
+                retry_dir,
+                service_tier,
+                agent,
+                max_steps,
+                base_cost_usd,
+            )
+
+        if guard_error:
+            with _state_lock, SessionLocal() as db:
+                current = db.get(Run, run_id)
+                if current and current.status not in TERMINAL_STATES:
+                    current.status = "cancelled"
+                    current.error = guard_error
+                    current.finished_at = datetime.now(UTC)
+                    db.commit()
+
+        retry_result = read_json(retry_dir / "result.json")
+        failure_summary = _run_failure_summary(retry_dir, supervisor_log)
+        if preferences.get("docker_cleanup_after_run", True):
+            try:
+                cleanup_job_resources(
+                    retry_name, jobs_root, DockerCleanupPolicy(), trigger="retry-finished"
+                )
+            except Exception:
+                pass
+        with SessionLocal() as db:
+            current = db.get(Run, run_id)
+            current_status = current.status if current else "failed"
+            current_error = current.error if current else None
+        missing_status = (
+            current_status
+            if current_status in {"cancelled", "interrupted"}
+            else "failed"
+        )
+        moved = _merge_retry_trials(
+            run,
+            retry_dir,
+            specs,
+            supervisor_log,
+            missing_status=missing_status,
+            missing_message=current_error or guard_error or failure_summary,
+        )
+        _sync_retry_result(
+            run_id,
+            proc.returncode,
+            retry_result,
+            len(moved),
+            len(specs),
+            failure_summary,
+        )
+    except Exception as exc:
+        if original_dir:
+            with SessionLocal() as db:
+                current = db.get(Run, run_id)
+                current_status = current.status if current else "failed"
+            marker_status = (
+                current_status
+                if current_status in {"cancelled", "interrupted"}
+                else "failed"
+            )
+            _set_retry_marker_state(original_dir, specs, marker_status, str(exc))
+        with _state_lock, SessionLocal() as db:
+            run = db.get(Run, run_id)
+            if run:
+                _apply_trial_aggregate(run)
+                if run.status not in TERMINAL_STATES:
+                    run.status = "failed"
+                    run.error = redact(f"Trial 重试失败：{exc}", current_secrets())[:4000]
+                    run.finished_at = datetime.now(UTC)
+                run.pid = None
+                db.commit()
+    finally:
+        _release_retry_batch(run_id, batch_id, proc)
+        if secret_dir:
+            shutil.rmtree(secret_dir, ignore_errors=True)
+        if (
+            retry_dir
+            and retry_dir.exists()
+            and (preferences or get_preferences()).get("docker_cleanup_after_run", True)
+        ):
+            try:
+                cleanup_job_resources(
+                    retry_dir.name,
+                    retry_dir.parent,
+                    DockerCleanupPolicy(),
+                    trigger="retry-finalize",
+                )
+            except Exception:
+                pass
+
+def retry_trials(run_id: int, trial_ids: list[str]) -> dict:
+    batch_id = uuid.uuid4().hex
+    reserved = False
+    try:
+        with _state_lock, SessionLocal() as db:
+            run = db.get(Run, run_id)
+            if not run:
+                raise LookupError("run not found")
+            if run.status not in TERMINAL_STATES:
+                raise RuntimeError("Run 正在执行，不能同时提交 Trial 重试")
+            specs = _bind_retry_specs(run, _retry_specs(run, trial_ids), batch_id)
+            preferences = get_preferences()
+            selected_ids = {spec["trial_id"] for spec in specs}
+            detail = parsed_run_detail(run, include_patches=False)
+            retained_cost = sum(
+                _visible_trial_cost(trial, run.service_tier)
+                for trial in detail["trials"]
+                if trial["id"] not in selected_ids
+            )
+            run_budget = _budget_value(preferences, "run_budget_usd")
+            if run_budget > 0 and retained_cost >= run_budget:
+                raise RuntimeError(
+                    f"保留 Trial 的累计费用 ${retained_cost:.2f} 已达到 Run 预算上限 ${run_budget:.2f}"
+                )
+            if not _reserve_retry_batch(run_id, batch_id):
+                raise RuntimeError("上一批 Trial 重试仍在收尾，暂不能提交新重试")
+            reserved = True
+            jobs_root = jobs_root_for(run)
+            original_dir = jobs_root / run.job_name
+            retry_name = retry_job_name(run.job_name, batch_id)
+            retry_dir = _retry_dir(jobs_root, run.job_name, batch_id)
+            for stale_dir in retry_job_dirs(jobs_root, run.job_name):
+                try:
+                    cleanup_job_resources(
+                        stale_dir.name,
+                        jobs_root,
+                        DockerCleanupPolicy(),
+                        trigger="retry-stale",
+                    )
+                except Exception:
+                    pass
+                shutil.rmtree(stale_dir, ignore_errors=True)
+                (jobs_root / f"{stale_dir.name}.supervisor.log").unlink(missing_ok=True)
+                (jobs_root / f"{stale_dir.name}.docker-cleanup.json").unlink(missing_ok=True)
+            retry_dir.mkdir(parents=True)
+            _write_json_atomic(retry_dir / ".deepswe-retry.json", {
+                "run_id": run_id,
+                "batch_id": batch_id,
+                "retry_job_name": retry_name,
+                "created_at": datetime.now(UTC).isoformat(),
+                "specs": specs,
+            })
+            for spec in specs:
+                target = _retry_target_path(original_dir, spec["target_id"])
+                if target.exists():
+                    shutil.rmtree(target)
+                target.mkdir(parents=True)
+                _write_json_atomic(
+                    target / "config.json",
+                    _retry_marker_config(original_dir, spec),
+                )
+            _set_retry_marker_state(original_dir, specs, "queued")
+            run.status = "queued"
+            run.error = None
+            run.finished_at = None
+            run.pid = None
+            _apply_trial_aggregate(run)
+            db.commit()
+    except Exception:
+        if reserved:
+            _release_retry_batch(run_id, batch_id)
+        raise
+    try:
+        threading.Thread(
+            target=_execute_retry,
+            args=(run_id, specs, batch_id),
+            daemon=True,
+        ).start()
+    except Exception:
+        _release_retry_batch(run_id, batch_id)
+        with _state_lock, SessionLocal() as db:
+            run = db.get(Run, run_id)
+            if run:
+                run.status = "failed"
+                run.error = "无法启动 Trial 重试线程"
+                run.finished_at = datetime.now(UTC)
+                _set_retry_marker_state(
+                    jobs_root_for(run) / run.job_name,
+                    specs,
+                    "failed",
+                    run.error,
+                )
+                db.commit()
+        raise
+    return {
+        "started": True,
+        "run_id": run_id,
+        "batch_id": batch_id,
+        "retry_job_name": retry_name,
+        "trial_ids": [spec["trial_id"] for spec in specs],
+        "retry_count": len(specs),
+    }
 
 def _cleanup_after_run(run_id: int, job_name: str | None, jobs_root: Path | None) -> None:
     """运行结束（含失败/取消）后的轻量 Docker 清理；失败不影响结果状态。"""
@@ -679,7 +1627,9 @@ def _kill_process_tree(pid: int, require_pier: bool = False) -> None:
         pass
 
 def cancel_run(run_id: int) -> bool:
-    with _lock: proc = _processes.get(run_id)
+    with _lock:
+        proc = _processes.get(run_id)
+        retry_batch_id = _retrying.get(run_id)
     if not proc: return False
     _terminate_tree(proc.pid)
     try:
@@ -695,8 +1645,12 @@ def cancel_run(run_id: int) -> bool:
             # 进程恰好已正常结束并落库，不把 completed 改写成 cancelled
             return False
         run.status = "cancelled"; run.finished_at = datetime.now(UTC); db.commit()
+    cleanup_name = (
+        retry_job_name(job_name, retry_batch_id)
+        if retry_batch_id else job_name
+    )
     try:
-        cleanup_job_resources(job_name, jobs_root, DockerCleanupPolicy(), trigger="cancelled")
+        cleanup_job_resources(cleanup_name, jobs_root, DockerCleanupPolicy(), trigger="cancelled")
     except Exception:
         pass
     return True
@@ -709,16 +1663,94 @@ def reap_orphaned_runs() -> None:
     for run_id, pid, job_name, jobs_root in stale:
         if pid:
             _kill_process_tree(pid, require_pier=True)
-        try:
-            cleanup_job_resources(job_name, jobs_root, DockerCleanupPolicy(), trigger="startup-reap")
-        except Exception:
-            pass
+        original_dir = jobs_root / job_name
+        marker_batches = set()
+        if original_dir.is_dir():
+            for path in original_dir.iterdir():
+                if not path.is_dir() or "__" not in path.name:
+                    continue
+                config = read_json(path / "config.json")
+                batch_id = config.get("deepswe_retry_batch")
+                if config.get("deepswe_retrying") and _valid_retry_batch_id(batch_id):
+                    marker_batches.add(batch_id)
+        retry_candidates = []
+        for candidate in retry_job_dirs(jobs_root, job_name):
+            metadata = _retry_request_metadata(candidate)
+            if not metadata or metadata.get("run_id") in {None, run_id}:
+                retry_candidates.append(candidate)
+            try:
+                cleanup_job_resources(
+                    candidate.name,
+                    jobs_root,
+                    DockerCleanupPolicy(),
+                    trigger="startup-reap",
+                )
+            except Exception:
+                pass
+        matching_candidates = [
+            candidate
+            for candidate in retry_candidates
+            if _retry_request_metadata(candidate).get("batch_id") in marker_batches
+        ]
+        retry_dir = max(
+            matching_candidates or retry_candidates,
+            key=lambda path: path.stat().st_mtime,
+            default=None,
+        )
+        is_retry = retry_dir is not None
+        if not is_retry:
+            try:
+                cleanup_job_resources(
+                    job_name,
+                    jobs_root,
+                    DockerCleanupPolicy(),
+                    trigger="startup-reap",
+                )
+            except Exception:
+                pass
+        recovered = 0
+        recovery_error = None
+        if is_retry:
+            specs = _retry_request_specs(retry_dir)
+            if specs:
+                with SessionLocal() as db:
+                    retry_run = db.get(Run, run_id)
+                if retry_run:
+                    try:
+                        recovered = len(_merge_retry_trials(
+                            retry_run,
+                            retry_dir,
+                            specs,
+                            jobs_root / f"{retry_dir.name}.supervisor.log",
+                            missing_status="interrupted",
+                            missing_message="服务重启时重试尚未完成",
+                        ))
+                    except Exception as exc:
+                        recovery_error = redact(str(exc), current_secrets())[:1000]
+                        _set_retry_marker_state(
+                            jobs_root / job_name,
+                            specs,
+                            "interrupted",
+                            recovery_error,
+                        )
+        has_replacements = original_dir.is_dir() and any(
+            read_json(path / "config.json").get("deepswe_replaced")
+            for path in original_dir.iterdir()
+            if path.is_dir() and "__" in path.name
+        )
         with _state_lock, SessionLocal() as db:
             run = db.get(Run, run_id)
             if run and run.status in ACTIVE_STATES:
+                if recovered or has_replacements:
+                    _apply_trial_aggregate(run)
                 run.status = "interrupted"
                 run.finished_at = run.finished_at or datetime.now(UTC)
-                run.error = run.error or "服务重启后检测到运行已中断，已回收残留进程与容器"
+                message = "服务重启后检测到运行已中断，已回收残留进程与容器"
+                if recovered:
+                    message += f"；已将 {recovered} 个重试 Trial 合并回原 Run"
+                if recovery_error:
+                    message += f"；重试结果恢复失败：{recovery_error}"
+                run.error = run.error or message
                 db.commit()
 
 def shutdown_processes() -> None:
@@ -742,5 +1774,7 @@ def get_run(run_id:int) -> dict|None:
 def run_log(run_id:int) -> str:
     with SessionLocal() as db: run=db.get(Run,run_id)
     if not run:return ""
-    root=jobs_root_for(run); paths=[root/f"{run.job_name}.supervisor.log",root/run.job_name/"job.log"]
+    root=jobs_root_for(run); job_dir=root/run.job_name
+    paths=[root/f"{run.job_name}.supervisor.log",job_dir/"job.log"]
+    paths += sorted((job_dir/".retry-logs").glob("*/*.log")) if (job_dir/".retry-logs").is_dir() else []
     return redact("\n".join(p.read_text(encoding="utf-8",errors="replace") for p in paths if p.exists()), current_secrets())[-200000:]

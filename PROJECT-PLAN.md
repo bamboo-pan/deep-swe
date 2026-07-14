@@ -31,7 +31,7 @@
 |---|---|
 | 凭据文件 | `C:\Users\bamboo2026\Documents\github\codex1.txt`(两行:URL、Token) |
 | agent / model / effort | mini-swe-agent / gpt-5.6-sol / high |
-| 任务集 / 重复 / 并发 | regression-standard-7 / 1 / 2 |
+| 任务集 / 重复 / 并发 | frontier-regression-4 / 1 / 2 |
 | verifier / tier | 开启 / standard |
 | 运行预算 | `trial_budget_usd` 单 Trial 默认 $8;`run_budget_usd` Run 级兜底默认 $10(均 0 = 禁用) |
 
@@ -54,19 +54,18 @@
 
 effort 三值记录:请求值 / adapter 映射值 / 有效值(`reasoning_effort_effective` 只能来自运行后观测,观测机制未落地前如实存 `null`,不复制请求值伪装)。
 
-## 6. 默认任务集 regression-standard-7
+## 6. 默认任务集 frontier-regression-4
 
 | ID | 任务 | 角色 |
 |---|---|---|
-| T01 | dasel-html-document-format | 区分 |
-| T02 | igel-persist-feature-schema | 区分 |
-| T03 | csstree-shorthand-expansion-compression | 区分 |
-| T04 | happy-dom-deterministic-intersectionobserver | 区分 |
-| T05 | superjson-error-stack-serialization | 区分 |
-| T06 | dateutil-rfc5545-timezone-interop | 区分 |
-| T07 | actionlint-action-pinning-lint | 控制 |
+| T01 | etree-xml-diff-patch | Go 算法与递归结构区分 |
+| T02 | psd-tools-blend-range-api | Python 跨模块 API 与数值语义区分 |
+| T03 | boa-hierarchical-evaluation-cancellation | Rust 状态传播与并发语义区分 |
+| T04 | sql-formatter-bigquery-pipe-formatting | TypeScript 解析/格式化控制 |
 
-UI 同时展示套件 ID、真实标题、目录名、数据集 ext_id。快捷模式:快速检查(每题 1 次,7 trials,并发 2 约 30–45 分钟)/ 建立基线(每题 4 次,28 trials,约 2–3 小时)。
+筛选基于 DeepSWE v1.1 官方 18,522 条 Trial，对 GPT-5.6、GPT-5.5、GPT-5.4、Claude 与 GLM-5.2 配置做题目区分度和组合相关性分析，并约束四种技术栈、无整组天花板/地板、统一 2 CPU / 8 GB 资源及运行时长。该组合与目标模型总体能力的相关系数约 0.895；GPT-5.6-SOL 的 low / medium / high / xhigh / max 套件通过率约为 38% / 56% / 75% / 100% / 100%。官方单配置通常只有 4 次样本，正式判断仍以本机同配置基线为准。
+
+UI 同时展示套件 ID、真实标题、目录名、数据集 ext_id。快速检查每题 1 次，共 4 trials，并发 2 约 25–35 分钟；正式基线每题 4 次，共 16 trials，预计约 1.5–2 小时。
 
 ## 7. 成本计算
 
@@ -89,13 +88,13 @@ GPT-5.6-SOL 官方价(每 1M Token):
 
 ## 9. 基线与降智判定
 
-基线建议 28 trials(每题 4 次)。五条告警规则(全部已实现):
+基线建议 16 trials(每题 4 次)。五条告警规则(全部已实现):
 
-1. 总通过率相对基线下降 ≥ 4/28(约 14 个百分点)
-2. 至少两个任务从 3–4/4 降为 0–1/4
+1. 总通过率相对基线下降 ≥ 2/16(12.5 个百分点；代码按基线 Trial 数缩放)
+2. 至少一个任务从 3–4/4 降为 0–1/4(代码按任务数缩放)
 3. 成功 Trial 归一化耗时增加 > 25%
 4. 耗时下降 > 35% 且通过率同时下降(疑似提前终止)
-5. 控制任务 actionlint 通过率降到 ≤ 1/4
+5. 控制任务 sql-formatter-bigquery-pipe-formatting 通过率降到 ≤ 1/4
 
 一次异常黄色(warning);相同配置(agent+模型+effort)连续两次异常升级红色(danger)。
 
@@ -161,4 +160,4 @@ GPT-5.6-SOL 官方价(每 1M Token):
 
 ## 15. 验收标准(第一版)
 
-三 Agent 可选、六档 effort、两行凭据安全读取、默认 7 题或任选、并发默认 2 可改、实时 Trial 状态/日志、可取消、通过率/F2P/P2P/耗时/Token/费用可见、多运行比较、基线+回归告警、官方价格计费、Token 与凭据零泄漏(数据库/日志/前端)。
+三 Agent 可选、六档 effort、两行凭据安全读取、默认 4 题或任选、并发默认 2 可改、实时 Trial 状态/日志、可取消、通过率/F2P/P2P/耗时/Token/费用可见、多运行比较、基线+回归告警、官方价格计费、Token 与凭据零泄漏(数据库/日志/前端)。

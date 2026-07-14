@@ -1240,6 +1240,7 @@ select {
   color: #6f8d82;
   font: 10px "IBM Plex Mono";
 }
+.trialresulttools .secondary,
 .trialresulttools .danger {
   padding: 7px 9px;
   font-size: 11px;

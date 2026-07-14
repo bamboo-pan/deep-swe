@@ -1,3 +1,4 @@
+import asyncio
 import json
 import subprocess
 from pathlib import Path
@@ -24,10 +25,34 @@ def test_health():
     with TestClient(app) as client:
         assert client.get("/api/health").json()["status"] == "ok"
 
-def test_bootstrap_has_seven_tasks():
+def test_lifespan_can_skip_startup_reap_for_side_by_side_server(monkeypatch):
+    from app import main
+
+    calls = []
+    monkeypatch.setenv("DEEPSWE_SKIP_STARTUP_REAP", "1")
+    monkeypatch.setattr(main, "init_db", lambda: calls.append("init"))
+    monkeypatch.setattr(main, "reap_orphaned_runs", lambda: calls.append("reap"))
+    monkeypatch.setattr(main, "shutdown_processes", lambda: calls.append("shutdown"))
+
+    async def exercise():
+        async with main.lifespan(main.app):
+            calls.append("running")
+
+    asyncio.run(exercise())
+
+    assert calls == ["init", "running", "shutdown"]
+
+def test_bootstrap_has_frontier_regression_suite():
     with TestClient(app) as client:
-        tasks = client.get("/api/bootstrap").json()["task_suite"]["tasks"]
-        assert len(tasks) == 7
+        suite = client.get("/api/bootstrap").json()["task_suite"]
+        tasks = suite["tasks"]
+        assert suite["name"] == "frontier-regression-4"
+        assert [task["id"] for task in tasks] == [
+            "etree-xml-diff-patch",
+            "psd-tools-blend-range-api",
+            "boa-hierarchical-evaluation-cancellation",
+            "sql-formatter-bigquery-pipe-formatting",
+        ]
         assert all(task["suite_id"].startswith("TASK-") for task in tasks if task["available"])
 
 def test_bootstrap_uses_provider_model_efforts_and_validates_selection(monkeypatch):
@@ -222,6 +247,59 @@ def test_delete_trial_rejects_active_run():
             db.add(run); db.commit(); db.refresh(run); run_id=run.id
         response=client.delete(f"/api/runs/{run_id}/trials/task-a%231")
         assert response.status_code == 409
+
+def test_retry_trials_endpoint_starts_only_for_terminal_run(monkeypatch):
+    from app import main
+    captured = {}
+    monkeypatch.setattr(main, "retry_trials", lambda run_id, trial_ids: captured.update({
+        "run_id": run_id, "trial_ids": trial_ids,
+    }) or {"started": True, "run_id": run_id, "trial_ids": trial_ids, "retry_count": len(trial_ids)})
+    with TestClient(app) as client:
+        with SessionLocal() as db:
+            done = Run(status="completed", agent="codex", model="test", reasoning_effort="high",
+                       job_name="retry-done", tasks_json='["task-a"]')
+            active = Run(status="running", agent="codex", model="test", reasoning_effort="high",
+                         job_name="retry-active", tasks_json='["task-a"]')
+            db.add_all([done, active]); db.commit(); db.refresh(done); db.refresh(active)
+            done_id, active_id = done.id, active.id
+
+        response = client.post(f"/api/runs/{done_id}/trials/retry", json={"trial_ids": ["one", "two"]})
+        assert response.status_code == 202
+        assert response.json()["retry_count"] == 2
+        assert captured == {"run_id": done_id, "trial_ids": ["one", "two"]}
+        assert client.post(
+            f"/api/runs/{active_id}/trials/retry", json={"trial_ids": ["one"]}
+        ).status_code == 409
+
+def test_settings_persist_retry_runtime_limits_and_cost_guards(monkeypatch):
+    from app import main
+
+    monkeypatch.setattr(main, "_provider_bootstrap", lambda preferences, force_refresh=False: {
+        "default_model": preferences["default_model"],
+        "default_effort": preferences["default_effort"],
+    })
+    keys = (
+        "agent_timeout_seconds", "verifier_timeout_seconds",
+        "infrastructure_max_retries", "agent_max_steps",
+        "trial_budget_usd", "run_budget_usd",
+    )
+    with TestClient(app) as client:
+        original = client.get("/api/settings").json()
+        payload = {
+            "agent_timeout_seconds": 7200,
+            "verifier_timeout_seconds": 2400,
+            "infrastructure_max_retries": 2,
+            "agent_max_steps": 160,
+            "trial_budget_usd": 7.5,
+            "run_budget_usd": 45.0,
+        }
+        try:
+            response = client.put("/api/settings", json=payload)
+            assert response.status_code == 200
+            saved = client.get("/api/settings").json()
+            assert {key: saved[key] for key in keys} == payload
+        finally:
+            client.put("/api/settings", json={key: original[key] for key in keys})
 
 def test_job_name_whitelist():
     assert is_safe_job_name("ui-20260711-123456-abc123")

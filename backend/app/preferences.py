@@ -9,6 +9,7 @@ from .security import read_credential
 
 KEYS = (
     "credential_file", "jobs_dir", "default_agent", "default_model", "default_effort", "default_concurrency",
+    "agent_timeout_seconds", "verifier_timeout_seconds", "infrastructure_max_retries", "agent_max_steps",
     "docker_cleanup_after_run", "docker_cleanup_on_delete", "docker_cache_retention_hours", "docker_cache_warning_gb",
     "run_budget_usd", "trial_budget_usd",
 )
@@ -21,6 +22,10 @@ def _defaults() -> dict:
         "default_model": settings.default_model,
         "default_effort": settings.default_effort,
         "default_concurrency": settings.default_concurrency,
+        "agent_timeout_seconds": settings.agent_timeout_seconds,
+        "verifier_timeout_seconds": settings.verifier_timeout_seconds,
+        "infrastructure_max_retries": settings.infrastructure_max_retries,
+        "agent_max_steps": settings.agent_max_steps,
         "docker_cleanup_after_run": settings.docker_cleanup_after_run,
         "docker_cleanup_on_delete": settings.docker_cleanup_on_delete,
         "docker_cache_retention_hours": settings.docker_cache_retention_hours,

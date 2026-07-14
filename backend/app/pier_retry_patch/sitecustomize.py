@@ -4,6 +4,7 @@ import json
 import os
 
 from networking import trial_network_subnets
+from runtime import install_retry_trial_names, install_safe_metric_display
 from transient import TRANSIENT_EXCEPTION_TYPE, is_transient_agent_failure
 
 
@@ -61,6 +62,32 @@ def _install_retry_backoff() -> None:
 
 
 _install_retry_backoff()
+
+
+def _install_retry_runtime_guards() -> None:
+    try:
+        from pier.job import Job
+    except ImportError:
+        return
+
+    install_safe_metric_display(Job)
+
+    raw_names = os.environ.get("DEEPSWE_RETRY_TRIAL_NAMES")
+    expected_job_name = os.environ.get("DEEPSWE_RETRY_JOB_NAME")
+    if not raw_names and not expected_job_name:
+        return
+    if not raw_names or not expected_job_name:
+        raise RuntimeError("Incomplete DeepSWE retry identity environment")
+    try:
+        trial_names = json.loads(raw_names)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Invalid DeepSWE retry trial identity JSON") from exc
+    if not isinstance(trial_names, list):
+        raise RuntimeError("DeepSWE retry trial identities must be a list")
+    install_retry_trial_names(Job, trial_names, expected_job_name)
+
+
+_install_retry_runtime_guards()
 
 
 def _install_transient_failure_classification() -> None:

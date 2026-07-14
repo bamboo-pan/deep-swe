@@ -1,4 +1,5 @@
 import json
+import re
 import tomllib
 from datetime import datetime
 from pathlib import Path
@@ -11,9 +12,9 @@ from .official_stats import configuration_stats, load_official_stats, normalize_
 from .preferences import current_secrets, jobs_path
 from .pier_retry_patch.transient import is_transient_agent_failure
 from .security import redact
+from .task_suite import CONTROL_TASK
 
 TIER_MULTIPLIER = {"standard": 1.0, "batch": 0.5, "priority": 2.0}
-CONTROL_TASK = "actionlint-action-pinning-lint"
 TRIAL_TERMINAL_STATES = {"completed", "failed", "cancelled", "interrupted"}
 
 def run_code(run_id: int) -> str:
@@ -43,6 +44,25 @@ def _json(path: Path) -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+
+def _agent_log_tail(folder: Path, max_bytes: int = 200_000) -> str:
+    chunks = []
+    for path in (folder / "agent").glob("*.txt"):
+        try:
+            with path.open("rb") as handle:
+                handle.seek(0, 2)
+                handle.seek(max(handle.tell() - max_bytes, 0))
+                chunks.append(handle.read().decode("utf-8", errors="replace"))
+        except OSError:
+            continue
+    return "\n".join(chunks)
+
+def _agent_hit_execution_limit(log_tail: str) -> bool:
+    lines = [line.strip() for line in log_tail.splitlines()]
+    return any(
+        current == "Exit:" and following == "LimitsExceeded"
+        for current, following in zip(lines, lines[1:])
+    )
 
 def parse_timestamp(value) -> datetime | None:
     if isinstance(value, datetime):
@@ -84,6 +104,9 @@ def _trial_stage(folder: Path, result: dict) -> str:
     if result:
         rewards = (result.get("verifier_result") or {}).get("rewards") or {}
         return "failed" if result.get("exception_info") or (rewards.get("reward") is not None and rewards.get("reward") < 1) else "completed"
+    retry_status = _json(folder / "retry-state.json").get("status")
+    if isinstance(retry_status, str) and retry_status:
+        return retry_status
     if (folder / "verifier" / "run.log").exists():
         return "verifier"
     if (folder / "artifacts" / "model.patch").exists():
@@ -114,28 +137,36 @@ def _canonical_task_name(folder: Path, data: dict, expected_tasks: list[str] | N
 
 def _trial(folder: Path, include_patch: bool = True, expected_tasks: list[str] | None = None) -> dict:
     data = _json(folder / "result.json")
+    config = _json(folder / "config.json")
+    retry_state = _json(folder / "retry-state.json") if not data else {}
     rewards = (data.get("verifier_result") or {}).get("rewards") or {}
     agent = data.get("agent_result") or {}
     info = data.get("agent_info") or {}
     task_name = _canonical_task_name(folder, data, expected_tasks)
     patch_path = folder / "artifacts" / "model.patch"
+    patch_bytes = patch_path.stat().st_size if patch_path.exists() else 0
     patch = patch_path.read_text(encoding="utf-8", errors="replace") if include_patch and patch_path.exists() else ""
     exception = data.get("exception_info") or {}
     agent_execution = data.get("agent_execution") or {}
-    failure_message = exception.get("exception_message")
-    failure_type = exception.get("exception_type")
+    failure_message = exception.get("exception_message") or retry_state.get("failure_message")
+    failure_type = exception.get("exception_type") or retry_state.get("failure_type")
+    reward = rewards.get("reward")
+    score_parts = []
+    baseline_score_parts = []
+    score_descriptions = {
+        "f2p": "目标失败测试修复（F2P）",
+        "p2p": "原有通过测试保持（P2P）",
+    }
+    for label in ("f2p", "p2p"):
+        passed, total = rewards.get(f"{label}_passed"), rewards.get(f"{label}_total")
+        if passed is not None and total is not None:
+            score_parts.append(f"{label.upper()} {passed}/{total}")
+            baseline_score_parts.append(f"{score_descriptions[label]} {passed}/{total}")
+    score_summary = "，".join(score_parts)
+    baseline_score_summary = "，".join(baseline_score_parts)
     agent_log_tail = ""
-    if failure_type:
-        chunks = []
-        for path in (folder / "agent").glob("*.txt"):
-            try:
-                with path.open("rb") as handle:
-                    handle.seek(0, 2)
-                    handle.seek(max(handle.tell() - 200_000, 0))
-                    chunks.append(handle.read().decode("utf-8", errors="replace"))
-            except OSError:
-                continue
-        agent_log_tail = "\n".join(chunks)
+    if failure_type or (reward is not None and reward < 1 and patch_bytes == 0):
+        agent_log_tail = _agent_log_tail(folder)
     if is_transient_agent_failure(
         failure_type, f"{failure_message or ''}\n{agent_log_tail}"
     ):
@@ -146,21 +177,60 @@ def _trial(folder: Path, include_patch: bool = True, expected_tasks: list[str] |
     if guard_reason:
         failure_type = "UsageGuardTerminated"
         failure_message = guard_reason + (f"；{failure_message}" if failure_message else "")
-    reward = rewards.get("reward")
+    if (
+        not failure_type
+        and reward is not None
+        and reward < 1
+        and patch_bytes == 0
+        and _agent_hit_execution_limit(agent_log_tail)
+    ):
+        kwargs = (((data.get("config") or {}).get("agent") or {}).get("kwargs") or {})
+        cost, cost_limit = agent.get("cost_usd"), kwargs.get("cost_limit")
+        numeric_cost = isinstance(cost, (int, float)) and not isinstance(cost, bool)
+        numeric_limit = isinstance(cost_limit, (int, float)) and not isinstance(cost_limit, bool)
+        if numeric_cost and numeric_limit and cost >= cost_limit:
+            failure_type = "CostLimitExceeded"
+            failure_message = (
+                f"本次 Agent 费用达到单 Trial 上限（${cost:.2f} / ${cost_limit:.2f}），任务自动停止；"
+                "评分系统未收到代码补丁（model.patch 为空）"
+            )
+        else:
+            failure_type = "AgentLimitExceeded"
+            steps = data.get("n_agent_steps") or agent.get("n_agent_steps")
+            step_detail = (
+                f"已执行 {steps} 步，"
+                if isinstance(steps, int) and not isinstance(steps, bool) and steps > 0
+                else ""
+            )
+            failure_message = (
+                f"本次 Agent {step_detail}达到设置的步数上限后自动停止；"
+                "评分系统未收到代码补丁（model.patch 为空）"
+            )
+        if baseline_score_summary:
+            failure_message += f"；因此使用原始代码评测：{baseline_score_summary}"
     if not failure_type and reward is not None and reward < 1:
         failure_type = "VerificationFailed"
-        score_parts = []
-        for label in ("f2p", "p2p"):
-            passed, total = rewards.get(f"{label}_passed"), rewards.get(f"{label}_total")
-            if passed is not None and total is not None:
-                score_parts.append(f"{label.upper()} {passed}/{total}")
-        failure_message = "验证未通过" + (f"：{'，'.join(score_parts)}" if score_parts else f"（reward {reward}）")
+        failure_message = "验证未通过" + (f"：{score_summary}" if score_summary else f"（reward {reward}）")
     redacted_failure = redact(str(failure_message), current_secrets())[:4000] if failure_message else None
     collapsed_failure = " ".join(redacted_failure.split()) if redacted_failure else None
+    retry_of = data.get("deepswe_retry_of") or config.get("deepswe_retry_of")
+    retry_batch = data.get("deepswe_retry_batch") or config.get("deepswe_retry_batch")
+    retry_job_name = data.get("deepswe_retry_job_name") or config.get("deepswe_retry_job_name")
+    retry_resource_id = data.get("deepswe_retry_resource_id") or config.get("deepswe_retry_resource_id")
+    attempt = data.get("deepswe_attempt") or config.get("deepswe_attempt")
+    retry_status = retry_state.get("status")
+    retrying = bool(
+        config.get("deepswe_retrying")
+        and retry_status not in TRIAL_TERMINAL_STATES
+    )
+    replaced = bool(data.get("deepswe_replaced") or config.get("deepswe_replaced"))
     return {
         "id": folder.name,
         **task_identity(task_name),
         "status": _trial_stage(folder, data),
+        "attempt": attempt if isinstance(attempt, int) and attempt > 0 else None,
+        "retrying": retrying,
+        "replaced": replaced,
         "started_at": data.get("started_at"),
         "finished_at": data.get("finished_at"),
         "duration_seconds": _seconds(data.get("started_at"), data.get("finished_at")),
@@ -185,8 +255,12 @@ def _trial(folder: Path, include_patch: bool = True, expected_tasks: list[str] |
             f"{failure_type}: {collapsed_failure}"[:320]
             if failure_type and collapsed_failure else failure_type or collapsed_failure
         ),
+        "retry_of": retry_of,
+        "retry_batch": retry_batch,
+        "retry_job_name": retry_job_name,
+        "retry_resource_id": retry_resource_id,
         "patch": patch[-100000:],
-        "patch_bytes": patch_path.stat().st_size if patch_path.exists() else 0,
+        "patch_bytes": patch_bytes,
     }
 
 def _enrich_trials(run: Run, trials: list[dict]) -> list[dict]:
@@ -235,10 +309,131 @@ def trial_folder(run: Run, trial_id: str) -> Path | None:
         return None
     return next((p for p in root.iterdir() if p.is_dir() and p.name == trial_id), None)
 
+def _retry_live_entries(
+    run: Run,
+    markers: list[dict],
+    expected_tasks: list[str],
+    include_patches: bool,
+) -> dict[str, dict]:
+    if not markers:
+        return {}
+    jobs_root = jobs_root_for(run).resolve()
+    retry_base = f"retry-{run.job_name}"
+    mapping = {}
+    remaining = []
+    for marker in markers:
+        retry_name = marker.get("retry_job_name")
+        resource_id = marker.get("retry_resource_id")
+        retry_batch = marker.get("retry_batch")
+        expected_retry_name = (
+            f"{retry_base}-{retry_batch[:12]}"
+            if isinstance(retry_batch, str)
+            and re.fullmatch(r"[0-9a-f]{32}", retry_batch)
+            else retry_base
+        )
+        if not (
+            isinstance(retry_name, str)
+            and Path(retry_name).name == retry_name
+            and retry_name == expected_retry_name
+            and isinstance(resource_id, str)
+            and Path(resource_id).name == resource_id
+            and "__" in resource_id
+        ):
+            remaining.append(marker)
+            continue
+        retry_root = (jobs_root / retry_name).resolve()
+        folder = (retry_root / resource_id).resolve()
+        if (
+            retry_root.parent != jobs_root
+            or folder.parent != retry_root
+            or not folder.is_dir()
+        ):
+            remaining.append(marker)
+            continue
+        mapping[marker["id"]] = {
+            "folder": folder,
+            "trial": _trial(
+                folder,
+                include_patch=include_patches,
+                expected_tasks=expected_tasks,
+            ),
+        }
+
+    retry_root = jobs_root / retry_base
+    if not remaining or not retry_root.is_dir():
+        return mapping
+    live_entries = [
+        {
+            "folder": folder,
+            "trial": _trial(
+                folder,
+                include_patch=include_patches,
+                expected_tasks=expected_tasks,
+            ),
+        }
+        for folder in sorted(
+            (path for path in retry_root.iterdir() if path.is_dir() and "__" in path.name),
+            key=lambda path: path.name,
+        )
+    ]
+    markers_by_task: dict[str, list[dict]] = {}
+    live_by_task: dict[str, list[dict]] = {}
+    for marker in remaining:
+        markers_by_task.setdefault(marker["task"], []).append(marker)
+    for entry in live_entries:
+        live_by_task.setdefault(entry["trial"]["task"], []).append(entry)
+
+    for task, task_markers in markers_by_task.items():
+        task_markers.sort(key=lambda trial: (trial.get("attempt") or 0, trial["id"]))
+        task_live = sorted(
+            live_by_task.get(task, []),
+            key=lambda entry: (
+                entry["trial"].get("started_at") is None,
+                str(entry["trial"].get("started_at") or ""),
+                entry["trial"]["id"],
+            ),
+        )
+        for marker, entry in zip(task_markers, task_live):
+            mapping[marker["id"]] = entry
+    return mapping
+
+def _retry_markers(run: Run, expected_tasks: list[str]) -> list[dict]:
+    root = jobs_root_for(run) / run.job_name
+    if not root.is_dir():
+        return []
+    return [
+        marker
+        for marker in (
+            _trial(folder, include_patch=False, expected_tasks=expected_tasks)
+            for folder in root.iterdir()
+            if folder.is_dir() and "__" in folder.name
+        )
+        if marker.get("retrying")
+    ]
+
 def trial_detail(run: Run, trial_id: str) -> dict | None:
     summary = next((trial for trial in run_detail(run, include_patches=False)["trials"] if trial["id"] == trial_id), None)
     if not summary:
         return None
+    if summary.get("retrying"):
+        expected_tasks = json.loads(run.tasks_json)
+        live = _retry_live_entries(
+            run,
+            _retry_markers(run, expected_tasks),
+            expected_tasks,
+            include_patches=True,
+        ).get(trial_id)
+        if not live:
+            return summary
+        detailed = live["trial"]
+        for key in (
+            "id", "task", "task_slug", "task_number", "task_code", "task_title",
+            "attempt", "run_code", "trial_code", "retrying", "replaced",
+            "retry_batch", "retry_job_name", "retry_resource_id",
+        ):
+            detailed[key] = summary.get(key)
+        detailed["resource_name"] = live["folder"].name
+        return detailed
     folder = trial_folder(run, trial_id)
     if not folder:
         return summary
@@ -253,8 +448,27 @@ def trial_log(run: Run, trial_id: str) -> str:
     folder = trial_folder(run, trial_id)
     if not folder:
         return ""
+    expected_tasks = json.loads(run.tasks_json)
+    marker = _trial(folder, include_patch=False, expected_tasks=expected_tasks)
+    if marker.get("retrying"):
+        live = _retry_live_entries(
+            run,
+            _retry_markers(run, expected_tasks),
+            expected_tasks,
+            include_patches=False,
+        ).get(trial_id)
+        if live:
+            folder = live["folder"]
     candidates = [folder / "trial.log", folder / "agent" / "codex.txt", folder / "agent" / "claude-code.txt", folder / "agent" / "mini-swe-agent.txt", folder / "verifier" / "run.log"]
-    return redact("\n\n".join(p.read_text(encoding="utf-8", errors="replace") for p in candidates if p.exists()), current_secrets())[-300000:]
+    chunks = []
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+    return redact("\n\n".join(chunks), current_secrets())[-300000:]
 
 def run_detail(run: Run, include_patches: bool = True) -> dict:
     root = jobs_root_for(run) / run.job_name
@@ -275,14 +489,6 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
         "interrupted": ("interrupted", "RunInterrupted", "Run 被中断，Trial 未完成"),
         "completed": ("failed", "ResultMissing", "Run 已结束，但 Trial 结果缺失"),
     }
-    if run.status in terminal_defaults:
-        status, failure_type, default_message = terminal_defaults[run.status]
-        for trial in trials:
-            if trial["status"] not in TRIAL_TERMINAL_STATES:
-                trial["status"] = status
-                trial["failure_type"] = trial.get("failure_type") or failure_type
-                trial["failure_message"] = trial.get("failure_message") or run.error or default_message
-                trial["failure_summary"] = f"{trial['failure_type']}: {trial['failure_message']}"[:320]
     # result.json 尚未写出时 trial 任务名回退到目录名（32 字符截断），归一回全名，
     # 否则占位补齐会产生幽灵 trial、compare 出现假任务行
     prefix_map = {}
@@ -293,15 +499,75 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
             full = prefix_map.get(trial["task"])
             if full:
                 trial.update(task_identity(full))
+    retry_markers = [trial for trial in trials if trial.get("retrying")]
+    live_entries = _retry_live_entries(
+        run,
+        retry_markers,
+        expected_tasks,
+        include_patches,
+    )
+    for marker in retry_markers:
+        entry = live_entries.get(marker["id"])
+        if not entry:
+            continue
+        preserved = {
+            key: marker.get(key)
+            for key in (
+                "id", "task", "task_slug", "task_number", "task_code",
+                "task_title", "attempt", "retrying", "replaced",
+                "retry_batch", "retry_job_name", "retry_resource_id",
+            )
+        }
+        marker.update(entry["trial"])
+        marker.update(preserved)
+    if run.status in terminal_defaults:
+        status, failure_type, default_message = terminal_defaults[run.status]
+        for trial in trials:
+            if trial["status"] not in TRIAL_TERMINAL_STATES:
+                trial["status"] = status
+                trial["failure_type"] = trial.get("failure_type") or failure_type
+                trial["failure_message"] = trial.get("failure_message") or run.error or default_message
+                trial["failure_summary"] = f"{trial['failure_type']}: {trial['failure_message']}"[:320]
     for task in expected_tasks:
-        task_trials = [trial for trial in trials if trial["task"] == task]
+        task_trials = sorted(
+            (trial for trial in trials if trial["task"] == task),
+            key=lambda trial: (
+                trial.get("started_at") is None,
+                str(trial.get("started_at") or ""),
+                trial["id"],
+            ),
+        )
         available_attempts = [
             attempt for attempt in range(1, run.attempts_per_task + 1)
             if (task, attempt) not in deleted_attempts
         ]
-        for index, trial in enumerate(task_trials):
-            trial["attempt"] = available_attempts[index] if index < len(available_attempts) else run.attempts_per_task + index + 1
-        for attempt in available_attempts[len(task_trials):]:
+        claimed_attempts: set[int] = set()
+        unassigned = []
+        for trial in task_trials:
+            attempt = trial.get("attempt")
+            if isinstance(attempt, int) and attempt > 0 and attempt not in claimed_attempts:
+                claimed_attempts.add(attempt)
+            else:
+                trial.pop("attempt", None)
+                unassigned.append(trial)
+        remaining_attempts = [
+            attempt for attempt in available_attempts if attempt not in claimed_attempts
+        ]
+        next_extra_attempt = max(
+            [run.attempts_per_task, *claimed_attempts],
+            default=run.attempts_per_task,
+        ) + 1
+        for trial in unassigned:
+            if remaining_attempts:
+                attempt = remaining_attempts.pop(0)
+            else:
+                attempt = next_extra_attempt
+                next_extra_attempt += 1
+            trial["attempt"] = attempt
+            claimed_attempts.add(attempt)
+        for attempt in available_attempts:
+            if attempt in claimed_attempts:
+                continue
             if run.status in terminal_defaults:
                 status, failure_type, default_message = terminal_defaults[run.status]
                 failure_message = run.error or default_message
@@ -315,6 +581,7 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
                 "reported_cost_usd": None, "steps": None, "patch": "", "patch_bytes": 0,
                 "failure_type": failure_type, "failure_message": failure_message,
                 "failure_summary": f"{failure_type}: {failure_message}"[:320] if failure_type and failure_message else failure_type,
+                "retrying": False, "replaced": False,
             })
     task_order = {task: index for index, task in enumerate(expected_tasks)}
     trials.sort(key=lambda trial: (task_order.get(trial["task"], len(task_order)), trial.get("attempt", 0), trial["id"]))
@@ -328,7 +595,15 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
     )
     stage = run.status if run.status in terminal_defaults else next((t["status"] for t in trials if t["status"] not in {"queued", "completed", "failed"}), run.status)
     total = len(trials)
-    if deleted_entries:
+    configured_visible_total = max(
+        len(expected_tasks) * run.attempts_per_task - len(deleted_entries), 0
+    )
+    has_targeted_retries = (
+        len(trial_folders) > configured_visible_total
+        or any(trial.get("retry_of") for trial in trials)
+        or any(trial.get("retrying") or trial.get("replaced") for trial in trials)
+    )
+    if deleted_entries or has_targeted_retries:
         def visible_total(field: str):
             values = [trial.get(field) for trial in trials if trial.get(field) is not None]
             return sum(values) if values else None
@@ -391,20 +666,23 @@ def run_task_progress(run: Run) -> dict:
     return {"passed": sum(task in passed_tasks for task in remaining_tasks), "total": len(remaining_tasks)}
 
 def run_trial_progress(run: Run) -> dict:
-    """Return configured Trial-level progress for lightweight run history rows."""
+    """Return Trial-level progress, including in-place targeted replacements."""
     expected_tasks = json.loads(run.tasks_json)
     deleted_ids = {item["id"] for item in deleted_trial_entries(run)}
-    total = max(len(expected_tasks) * run.attempts_per_task - len(deleted_ids), 0)
+    configured_total = max(len(expected_tasks) * run.attempts_per_task - len(deleted_ids), 0)
     root = jobs_root_for(run) / run.job_name
     passed = 0
     completed = 0
+    actual = 0
     if root.exists():
         for folder in (p for p in root.iterdir() if p.is_dir() and "__" in p.name and p.name not in deleted_ids):
+            actual += 1
             result_path = folder / "result.json"
             data = _json(result_path)
             reward = ((data.get("verifier_result") or {}).get("rewards") or {}).get("reward")
             passed += reward == 1
             completed += result_path.exists()
+    total = max(configured_total, actual)
     if run.status in {"failed", "cancelled", "interrupted", "completed"}:
         completed = total
     completed = min(completed, total)
@@ -413,6 +691,83 @@ def run_trial_progress(run: Run) -> dict:
         "total": total,
         "passed": passed,
         "percent": round(completed / total * 100) if total else 0,
+    }
+
+def aggregate_trial_results(run: Run) -> dict:
+    """Aggregate persisted Trial result files, including targeted replacements."""
+    root = jobs_root_for(run) / run.job_name
+    deleted_entries = deleted_trial_entries(run)
+    deleted_ids = {item["id"] for item in deleted_entries}
+    expected_tasks = json.loads(run.tasks_json)
+    deleted_per_task: dict[str, int] = {}
+    for item in deleted_entries:
+        deleted_per_task[item["task"]] = deleted_per_task.get(item["task"], 0) + 1
+    rewards: list[float] = []
+    input_tokens: list[int] = []
+    cached_tokens: list[int] = []
+    output_tokens: list[int] = []
+    costs: list[float] = []
+    trial_count = 0
+    result_count = 0
+    errored = 0
+    result_rows: list[tuple[str, bool, str | None]] = []
+    results_per_task: dict[str, int] = {}
+
+    if root.exists():
+        for folder in (
+            path for path in root.iterdir()
+            if path.is_dir() and "__" in path.name and path.name not in deleted_ids
+        ):
+            trial_count += 1
+            result_path = folder / "result.json"
+            data = _json(result_path)
+            if not data:
+                continue
+            result_count += 1
+            has_error = bool(data.get("exception_info"))
+            errored += has_error
+            retry_of = data.get("deepswe_retry_of")
+            result_rows.append((folder.name, has_error, retry_of if isinstance(retry_of, str) else None))
+            task = _canonical_task_name(folder, data, expected_tasks)
+            results_per_task[task] = results_per_task.get(task, 0) + 1
+            reward = ((data.get("verifier_result") or {}).get("rewards") or {}).get("reward")
+            if isinstance(reward, (int, float)) and not isinstance(reward, bool):
+                rewards.append(float(reward))
+            agent = data.get("agent_result") or {}
+            for values, key in (
+                (input_tokens, "n_input_tokens"),
+                (cached_tokens, "n_cache_tokens"),
+                (output_tokens, "n_output_tokens"),
+                (costs, "cost_usd"),
+            ):
+                value = agent.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    values.append(value)
+
+    superseded_ids = {retry_of for _trial_id, _error, retry_of in result_rows if retry_of}
+    effective_errored = sum(
+        has_error for trial_id, has_error, _retry_of in result_rows
+        if trial_id not in superseded_ids
+    )
+    missing_configured = sum(
+        max(
+            run.attempts_per_task - deleted_per_task.get(task, 0) - results_per_task.get(task, 0),
+            0,
+        )
+        for task in expected_tasks
+    )
+    return {
+        "trial_count": trial_count,
+        "result_count": result_count,
+        "errored": errored,
+        "effective_errored": effective_errored,
+        "missing_configured": missing_configured,
+        "reward": sum(rewards) / len(rewards) if rewards else None,
+        "passed": bool(trial_count) and len(rewards) == trial_count and all(value == 1 for value in rewards),
+        "input_tokens": sum(input_tokens) if input_tokens else None,
+        "cached_tokens": sum(cached_tokens) if cached_tokens else None,
+        "output_tokens": sum(output_tokens) if output_tokens else None,
+        "cost_usd": sum(costs) if costs else None,
     }
 
 def list_details() -> list[dict]:
@@ -522,14 +877,19 @@ def _regression_reasons(current: dict, baseline: dict) -> list[str]:
     """Plan §18 的五条告警规则。"""
     reasons = []
     current_rate, baseline_rate = _pass_rate(current), _pass_rate(baseline)
-    if baseline_rate - current_rate >= 4 / 28:
+    baseline_trials = sum(
+        trial.get("reward") is not None for trial in baseline.get("trials", [])
+    )
+    significant_losses = max(1, round(baseline_trials / 7)) if baseline_trials else 1
+    if baseline_trials and baseline_rate - current_rate >= significant_losses / baseline_trials:
         reasons.append(f"总通过率下降 {(baseline_rate - current_rate) * 100:.1f} 个百分点")
     base_tasks, current_tasks = _task_pass_rates(baseline), _task_pass_rates(current)
     collapsed = sum(
         1 for task, base_value in base_tasks.items()
         if base_value >= .75 and current_tasks.get(task) is not None and current_tasks[task] <= .25
     )
-    if collapsed >= 2:
+    collapse_threshold = max(1, round(len(base_tasks) * 2 / 7)) if base_tasks else 1
+    if collapsed >= collapse_threshold:
         reasons.append(f"{collapsed} 个任务通过率显著下降")
     base_success = [t["duration_seconds"] for t in baseline["trials"] if t.get("reward") == 1 and t.get("duration_seconds")]
     current_success = [t["duration_seconds"] for t in current["trials"] if t.get("reward") == 1 and t.get("duration_seconds")]

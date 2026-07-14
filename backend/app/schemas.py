@@ -19,11 +19,6 @@ class RunDraft(BaseModel):
     concurrency: int = Field(2, ge=1, le=MAX_CONCURRENCY_PER_RUN)
     parallel_agent_count: int = Field(1, ge=1, le=MAX_PARALLEL_AGENT_COUNT)
     confirm_high_concurrency: bool = False
-    agent_timeout_seconds: int = Field(5400, ge=60, le=21600)
-    verifier_timeout_seconds: int = Field(1800, ge=60, le=7200)
-    retry_infrastructure_errors: bool = True
-    infrastructure_max_retries: int = Field(4, ge=0, le=6)
-    agent_max_steps: int = Field(120, ge=10, le=500)
     codex_request_max_retries: int = Field(6, ge=0, le=10)
     codex_stream_max_retries: int = Field(6, ge=0, le=10)
     codex_stream_idle_timeout_seconds: int = Field(600, ge=30, le=1800)
@@ -37,6 +32,10 @@ class SettingsUpdate(BaseModel):
     default_model: str | None = None
     default_effort: Effort | None = None
     default_concurrency: int | None = Field(None, ge=1, le=MAX_CONCURRENCY_PER_RUN)
+    agent_timeout_seconds: int | None = Field(None, ge=60, le=21600)
+    verifier_timeout_seconds: int | None = Field(None, ge=60, le=7200)
+    infrastructure_max_retries: int | None = Field(None, ge=0, le=6)
+    agent_max_steps: int | None = Field(None, ge=10, le=500)
     docker_cleanup_after_run: bool | None = None
     docker_cleanup_on_delete: bool | None = None
     docker_cache_retention_hours: int | None = Field(None, ge=1, le=24 * 365)
@@ -52,6 +51,9 @@ class CompareRequest(BaseModel):
 
 class CompareAnalysisRequest(BaseModel):
     items: list[str] = Field(default_factory=list)
+
+class RetryTrialsDraft(BaseModel):
+    trial_ids: list[str] = Field(min_length=1, max_length=1000)
 
 class RestorePayload(BaseModel):
     version: int
