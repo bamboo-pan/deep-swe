@@ -3,13 +3,14 @@ import csv
 import io
 import json
 import os
+import re
 import shutil
 import time
 import tomllib
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -29,6 +30,9 @@ from .models import ACTIVE_STATES, TERMINAL_STATES, Baseline, Run, Setting
 from .official_stats import load_official_stats, official_stats_meta, sync_official_stats
 from .preferences import KEYS as PREFERENCE_KEYS, get_preferences, update_preferences
 from .pricing import pricing_meta, sync_pricing
+from .provider_proxy import (
+    forward_provider_request, latest_limit_event, provider_queue_status,
+)
 from .provider_catalog import EFFORT_ORDER, get_provider_catalog
 from .results import (
     compare_runs, deleted_trial_entries, jobs_root_for, list_details, parse_timestamp,
@@ -228,6 +232,16 @@ def start_run_batch(draft: RunBatchDraft):
 
 @app.get("/api/runs")
 def runs(): return list_runs()
+
+@app.get("/api/provider/status")
+def provider_status(): return provider_queue_status()
+
+@app.api_route(
+    "/api/provider/{path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+async def provider_proxy(request: Request, path: str):
+    return await forward_provider_request(request, path)
 
 @app.get("/api/runs/{run_id}")
 def run_detail(run_id:int):
@@ -440,6 +454,77 @@ def _run_fingerprint(run: Run) -> tuple:
                 parts.append(f"{trial.name}/{marker}:{_stage_marker_signature(trial / marker)}")
     return tuple(parts)
 
+
+_PROVIDER_COOLDOWN_RE = re.compile(
+    r'"code"\s*:\s*"model_cooldown".*?'
+    r'"model"\s*:\s*"(?P<model>[^"]+)".*?'
+    r'"provider"\s*:\s*"(?P<provider>[^"]+)".*?'
+    r'"reset_seconds"\s*:\s*(?P<seconds>\d+)',
+    re.IGNORECASE,
+)
+_PROVIDER_RATE_LIMIT_RE = re.compile(
+    r"(?:RateLimitError|429 Too Many Requests|rate limit exceeded)",
+    re.IGNORECASE,
+)
+
+
+def _tail_text_file(path: Path, limit: int = 96_000) -> str:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(size - limit, 0))
+            return handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _provider_limit_alert(run: Run) -> dict | None:
+    """Return a short-lived, redacted alert for the newest provider limit event."""
+    if event := latest_limit_event():
+        return event
+    root = jobs_root_for(run) / run.job_name
+    candidates = [root / "job.log", jobs_root_for(run) / f"{run.job_name}.supervisor.log"]
+    if root.is_dir():
+        candidates.extend(root.glob("*/agent/*.txt"))
+    recent = []
+    for path in candidates:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        recent.append((stat.st_mtime, stat.st_mtime_ns, path))
+    for modified, modified_ns, path in sorted(recent, reverse=True):
+        text = _tail_text_file(path)
+        cooldowns = list(_PROVIDER_COOLDOWN_RE.finditer(text))
+        if cooldowns:
+            match = cooldowns[-1]
+            seconds = int(match.group("seconds"))
+            if time.time() - modified > max(seconds + 60, 180):
+                continue
+            provider = match.group("provider")
+            model = match.group("model")
+            reset_bucket = round((modified + seconds) / 30)
+            return {
+                "key": f"{run.id}:cooldown:{provider}:{model}:{reset_bucket}",
+                "kind": "provider_rate_limit",
+                "message": (
+                    f"Provider {provider} 对模型 {model} 触发冷却，"
+                    f"预计约 {seconds} 秒后恢复；当前请求可能自动重试。"
+                ),
+                "reset_seconds": seconds,
+            }
+        if _PROVIDER_RATE_LIMIT_RE.search(text):
+            if time.time() - modified > 180:
+                continue
+            return {
+                "key": f"{run.id}:rate-limit:{modified_ns // 60_000_000_000}",
+                "kind": "provider_rate_limit",
+                "message": "Provider 返回请求限速，当前请求可能自动重试，请检查 RPM 和并发设置。",
+                "reset_seconds": None,
+            }
+    return None
+
 @app.get("/api/runs/{run_id}/events")
 async def run_events(run_id:int):
     if not get_run(run_id): raise HTTPException(404,"run not found")
@@ -453,6 +538,7 @@ async def run_events(run_id:int):
             if fingerprint != last_fingerprint:
                 last_fingerprint = fingerprint
                 detail = parsed_run_detail(row, include_patches=False)
+                detail["provider_alert"] = _provider_limit_alert(row)
                 payload = json.dumps(detail, default=str, ensure_ascii=False)
                 if payload != last_payload:
                     yield f"data: {payload}\n\n"; last_payload = payload

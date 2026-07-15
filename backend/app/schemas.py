@@ -40,6 +40,7 @@ class SettingsUpdate(BaseModel):
     default_model: str | None = None
     default_effort: Effort | None = None
     max_parallel_tasks: int | None = Field(None, ge=1, le=MAX_PARALLEL_TASKS)
+    provider_rpm: int | None = Field(None, ge=0, le=100000)
     agent_timeout_seconds: int | None = Field(None, ge=60, le=21600)
     verifier_timeout_seconds: int | None = Field(None, ge=60, le=7200)
     infrastructure_max_retries: int | None = Field(None, ge=0, le=6)

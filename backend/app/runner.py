@@ -85,6 +85,10 @@ def _anthropic_url(url: str) -> str:
     mapped = _docker_url(url).rstrip("/")
     return mapped[:-3] if mapped.endswith("/v1") else mapped
 
+
+def _provider_proxy_url() -> str:
+    return _docker_url("http://127.0.0.1:8765/api/provider")
+
 def _docker_proxy_connectivity(url: str) -> None:
     """Verify the proxy from the same dual-network topology used by Pier."""
     parsed = urlparse(_docker_url(url))
@@ -647,7 +651,7 @@ def _execute(run_id: int):
             jobs_root = jobs_root_for(run)
         _verify_global_queue_patch(run_id)
         cred = read_credential(credential_path())
-        _preflight(tasks, cred.url)
+        _preflight(tasks, _provider_proxy_url())
         secret_dir, auth = _write_secret_auth(cred.token)
         command_model = f"openai/{model}" if agent == "mini-swe-agent" and "/" not in model else model
         agent_divisor, verifier_divisor = _declared_timeouts(tasks)
@@ -670,14 +674,14 @@ def _execute(run_id: int):
             trial_budget = 0.0
         if agent == "codex":
             config = _codex_config(
-                cred.url, secret_dir, model, effort,
+                _provider_proxy_url(), secret_dir, model, effort,
                 request_max_retries=run.codex_request_max_retries,
                 stream_max_retries=run.codex_stream_max_retries,
                 stream_idle_timeout_seconds=run.codex_stream_idle_timeout_seconds,
             )
             args += ["--agent-env", f"CODEX_AUTH_JSON_PATH={auth}", "--agent-kwarg", f"config_toml_file={config}", "--agent-kwarg", f"reasoning_effort={effort}"]
         elif agent == "mini-swe-agent":
-            process_env.update({"OPENAI_API_KEY": cred.token, "OPENAI_BASE_URL": _docker_url(cred.url)})
+            process_env.update({"OPENAI_API_KEY": cred.token, "OPENAI_BASE_URL": _provider_proxy_url()})
             limits = _mini_limits_config(secret_dir, run.agent_max_steps, effort)
             # litellm_response（Responses API 桥）顶层 import litellm.proxy，
             # 需要完整 proxy extras（fastapi/orjson/pyjwt 等），agent 容器默认没装
@@ -687,7 +691,7 @@ def _execute(run_id: int):
                 # mini 原生单 Trial 费用限额（agent.cost_limit，0 = 禁用），到限优雅停止
                 args += ["--agent-kwarg", f"cost_limit={trial_budget}"]
         elif agent == "claude-code":
-            process_env.update({"ANTHROPIC_API_KEY": cred.token, "ANTHROPIC_BASE_URL": _anthropic_url(cred.url)})
+            process_env.update({"ANTHROPIC_API_KEY": cred.token, "ANTHROPIC_BASE_URL": _provider_proxy_url()})
             # 覆盖 pier 默认的 disallowed_tools=EnterPlanMode，追加 Task/Agent 禁用容器内 subagent：
             # 2026-07-12 事故中主 agent 43 分钟 spawn 2687 个 subagent（6663 万输入 token），
             # max_turns 只约束主对话轮数，对 subagent 无效
@@ -970,7 +974,7 @@ def _prepare_retry_config(
         if run.agent == "mini-swe-agent":
             process_env.update({
                 "OPENAI_API_KEY": credential.token,
-                "OPENAI_BASE_URL": _docker_url(credential.url),
+                "OPENAI_BASE_URL": _provider_proxy_url(),
             })
             kwargs["config_file"] = str(
                 _mini_limits_config(secret_dir, run.agent_max_steps, run.reasoning_effort)
@@ -981,7 +985,7 @@ def _prepare_retry_config(
                 kwargs.pop("cost_limit", None)
         elif run.agent == "codex":
             kwargs["config_toml_file"] = str(_codex_config(
-                credential.url,
+                _provider_proxy_url(),
                 secret_dir,
                 run.model,
                 run.reasoning_effort,
@@ -994,7 +998,7 @@ def _prepare_retry_config(
         elif run.agent == "claude-code":
             process_env.update({
                 "ANTHROPIC_API_KEY": credential.token,
-                "ANTHROPIC_BASE_URL": _anthropic_url(credential.url),
+                "ANTHROPIC_BASE_URL": _provider_proxy_url(),
             })
             kwargs["max_turns"] = run.agent_max_steps
             if trial_budget > 0:
@@ -1467,7 +1471,7 @@ def _execute_retry(run_id: int, specs: list[dict], batch_id: str) -> None:
             )
 
         credential = read_credential(credential_path())
-        _preflight(list(dict.fromkeys(spec["task"] for spec in specs)), credential.url)
+        _preflight(list(dict.fromkeys(spec["task"] for spec in specs)), _provider_proxy_url())
         secret_dir, auth_path = _write_secret_auth(credential.token)
         config_path, process_env = _prepare_retry_config(
             run, specs, credential, secret_dir, auth_path, jobs_root, preferences

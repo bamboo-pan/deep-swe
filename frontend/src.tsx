@@ -71,6 +71,14 @@ type QueueStatus = {
   available: number;
   total: number;
 };
+type ProviderQueueStatus = {
+  enabled: boolean;
+  rpm: number;
+  sent_last_60_seconds: number;
+  queued_requests: number;
+  available_now: number | null;
+  next_release_seconds: number;
+};
 type QueueAdmission = QueueStatus & {
   requested_trials: number;
   immediate_trials: number;
@@ -160,6 +168,12 @@ type Run = {
   uncached_input_tokens?: number;
   output_tokens?: number;
   error?: string;
+  provider_alert?: {
+    key: string;
+    kind: "provider_rate_limit";
+    message: string;
+    reset_seconds?: number | null;
+  } | null;
 };
 type TaskInfo = {
   id: string;
@@ -183,6 +197,7 @@ type Prefs = {
   default_model: string;
   default_effort: string;
   max_parallel_tasks: number;
+  provider_rpm: number;
   agent_timeout_seconds: number;
   verifier_timeout_seconds: number;
   infrastructure_max_retries: number;
@@ -390,6 +405,7 @@ function App() {
   const [checks, setChecks] = useState<Check[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
   const [scheduler, setScheduler] = useState<QueueStatus>();
+  const [providerQueue, setProviderQueue] = useState<ProviderQueueStatus>();
   const [tab, setTab] = useState("dashboard");
   const [navigationCollapsed, setNavigationCollapsed] = useState(
     () => localStorage.getItem("deepswe-navigation-collapsed") === "true",
@@ -406,6 +422,7 @@ function App() {
   const [tasks, setTasks] = useState<TaskInfo[]>([]);
   const [prefs, setPrefs] = useState<Prefs>();
   const [notice, setNotice] = useState("");
+  const providerAlertKey = useRef("");
   const [starting, setStarting] = useState(false);
   const [agent, setAgent] = useState("mini-swe-agent");
   const [allAgents, setAllAgents] = useState(false);
@@ -423,10 +440,12 @@ function App() {
     Promise.all([
       request<Run[]>("/api/runs"),
       request<QueueStatus>("/api/scheduler"),
+      request<ProviderQueueStatus>("/api/provider/status"),
     ])
-      .then(([nextRuns, nextScheduler]) => {
+      .then(([nextRuns, nextScheduler, nextProviderQueue]) => {
         setRuns(nextRuns);
         setScheduler(nextScheduler);
+        setProviderQueue(nextProviderQueue);
       })
       .catch(() => {});
   const refreshCompareRuns = () =>
@@ -443,6 +462,17 @@ function App() {
       .then((x) => setChecks(x.checks))
       .catch(() => {});
   };
+  const showProviderAlert = (run: Run) => {
+    const alert = run.provider_alert;
+    if (!alert || alert.key === providerAlertKey.current) return;
+    providerAlertKey.current = alert.key;
+    setNotice(alert.message);
+  };
+  useEffect(() => {
+    if (!notice) return;
+    const timer = setTimeout(() => setNotice(""), 7000);
+    return () => clearTimeout(timer);
+  }, [notice]);
   useEffect(() => {
     localStorage.setItem(
       "deepswe-navigation-collapsed",
@@ -479,7 +509,8 @@ function App() {
         .then((d) => {
           if (closed) return; // 快速切换运行时丢弃过期响应
           latestStatus = d.status;
-        setDetail(terminal.has(d.status) && tab === "live" ? null : d);
+          showProviderAlert(d);
+          setDetail(terminal.has(d.status) && tab === "live" ? null : d);
         })
         .catch(() => {});
     const connect = () => {
@@ -488,6 +519,7 @@ function App() {
       source.onmessage = (e) => {
         const next = JSON.parse(e.data);
         latestStatus = next.status;
+        showProviderAlert(next);
         setDetail(terminal.has(next.status) && tab === "live" ? null : next);
         refreshRuns();
         if (terminal.has(next.status)) source?.close();
@@ -673,6 +705,8 @@ function App() {
     if (!prefs) return;
     if (!Number.isInteger(prefs.max_parallel_tasks) || prefs.max_parallel_tasks < 1 || prefs.max_parallel_tasks > 72)
       return setNotice("最大并行 Task 数需为 1-72 的整数");
+    if (!Number.isInteger(prefs.provider_rpm) || prefs.provider_rpm < 0 || prefs.provider_rpm > 100000)
+      return setNotice("Provider RPM 需为 0-100000 的整数，0 表示禁用");
     if (!Number.isInteger(prefs.agent_timeout_seconds) || prefs.agent_timeout_seconds < 60 || prefs.agent_timeout_seconds > 21600)
       return setNotice("Agent 超时需为 60-21600 秒");
     if (!Number.isInteger(prefs.verifier_timeout_seconds) || prefs.verifier_timeout_seconds < 60 || prefs.verifier_timeout_seconds > 7200)
@@ -1167,6 +1201,7 @@ function App() {
             runs={runs}
             detail={detail && !terminal.has(detail.status) ? detail : null}
             scheduler={scheduler}
+            providerQueue={providerQueue}
             selectRun={(id) => {
               // 切换 Agent 视图时清掉上一个运行的 Trial 详情，防止 A 的 patch 挂在 B 下
               setSelectedRun(id);
@@ -1280,10 +1315,50 @@ function Dashboard({
     </>
   );
 }
+function ProviderQueue({ status }: { status?: ProviderQueueStatus }) {
+  if (!status) {
+    return <section className="panel providerqueue loading">正在读取 Provider 请求队列…</section>;
+  }
+  const saturated = status.enabled && status.available_now === 0;
+  const state = !status.enabled
+    ? "未启用 RPM 限速"
+    : status.queued_requests > 0
+      ? `排队中 · 约 ${Math.ceil(status.next_release_seconds)} 秒后放行`
+      : saturated
+        ? `窗口已满 · 约 ${Math.ceil(status.next_release_seconds)} 秒后恢复额度`
+        : "可立即发送";
+  const percent = status.enabled && status.rpm > 0
+    ? Math.min(status.sent_last_60_seconds / status.rpm * 100, 100)
+    : 0;
+  return (
+    <section className={`panel providerqueue ${status.queued_requests ? "waiting" : saturated ? "saturated" : "ready"}`}>
+      <div className="providerqueuehead">
+        <div>
+          <span className="providerqueuedot" />
+          <b>Provider 请求队列</b>
+        </div>
+        <strong>{state}</strong>
+      </div>
+      <div className="providerqueuemetrics">
+        <span><small>RPM 上限</small><b>{status.enabled ? status.rpm : "∞"}</b></span>
+        <span><small>过去 60 秒</small><b>{status.sent_last_60_seconds}</b></span>
+        <span><small>等待请求</small><b>{status.queued_requests}</b></span>
+        <span><small>当前可用</small><b>{status.available_now ?? "∞"}</b></span>
+        <span><small>下次放行</small><b>{status.next_release_seconds > 0 ? `${Math.ceil(status.next_release_seconds)}s` : "NOW"}</b></span>
+      </div>
+      {status.enabled && (
+        <div className="providerqueuebar" aria-label={`过去 60 秒已使用 ${status.sent_last_60_seconds}/${status.rpm}`}>
+          <span style={{ width: `${percent}%` }} />
+        </div>
+      )}
+    </section>
+  );
+}
 function Live({
   runs,
   detail,
   scheduler,
+  providerQueue,
   selectRun,
   cancel,
   openTrial,
@@ -1293,16 +1368,23 @@ function Live({
   runs: Run[];
   detail: Run | null;
   scheduler?: QueueStatus;
+  providerQueue?: ProviderQueueStatus;
   selectRun: (id: number) => void;
   cancel: () => void;
   openTrial: (t: Trial) => void;
   activeTrial: Trial | null;
   trialLog: string;
 }) {
-  if (!detail) return <Empty text="创建或选择一次运行后，这里显示实时进度。" />;
+  if (!detail) return (
+    <>
+      <ProviderQueue status={providerQueue} />
+      <Empty text="创建或选择一次运行后，这里显示实时进度。" />
+    </>
+  );
   const active = runs.filter((r) => !terminal.has(r.status));
   return (
     <>
+      <ProviderQueue status={providerQueue} />
       {active.length > 1 && (
         <section className="panel liveswitch">
           <b>正在运行 {active.length} 个 Agent</b>
@@ -2404,6 +2486,19 @@ function Settings({
               value={prefs.max_parallel_tasks}
               onChange={(e) =>
                 setPrefs({ ...prefs, max_parallel_tasks: +e.target.value })
+              }
+            />
+          </label>
+          <label title="所有 Agent 模型请求共用滚动 60 秒窗口；窗口未满时立即放行，达到 RPM 后等待最早请求移出窗口。0 表示禁用限速。">
+            Provider RPM（0 禁用）
+            <input
+              type="number"
+              min={0}
+              max={100000}
+              step={1}
+              value={prefs.provider_rpm}
+              onChange={(e) =>
+                setPrefs({ ...prefs, provider_rpm: +e.target.value })
               }
             />
           </label>

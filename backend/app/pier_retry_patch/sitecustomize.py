@@ -6,7 +6,9 @@ import os
 
 from global_queue import release_slot, trial_task_name, try_acquire_slot
 from local_image_retention import preserve_local_prebuilt_image
-from networking import trial_network_subnets
+from networking import (
+    allow_provider_proxy_port, provider_proxy_domains, trial_network_subnets,
+)
 from runtime import install_retry_trial_names, install_safe_metric_display
 from transient import (
     TRANSIENT_EXCEPTION_TYPE,
@@ -26,9 +28,19 @@ def _install_safe_docker_networks() -> None:
     original_write = agent_setup.write_docker_proxy_compose
 
     def write_docker_proxy_compose(*, path, proxy_dir, allowlist, token):
+        # Agent containers only have the internal network and must reach the
+        # host-side DeepSWE provider proxy through Pier's authenticated Squid.
+        # Add the Docker host alias without opening any other destination.
+        allowlist = allowlist.model_copy(update={
+            "domains": provider_proxy_domains(allowlist.domains)
+        })
         result = original_write(
             path=path, proxy_dir=proxy_dir, allowlist=allowlist, token=token
         )
+        squid_script = proxy_dir / "start-squid.sh"
+        squid_text = squid_script.read_text(encoding="utf-8")
+        squid_text = allow_provider_proxy_port(squid_text)
+        squid_script.write_text(squid_text, encoding="utf-8", newline="\n")
         compose = json.loads(path.read_text(encoding="utf-8"))
         internal_subnet, external_subnet = trial_network_subnets(
             str(path.parent.resolve())

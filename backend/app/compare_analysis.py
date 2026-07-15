@@ -1,4 +1,5 @@
 import json
+import time
 from collections import Counter
 from typing import Any
 
@@ -6,6 +7,7 @@ import httpx
 
 from .official_stats import normalize_model_name
 from .preferences import credential_path
+from .provider_proxy import record_limit_event, reserve_provider_request
 from .results import compare_runs
 from .security import read_credential, redact
 
@@ -168,6 +170,9 @@ def analyze_compare_items(items: list[tuple[int, str]]) -> dict:
 
     endpoint = f"{credential.url.rstrip('/')}/responses"
     try:
+        delay = reserve_provider_request()
+        if delay:
+            time.sleep(delay)
         response = httpx.post(
             endpoint,
             headers={
@@ -183,6 +188,8 @@ def analyze_compare_items(items: list[tuple[int, str]]) -> dict:
             },
             timeout=180.0,
         )
+        if getattr(response, "status_code", None) == 429:
+            record_limit_event(response.status_code, response.content)
         response.raise_for_status()
         content = _response_text(response.json())
     except (httpx.HTTPError, json.JSONDecodeError) as exc:

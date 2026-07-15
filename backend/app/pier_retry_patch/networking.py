@@ -7,6 +7,22 @@ import os
 
 DEFAULT_NETWORK_POOL = "10.240.0.0/12"
 TRIAL_NETWORK_PREFIX = 29
+PROVIDER_PROXY_HOST = "host.docker.internal"
+PROVIDER_PROXY_PORT = 8765
+
+
+def provider_proxy_domains(domains: list[str]) -> list[str]:
+    return sorted(set([*domains, PROVIDER_PROXY_HOST]))
+
+
+def allow_provider_proxy_port(squid_config: str) -> str:
+    return squid_config.replace(
+        "acl SSL_ports port 443 9887",
+        f"acl SSL_ports port 443 {PROVIDER_PROXY_PORT} 9887",
+    ).replace(
+        "acl Safe_ports port 80 443 9887",
+        f"acl Safe_ports port 80 443 {PROVIDER_PROXY_PORT} 9887",
+    )
 
 
 def trial_network_subnets(identity: str) -> tuple[str, str]:

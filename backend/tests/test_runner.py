@@ -14,7 +14,10 @@ from app.pier_retry_patch.transient import (
     is_transient_agent_failure,
     retry_transient_verifier,
 )
-from app.pier_retry_patch.networking import DEFAULT_NETWORK_POOL, trial_network_subnets
+from app.pier_retry_patch.networking import (
+    DEFAULT_NETWORK_POOL, allow_provider_proxy_port, provider_proxy_domains,
+    trial_network_subnets,
+)
 from app.pier_retry_patch.runtime import (
     install_retry_trial_names,
     install_safe_metric_display,
@@ -361,6 +364,7 @@ def test_verifier_infrastructure_retry_is_selective_and_bounded():
 def test_runtime_retry_and_agent_limits_live_in_settings():
     update=SettingsUpdate(
         max_parallel_tasks=18,
+        provider_rpm=30,
         agent_timeout_seconds=7200, verifier_timeout_seconds=2400,
         infrastructure_max_retries=4, agent_max_steps=150,
     )
@@ -369,6 +373,7 @@ def test_runtime_retry_and_agent_limits_live_in_settings():
                    codex_stream_idle_timeout_seconds=900)
     assert update.agent_timeout_seconds == 7200
     assert update.max_parallel_tasks == 18
+    assert update.provider_rpm == 30
     assert update.verifier_timeout_seconds == 2400
     assert update.infrastructure_max_retries == 4
     assert update.agent_max_steps == 150
@@ -385,6 +390,17 @@ def test_requested_trial_count_and_concurrency_risk_are_separate():
     assert concurrency_advice(19)["requires_confirmation"] is True
     assert concurrency_advice(72)["level"] == "danger"
     assert concurrency_advice(73)["level"] == "blocked"
+
+
+def test_provider_proxy_is_allowed_through_pier_squid():
+    assert provider_proxy_domains(["api.example.com"]) == [
+        "api.example.com", "host.docker.internal",
+    ]
+    config = allow_provider_proxy_port(
+        "acl SSL_ports port 443 9887\nacl Safe_ports port 80 443 9887\n"
+    )
+    assert "SSL_ports port 443 8765 9887" in config
+    assert "Safe_ports port 80 443 8765 9887" in config
 
 def test_create_runs_queues_agent_group_larger_than_global_limit(monkeypatch):
     class NoopThread:
@@ -507,6 +523,7 @@ def test_global_queue_releases_next_run_when_slot_opens():
             else:
                 db.add(Setting(key="max_parallel_tasks", value=original_limit))
             db.commit()
+
 
 def test_trial_classifies_transient_repository_failure(tmp_path: Path):
     folder=tmp_path/"task-a__x"; folder.mkdir()

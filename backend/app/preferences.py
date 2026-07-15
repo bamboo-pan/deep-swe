@@ -8,7 +8,7 @@ from .schemas import MAX_PARALLEL_AGENT_COUNT, MAX_PARALLEL_TASKS, SettingsUpdat
 from .security import read_credential
 
 CURRENT_KEYS = (
-    "credential_file", "jobs_dir", "default_agent", "default_model", "default_effort", "max_parallel_tasks",
+    "credential_file", "jobs_dir", "default_agent", "default_model", "default_effort", "max_parallel_tasks", "provider_rpm",
     "agent_timeout_seconds", "verifier_timeout_seconds", "infrastructure_max_retries", "agent_max_steps",
     "docker_cleanup_after_run", "docker_cleanup_on_delete", "docker_cache_retention_hours", "docker_cache_warning_gb",
     "run_budget_usd", "trial_budget_usd",
@@ -24,6 +24,7 @@ def _defaults() -> dict:
         "default_model": settings.default_model,
         "default_effort": settings.default_effort,
         "max_parallel_tasks": settings.max_parallel_tasks,
+        "provider_rpm": settings.provider_rpm,
         "agent_timeout_seconds": settings.agent_timeout_seconds,
         "verifier_timeout_seconds": settings.verifier_timeout_seconds,
         "infrastructure_max_retries": settings.infrastructure_max_retries,
@@ -73,6 +74,14 @@ def update_preferences(payload: SettingsUpdate) -> dict:
             legacy = db.get(Setting, "default_concurrency")
             if legacy:
                 db.delete(legacy)
+        if "provider_rpm" in changes:
+            for key in (
+                "_provider_rpm_next_request",
+                "_provider_rpm_request_schedule",
+            ):
+                limiter_state = db.get(Setting, key)
+                if limiter_state:
+                    db.delete(limiter_state)
         db.commit()
     return get_preferences()
 

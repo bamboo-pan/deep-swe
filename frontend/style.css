@@ -283,6 +283,84 @@ h1 {
   color: #6f8e83;
   font: 11px "IBM Plex Mono";
 }
+.providerqueue {
+  display: grid;
+  gap: 14px;
+  padding: 16px 18px;
+  border-color: #245343;
+}
+.providerqueue.loading {
+  color: #789389;
+  font-size: 12px;
+}
+.providerqueuehead,
+.providerqueuehead > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 9px;
+}
+.providerqueuehead b,
+.providerqueuehead strong {
+  font: 600 12px "IBM Plex Mono";
+}
+.providerqueuehead strong {
+  color: #69dcb1;
+}
+.providerqueue.waiting .providerqueuehead strong,
+.providerqueue.saturated .providerqueuehead strong {
+  color: #efb344;
+}
+.providerqueuedot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #32d898;
+  box-shadow: 0 0 8px #32d898;
+}
+.providerqueue.waiting .providerqueuedot,
+.providerqueue.saturated .providerqueuedot {
+  background: #efb344;
+  box-shadow: 0 0 8px #efb344;
+}
+.providerqueuemetrics {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(100px, 1fr));
+  gap: 10px;
+}
+.providerqueuemetrics span {
+  display: grid;
+  gap: 5px;
+  padding: 10px 12px;
+  border: 1px solid #173b30;
+  border-radius: 6px;
+  background: #091713;
+}
+.providerqueuemetrics small {
+  color: #6f8e83;
+  font-size: 10px;
+}
+.providerqueuemetrics b {
+  color: #d7e7e1;
+  font: 600 17px "IBM Plex Mono";
+}
+.providerqueuebar {
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #10251e;
+}
+.providerqueuebar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #2fca91, #efb344);
+  transition: width 0.25s ease;
+}
+@media (max-width: 820px) {
+  .providerqueuemetrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .providerqueuehead { align-items: flex-start; flex-direction: column; }
+}
 .queueusage {
   margin-top: 5px;
   overflow-wrap: anywhere;

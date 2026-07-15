@@ -70,6 +70,25 @@ or later trials do not try to pull that image from a registry. Pier may still
 build the per-agent installation layer on the first run; BuildKit reuses that
 layer on later runs while the agent fingerprint and task base image are unchanged.
 
+### Provider RPM and request queue
+
+The UI can enforce a global Provider RPM limit. Every model HTTP request from
+Codex, Claude Code, and mini-swe-agent is routed through the local DeepSWE
+provider proxy. A shared rolling 60-second window allows requests immediately
+while capacity remains and queues excess requests until the oldest request
+leaves the window. Automatic retries use the same quota.
+
+The Live page shows the configured RPM, requests sent during the last 60
+seconds, queued requests, immediately available capacity, and the next release
+countdown. Provider `429` and `model_cooldown` responses also appear as automatic
+UI notifications.
+
+For network-isolated Pier trials, the agent reaches the host-side proxy through
+Pier's authenticated Squid service. `host.docker.internal` and port `8765` are
+added narrowly to that proxy policy; the task container does not receive general
+internet access. If this exception is missing, Squid returns `ERR_ACCESS_DENIED`
+before the request reaches DeepSWE or the upstream provider.
+
 ## What is Pier
 
 [Pier](https://github.com/datacurve-ai/pier) is a [Harbor](https://www.harborframework.com/docs/tasks)-compatible framework for sandboxed coding-agent evals. It began as a fork of Harbor to support CLI agents in air-gapped tasks: Harbor blocks all outbound traffic in `allow_internet = false` tasks, including dependency installs and LLM API calls. Pier adds per-agent network allowlists, giving agents only the network access they need while keeping the task environment isolated.

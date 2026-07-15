@@ -232,6 +232,22 @@ def test_batch_validation_warns_when_global_slots_are_full(monkeypatch):
                 db.execute(delete(TrialQueueEntry))
                 db.commit()
 
+
+def test_provider_queue_status_endpoint(monkeypatch):
+    from app import main
+
+    expected = {
+        "enabled": True,
+        "rpm": 30,
+        "sent_last_60_seconds": 24,
+        "queued_requests": 6,
+        "available_now": 6,
+        "next_release_seconds": 12.5,
+    }
+    monkeypatch.setattr(main, "provider_queue_status", lambda: expected)
+    with TestClient(app) as client:
+        assert client.get("/api/provider/status").json() == expected
+
 def test_settings_cannot_lower_limit_below_running_trials():
     with TestClient(app) as client:
         with SessionLocal() as db:
@@ -411,6 +427,7 @@ def test_settings_persist_retry_runtime_limits_and_cost_guards(monkeypatch):
     })
     keys = (
         "max_parallel_tasks",
+        "provider_rpm",
         "agent_timeout_seconds", "verifier_timeout_seconds",
         "infrastructure_max_retries", "agent_max_steps",
         "trial_budget_usd", "run_budget_usd",
@@ -419,6 +436,7 @@ def test_settings_persist_retry_runtime_limits_and_cost_guards(monkeypatch):
         original = client.get("/api/settings").json()
         payload = {
             "max_parallel_tasks": 9,
+            "provider_rpm": 30,
             "agent_timeout_seconds": 7200,
             "verifier_timeout_seconds": 2400,
             "infrastructure_max_retries": 2,

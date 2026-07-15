@@ -253,3 +253,14 @@ $env:COMPOSE_BAKE = "false"
 | `test-python-summary-workflow` | 12 | 99,683 / 70,144 / 5,471 | $0.346897 | `Reward=1`，F2P 5/5，P2P 3/3 |
 
 合计费用 `$0.564693`。两个 Trial 都有模型 trajectory、提交记录、`model.patch` 与 verifier `reward.json`，因此可确认是实际模型调用后的端到端通过，不是由参考 Patch 代替。原始产物路径记录在 `PROJECT-PLAN.md` §6.1。
+
+### 9.8 Provider RPM、本地代理与 Pier Squid
+
+- Provider RPM 必须限制实际模型 HTTP 请求，而不是只限制 Trial 启动。Trial 启动限速只能削平第一波请求，无法覆盖 Agent 后续步骤和自动重试。
+- 当前实现使用 SQLite 共享的滚动 60 秒窗口。窗口未满时允许突发请求立即发送，满额后把请求预约到最早可用时间；Codex、Claude Code、mini-swe-agent 和 AI 对比分析共享额度。
+- 请求级代理改变了网络拓扑：Agent 不再直接访问中转 provider，而是访问宿主机 `host.docker.internal:8765/api/provider`，再由 DeepSWE 后端携带原凭据转发到真实 provider。
+- `allow_internet = false` 的 Pier Agent 容器只有 internal network，对外请求必须经过认证 Squid。仅设置 `NO_PROXY=host.docker.internal` 会绕过唯一出口，反而无法到达宿主机。
+- 2026-07-15 的真实故障表现为 Agent 日志返回 Squid `ERR_ACCESS_DENIED`，请求 URL 是 `http://host.docker.internal:8765/api/provider/responses`。根因是 Squid 的 domain allowlist 没有 `host.docker.internal`，且 `Safe_ports` 不包含 8765，请求尚未到达 DeepSWE，更没有到达 provider。
+- 修复必须同时完成两项：把 `host.docker.internal` 加入精确域名白名单，把 8765 加入 Squid 的 `Safe_ports`/`SSL_ports`。这只开放本地 DeepSWE 代理，不扩大其他互联网访问范围。
+- 排障应分三段验证：Docker 到 `host.docker.internal:8765` 的 TCP 连通、本地 DeepSWE 代理到真实 provider 的 HTTP 响应、Pier Squid 对目标域名和端口的 ACL。只做前两段会漏掉本次问题。
+- Live 页应直接显示 RPM、过去 60 秒请求数、等待请求数、当前可用额度和下次放行倒计时；否则用户只能看到 Agent“卡住”，无法区分模型执行、RPM 排队和 provider 冷却。
