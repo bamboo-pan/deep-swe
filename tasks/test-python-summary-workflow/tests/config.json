@@ -1,0 +1,20 @@
+{
+  "base_commit": "4e74fd3c99da38da9c8f1cc10c0477ffb4e7bf79",
+  "f2p_node_ids": [
+    "tests.test_task_summary.test_summary_returns_complete_empty_schema",
+    "tests.test_task_summary.test_summary_calculates_minimum_and_maximum",
+    "tests.test_task_summary.test_summary_consumes_generators_once",
+    "tests.test_task_summary.test_summary_rejects_boolean_values",
+    "tests.test_task_summary.test_summary_rejects_non_builtin_numeric_values"
+  ],
+  "p2p_node_ids": [
+    "tests.test_stats_existing.test_summary_handles_empty_iterable",
+    "tests.test_stats_existing.test_summary_calculates_legacy_fields",
+    "tests.test_stats_existing.test_summary_accepts_tuples"
+  ],
+  "grade": {
+    "format": "junit",
+    "tool_label": "pytest",
+    "reports": ["/logs/verifier/pytest.xml"]
+  }
+}

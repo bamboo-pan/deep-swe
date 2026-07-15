@@ -1,18 +1,28 @@
-import json, subprocess, uuid
+import asyncio, json, subprocess, threading, time, uuid
 import ipaddress
+import pytest
 from pathlib import Path
 from types import SimpleNamespace
+from sqlalchemy import delete, select
 from app.database import SessionLocal, init_db
-from app.models import Run
+from app.models import Run, Setting, TrialQueueEntry
 from app import runner
 from app import results
-from app.pier_retry_patch.transient import is_transient_agent_failure
+from app.pier_retry_patch.global_queue import release_slot, try_acquire_slot
+from app.pier_retry_patch.transient import (
+    TransientVerifierInfrastructureError,
+    is_transient_agent_failure,
+    retry_transient_verifier,
+)
 from app.pier_retry_patch.networking import DEFAULT_NETWORK_POOL, trial_network_subnets
 from app.pier_retry_patch.runtime import (
     install_retry_trial_names,
     install_safe_metric_display,
 )
-from app.schemas import RunDraft, SettingsUpdate, concurrency_advice, total_parallel_tasks
+from app.schemas import (
+    RunBatchDraft, RunDraft, SettingsUpdate, concurrency_advice,
+)
+from app.scheduler import clear_run_queue, queue_database_path, requested_trial_count
 
 def make_run(job_name: str, **extra) -> int:
     init_db()
@@ -25,6 +35,10 @@ def write_result(folder: Path, payload: dict):
     (folder/"result.json").write_text(json.dumps(payload), encoding="utf-8")
 
 SUCCESS_PAYLOAD={"stats":{"n_errored_trials":0,"n_input_tokens":100,"n_cache_tokens":80,"n_output_tokens":20,"cost_usd":1.25,"evals":{"x":{"metrics":[{"reward":1.0}]}}}}
+REGISTRY_EOF_MESSAGE = """Docker compose command failed for environment datacurve/task.
+#3 ERROR: failed to do request: Head "https://public.ecr.aws/v2/example/manifests/v1": EOF
+failed to solve: failed to resolve source metadata: failed to do request: EOF
+"""
 
 def test_sync_success_result(tmp_path: Path, monkeypatch):
     job="test-"+uuid.uuid4().hex; run_id=make_run(job)
@@ -68,6 +82,45 @@ def test_sync_does_not_override_cancelled(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(runner.settings,"jobs_dir",tmp_path); runner._sync_result(run_id,0)
     assert runner.get_run(run_id)["status"]=="cancelled"
 
+def test_cancel_run_removes_queue_before_pier_process_starts(monkeypatch):
+    init_db()
+    monkeypatch.setattr(runner, "cleanup_job_resources", lambda *args, **kwargs: {})
+    with SessionLocal() as db:
+        run = Run(
+            status="preflight",
+            job_name=f"cancel-queued-{uuid.uuid4().hex}",
+            agent="codex",
+            model="gpt-5.6-sol",
+            reasoning_effort="high",
+            tasks_json='["task-a"]',
+        )
+        db.add(run)
+        db.flush()
+        run_id = run.id
+        db.add(TrialQueueEntry(
+            run_id=run_id,
+            task_name="task-a",
+            attempt=1,
+            state="queued",
+            queue_order=1,
+        ))
+        db.commit()
+    try:
+        assert runner.cancel_run(run_id) is True
+        with SessionLocal() as db:
+            assert db.get(Run, run_id).status == "cancelled"
+            assert db.scalar(select(TrialQueueEntry).where(
+                TrialQueueEntry.run_id == run_id
+            )) is None
+    finally:
+        with runner._lock:
+            runner._cancel_requested.discard(run_id)
+        with SessionLocal() as db:
+            run = db.get(Run, run_id)
+            if run:
+                db.delete(run)
+                db.commit()
+
 def test_sync_survives_truncated_result_json(tmp_path: Path, monkeypatch):
     # taskkill 截断 result.json 时不允许抛异常连锁改写状态
     job="test-"+uuid.uuid4().hex; run_id=make_run(job)
@@ -107,6 +160,27 @@ def test_infrastructure_retry_args_are_bounded_and_typed():
     assert "TransientAgentInfrastructureError" in enabled
     assert runner._pier_retry_args(False, 3) == ["--max-retries", "0"]
     assert runner._pier_retry_args(True, 0) == ["--max-retries", "0"]
+
+def test_global_queue_patch_handshake_fails_closed(monkeypatch):
+    monkeypatch.setattr(runner.shutil, "which", lambda name: "C:/pier.exe")
+    monkeypatch.setattr(runner, "_pier_process_env", lambda run_id: {})
+    monkeypatch.setattr(
+        runner.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, "0.3.0\n", ""
+        ),
+    )
+    runner._queue_patch_verified = False
+    try:
+        try:
+            runner._verify_global_queue_patch(1)
+        except RuntimeError as exc:
+            assert "补丁验证失败" in str(exc)
+        else:
+            raise AssertionError("missing queue patch marker must fail closed")
+    finally:
+        runner._queue_patch_verified = False
 
 def test_trial_docker_networks_avoid_lan_and_are_stable():
     first=trial_network_subnets("run-1/task-a__abc")
@@ -179,6 +253,13 @@ def test_unexpected_eof_requires_network_error_context():
     assert runner._network_failure_summary(source) is None
     assert runner._network_failure_summary("APIConnectionError: unexpected EOF") == "模型代理连接意外中断"
 
+def test_registry_eof_is_classified_and_summarized():
+    assert is_transient_agent_failure("RuntimeError", REGISTRY_EOF_MESSAGE)
+    assert "EOF" in runner._network_failure_summary(REGISTRY_EOF_MESSAGE)
+    assert not is_transient_agent_failure(
+        "RuntimeError", "parser failed after receiving an EOF token"
+    )
+
 def test_transient_agent_failure_classification_is_selective():
     assert is_transient_agent_failure(
         "NonZeroAgentExitCodeError", "unexpected status 503 Service Unavailable"
@@ -209,9 +290,77 @@ def test_transient_agent_failure_classification_is_selective():
     assert not is_transient_agent_failure(
         "NonZeroAgentExitCodeError", "tests failed with exit code 1"
     )
+    assert is_transient_agent_failure(
+        "NonZeroAgentExitCodeError",
+        "Command failed; stdout truncated",
+        agent_log_tail="unexpected status 503 Service Unavailable",
+    )
+    assert not is_transient_agent_failure(
+        "RuntimeError",
+        "verifier assertion failed",
+        agent_log_tail="unexpected status 503 Service Unavailable",
+    )
+
+def test_verifier_infrastructure_retry_preserves_the_agent_run():
+    attempts = []
+    retries = []
+
+    async def operation():
+        attempts.append(len(attempts) + 1)
+        if len(attempts) == 1:
+            raise RuntimeError(REGISTRY_EOF_MESSAGE)
+        return "verified"
+
+    result = asyncio.run(retry_transient_verifier(
+        operation,
+        max_retries=2,
+        delays=(0,),
+        on_retry=lambda number, limit, delay, exc: retries.append(
+            (number, limit, delay, type(exc).__name__)
+        ),
+    ))
+
+    assert result == "verified"
+    assert attempts == [1, 2]
+    assert retries == [(1, 2, 0.0, "RuntimeError")]
+
+def test_verifier_infrastructure_retry_is_selective_and_bounded():
+    non_transient_attempts = 0
+
+    async def non_transient_operation():
+        nonlocal non_transient_attempts
+        non_transient_attempts += 1
+        raise RuntimeError("application returned service unavailable")
+
+    with pytest.raises(RuntimeError, match="service unavailable"):
+        asyncio.run(retry_transient_verifier(
+            non_transient_operation,
+            max_retries=4,
+            delays=(0,),
+        ))
+    assert non_transient_attempts == 1
+
+    transient_attempts = 0
+
+    async def transient_operation():
+        nonlocal transient_attempts
+        transient_attempts += 1
+        raise RuntimeError(REGISTRY_EOF_MESSAGE)
+
+    with pytest.raises(
+        TransientVerifierInfrastructureError,
+        match=r"after 3 attempt\(s\)",
+    ):
+        asyncio.run(retry_transient_verifier(
+            transient_operation,
+            max_retries=2,
+            delays=(0,),
+        ))
+    assert transient_attempts == 3
 
 def test_runtime_retry_and_agent_limits_live_in_settings():
     update=SettingsUpdate(
+        max_parallel_tasks=18,
         agent_timeout_seconds=7200, verifier_timeout_seconds=2400,
         infrastructure_max_retries=4, agent_max_steps=150,
     )
@@ -219,49 +368,145 @@ def test_runtime_retry_and_agent_limits_live_in_settings():
                    codex_request_max_retries=7, codex_stream_max_retries=8,
                    codex_stream_idle_timeout_seconds=900)
     assert update.agent_timeout_seconds == 7200
+    assert update.max_parallel_tasks == 18
     assert update.verifier_timeout_seconds == 2400
     assert update.infrastructure_max_retries == 4
     assert update.agent_max_steps == 150
     assert "infrastructure_max_retries" not in RunDraft.model_fields
     assert "agent_max_steps" not in RunDraft.model_fields
+    assert "concurrency" not in RunDraft.model_fields
     assert draft.codex_request_max_retries == 7
     assert draft.codex_stream_max_retries == 8
     assert draft.codex_stream_idle_timeout_seconds == 900
 
-def test_parallel_task_count_uses_actual_trial_capacity():
-    draft = RunDraft(
-        tasks=["task-a", "task-b", "task-c"], attempts_per_task=2,
-        concurrency=72, parallel_agent_count=3,
-    )
-    assert total_parallel_tasks(draft) == 18
+def test_requested_trial_count_and_concurrency_risk_are_separate():
+    assert requested_trial_count(["task-a", "task-b", "task-c"], 2, 3) == 18
     assert concurrency_advice(18)["level"] == "warning"
     assert concurrency_advice(19)["requires_confirmation"] is True
     assert concurrency_advice(72)["level"] == "danger"
+    assert concurrency_advice(73)["level"] == "blocked"
 
-    allowed = RunDraft(
-        tasks=["task-a", "task-b", "task-c"], attempts_per_task=8,
-        concurrency=24, parallel_agent_count=3,
-    )
-    blocked = RunDraft(
-        tasks=["task-a", "task-b", "task-c"], attempts_per_task=9,
-        concurrency=25, parallel_agent_count=3,
-    )
-    assert total_parallel_tasks(allowed) == 72
-    assert concurrency_advice(total_parallel_tasks(allowed))["level"] == "danger"
-    assert total_parallel_tasks(blocked) == 75
-    assert concurrency_advice(total_parallel_tasks(blocked))["level"] == "blocked"
+def test_create_runs_queues_agent_group_larger_than_global_limit(monkeypatch):
+    class NoopThread:
+        def __init__(self, *args, **kwargs): pass
+        def start(self): pass
 
-def test_create_run_rejects_unconfirmed_high_parallel_count():
-    draft = RunDraft(
-        tasks=["task-a", "task-b", "task-c"], attempts_per_task=8,
-        concurrency=24, parallel_agent_count=3,
+    init_db()
+    with SessionLocal() as db:
+        db.execute(delete(TrialQueueEntry))
+        db.commit()
+    monkeypatch.setattr(runner.threading, "Thread", NoopThread)
+    current_preferences = runner.get_preferences()
+    monkeypatch.setattr(runner, "get_preferences", lambda: {
+        **current_preferences,
+        "max_parallel_tasks": 2,
+    })
+    draft = RunBatchDraft(
+        agents=["mini-swe-agent", "codex", "claude-code"],
+        tasks=["task-a"],
     )
+    runs, admission = runner.create_runs_with_admission(draft)
     try:
-        runner.create_run(draft)
-    except ValueError as exc:
-        assert "72" in str(exc) and "确认" in str(exc)
-    else:
-        raise AssertionError("high parallel run must require confirmation")
+        assert admission["immediate_trials"] == 2
+        assert admission["queued_trials"] == 1
+        assert [run.concurrency for run in runs] == [2, 2, 2]
+        with SessionLocal() as db:
+            entries = db.scalars(select(TrialQueueEntry)).all()
+            assert len(entries) == 3
+    finally:
+        with SessionLocal() as db:
+            for run in runs:
+                clear_run_queue(run.id, db=db)
+                saved = db.get(Run, run.id)
+                if saved:
+                    db.delete(saved)
+            db.commit()
+
+def test_global_queue_releases_next_run_when_slot_opens():
+    init_db()
+    run_ids = []
+    original_limit = None
+    with SessionLocal() as db:
+        db.execute(delete(TrialQueueEntry))
+        setting = db.get(Setting, "max_parallel_tasks")
+        original_limit = setting.value if setting else None
+        if setting:
+            setting.value = "1"
+        else:
+            db.add(Setting(key="max_parallel_tasks", value="1"))
+        for index in range(2):
+            run = Run(
+                status="queued",
+                job_name=f"queue-test-{uuid.uuid4().hex}-{index}",
+                agent="codex",
+                model="gpt-5.6-sol",
+                reasoning_effort="high",
+                tasks_json='["task-a"]',
+            )
+            db.add(run)
+            db.flush()
+            run_ids.append(run.id)
+            db.add(TrialQueueEntry(
+                run_id=run.id,
+                task_name="task-a",
+                attempt=1,
+                state="queued",
+                queue_order=index + 1,
+            ))
+        db.commit()
+
+    database = queue_database_path()
+    acquired: dict[str, int | Exception] = {}
+
+    def acquire_second():
+        try:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                entry = try_acquire_slot(
+                    database, run_ids[1], "task-a", "task-a__second", 1
+                )
+                if entry is not None:
+                    acquired["entry"] = entry
+                    return
+                time.sleep(0.02)
+            acquired["entry"] = TimeoutError("second Trial never acquired a slot")
+        except Exception as exc:
+            acquired["entry"] = exc
+
+    waiter = threading.Thread(target=acquire_second, daemon=True)
+    waiter.start()
+    time.sleep(0.15)
+    # 后提交的 Run 即使先进入调度代码，也不能越过更早的队列项。
+    assert "entry" not in acquired
+    first_entry = try_acquire_slot(
+        database, run_ids[0], "task-a", "task-a__first", 1
+    )
+    assert first_entry is not None
+    time.sleep(0.1)
+    assert "entry" not in acquired
+    release_slot(database, run_ids[0], first_entry)
+    waiter.join(timeout=3)
+    try:
+        assert isinstance(acquired.get("entry"), int), acquired.get("entry")
+    finally:
+        second_entry = acquired.get("entry")
+        if isinstance(second_entry, int):
+            release_slot(database, run_ids[1], second_entry)
+        with SessionLocal() as db:
+            db.execute(delete(TrialQueueEntry))
+            for run_id in run_ids:
+                run = db.get(Run, run_id)
+                if run:
+                    db.delete(run)
+            setting = db.get(Setting, "max_parallel_tasks")
+            if original_limit is None:
+                if setting:
+                    db.delete(setting)
+            elif setting:
+                setting.value = original_limit
+            else:
+                db.add(Setting(key="max_parallel_tasks", value=original_limit))
+            db.commit()
 
 def test_trial_classifies_transient_repository_failure(tmp_path: Path):
     folder=tmp_path/"task-a__x"; folder.mkdir()
@@ -283,6 +528,20 @@ def test_trial_classifies_transient_error_from_agent_log_tail(tmp_path: Path):
         encoding="utf-8",
     )
     assert results._trial(folder)["failure_type"] == "InfrastructureNetworkError"
+
+def test_verifier_failure_is_not_reclassified_from_stale_agent_log(tmp_path: Path):
+    folder=tmp_path/"task-a__x"; (folder/"agent").mkdir(parents=True)
+    write_result(folder, {"task_name":"task-a","exception_info":{
+        "exception_type":"RuntimeError",
+        "exception_message":"verifier failed because the Dockerfile is invalid",
+    }})
+    (folder/"agent"/"mini-swe-agent.txt").write_text(
+        "earlier request: unexpected status 503 Service Unavailable",
+        encoding="utf-8",
+    )
+
+    assert results._trial(folder)["failure_type"] == "RuntimeError"
+    assert runner._run_failure_summary(tmp_path).startswith("RuntimeError:")
 
 def test_official_regression_contains_baseline_values(monkeypatch):
     current={"trials":[{"task":"task-a","reward":1,"duration_seconds":80.0}]}
@@ -601,6 +860,7 @@ def test_new_pier_job_name_uses_public_run_identity(monkeypatch):
     current_preferences = runner.get_preferences()
     monkeypatch.setattr(runner, "get_preferences", lambda: {
         **current_preferences,
+        "max_parallel_tasks": 5,
         "agent_timeout_seconds": 7200,
         "verifier_timeout_seconds": 2400,
         "infrastructure_max_retries": 3,
@@ -613,6 +873,7 @@ def test_new_pier_job_name_uses_public_run_identity(monkeypatch):
     ))
     try:
         assert row.job_name == f"run-{row.id:06d}-codex"
+        assert row.concurrency == 5
         assert runner.serialize(row)["run_code"] == f"RUN-{row.id:06d}"
         assert row.agent_timeout_seconds == 7200
         assert row.verifier_timeout_seconds == 2400
@@ -623,6 +884,7 @@ def test_new_pier_job_name_uses_public_run_identity(monkeypatch):
         assert row.codex_stream_idle_timeout_seconds == 900
     finally:
         with SessionLocal() as db:
+            clear_run_queue(row.id, db=db)
             saved = db.get(Run, row.id)
             if saved:
                 db.delete(saved)
@@ -826,6 +1088,7 @@ def test_stale_retry_finalizer_does_not_remove_new_batch_process():
             runner._processes.pop(run_id, None)
 
 def test_retry_config_uses_latest_runtime_settings_and_expands_duplicate_tasks(tmp_path: Path, monkeypatch):
+    init_db()
     job = "run-000123-mini-swe-agent"
     job_dir = tmp_path / job
     job_dir.mkdir()
@@ -868,13 +1131,14 @@ def test_retry_config_uses_latest_runtime_settings_and_expands_duplicate_tasks(t
 
     path, env = runner._prepare_retry_config(
         run, specs, SimpleNamespace(url="http://127.0.0.1:9887/v1", token="secret"),
-        secret_dir, auth, tmp_path, {"trial_budget_usd": 3.25},
+        secret_dir, auth, tmp_path,
+        {"trial_budget_usd": 3.25, "max_parallel_tasks": 17},
     )
     retry = json.loads(path.read_text(encoding="utf-8"))
 
     assert retry["job_name"] == runner.retry_job_name(job, "a" * 32)
     assert retry["n_attempts"] == 1
-    assert retry["n_concurrent_trials"] == 17
+    assert retry["n_concurrent_trials"] == 2
     assert retry["agent_timeout_multiplier"] == 2
     assert retry["verifier_timeout_multiplier"] == 3
     assert retry["retry"]["max_retries"] == 1
@@ -888,17 +1152,19 @@ def test_retry_config_uses_latest_runtime_settings_and_expands_duplicate_tasks(t
     assert retry["agents"][0]["kwargs"]["config_file"].endswith("mini-limits.yaml")
     assert "step_limit: 155" in (secret_dir / "mini-limits.yaml").read_text(encoding="utf-8")
     assert env["OPENAI_API_KEY"] == "secret"
+    assert env["DEEPSWE_VERIFIER_INFRA_MAX_RETRIES"] == "1"
     assert env["DEEPSWE_RETRY_JOB_NAME"] == retry["job_name"]
     assert json.loads(env["DEEPSWE_RETRY_TRIAL_NAMES"]) == [
         spec["runtime_trial_id"] for spec in specs
     ]
 
     run.infrastructure_max_retries = 0
-    path, _ = runner._prepare_retry_config(
+    path, disabled_env = runner._prepare_retry_config(
         run, specs, SimpleNamespace(url="http://127.0.0.1:9887/v1", token="secret"),
         secret_dir, auth, tmp_path, {"trial_budget_usd": 0},
     )
     disabled = json.loads(path.read_text(encoding="utf-8"))
+    assert disabled_env["DEEPSWE_VERIFIER_INFRA_MAX_RETRIES"] == "0"
     assert disabled["retry"]["max_retries"] == 0
     assert disabled["retry"]["include_exceptions"] == []
     assert "cost_limit" not in disabled["agents"][0]["kwargs"]

@@ -2,6 +2,7 @@
 /.venv/
 /data/*
 !/data/official-task-stats-*.json
+!/data/model-pricing.json
 /jobs/
 /frontend/node_modules/
 /frontend/dist/

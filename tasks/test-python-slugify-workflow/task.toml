@@ -1,0 +1,49 @@
+schema_version = "1.1"
+artifacts = ["/logs/artifacts/model.patch"]
+
+[task]
+name = "datacurve/test-python-slugify-workflow"
+description = "TEST ONLY: a small Python task for validating the complete agent and verifier workflow."
+authors = []
+keywords = ["test", "workflow", "python"]
+
+[metadata]
+ext_id = "test-python-slugify-workflow-v1"
+task_id = "test-python-slugify-workflow"
+display_title = "[TEST] Python slugify workflow"
+display_description = "Test-only task that implements deterministic label slugification."
+original_title = "Test Python Slugify Workflow"
+category = "test_validation"
+language = "python"
+repository_url = "local://deepswe-test-fixture/slugify"
+base_commit_hash = "d292555c23c1bf40f0fd410ce0371a06d81bfaf4"
+
+[verifier]
+environment_mode = "separate"
+timeout_sec = 120.0
+
+[verifier.env]
+
+[verifier.environment]
+build_timeout_sec = 600.0
+cpus = 1
+memory_mb = 1024
+storage_mb = 4096
+allow_internet = false
+
+[agent]
+timeout_sec = 600.0
+
+[environment]
+build_timeout_sec = 600.0
+os = "linux"
+cpus = 1
+memory_mb = 1024
+storage_mb = 4096
+gpus = 0
+allow_internet = false
+mcp_servers = []
+
+[environment.env]
+
+[solution.env]

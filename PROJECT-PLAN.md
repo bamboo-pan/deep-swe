@@ -1,6 +1,6 @@
 # DeepSWE 模型降智测试工具 — 项目计划
 
-更新时间:2026-07-12。本文合并原 `DEEPSWE-REGRESSION-UI-PLAN.md`、`DEEPSWE-REGRESSION-UI-PROGRESS.md`、`DOCKER-RESOURCE-CLEANUP-INTEGRATION-PLAN.md`,内容已对照当前代码校准。经验教训见 `LESSONS-LEARNED.md`。
+更新时间:2026-07-15。本文合并原 `DEEPSWE-REGRESSION-UI-PLAN.md`、`DEEPSWE-REGRESSION-UI-PROGRESS.md`、`DOCKER-RESOURCE-CLEANUP-INTEGRATION-PLAN.md`,内容已对照当前代码校准。经验教训见 `LESSONS-LEARNED.md`。
 
 ## 1. 目标
 
@@ -35,7 +35,7 @@
 | verifier / tier | 开启 / standard |
 | 运行预算 | `trial_budget_usd` 单 Trial 默认 $8;`run_budget_usd` Run 级兜底默认 $10(均 0 = 禁用) |
 
-并发限制按实际总并行 Trial 数计算:`Agent 数 × min(每 Agent 并发数,任务数 × 每题次数)`。每 Agent 并发输入最大 72;总并行 1–12 正常,13–18 黄色资源峰值警告,19–72 红色警告 + 前后端确认(`confirm_high_concurrency`),>72 禁止。任务声明的 2 CPU / 8 GB 是容器上限而非固定占用,不再直接相乘作为阈值依据。
+最大并行 Task 数是 Settings 中的系统级硬上限，范围 1–72，调度单位为 Trial（任务 × 重复次数 × Agent）。所有 Run、Agent 和定向重试共享同一条 FIFO 队列；新 Run 只占用当前空闲槽位，超出的 Trial 保持 queued，任一运行中的 Trial 结束后自动补位，系统实际运行数不得超过该上限。提交前后端都返回本次可立即启动数、排队数和前方已有排队数。队列状态落在 SQLite，Pier 进程在创建 Trial 环境前申请全局槽位，正常结束、取消、进程失败和服务重启收割时释放或清理槽位。任务声明的 2 CPU / 8 GB 是容器上限而非固定占用，不再直接相乘作为阈值依据。
 
 ## 4. 凭据与安全
 
@@ -67,17 +67,60 @@ effort 三值记录:请求值 / adapter 映射值 / 有效值(`reasoning_effort_
 
 UI 同时展示套件 ID、真实标题、目录名、数据集 ext_id。快速检查每题 1 次，共 4 trials，并发 2 约 25–35 分钟；正式基线每题 4 次，共 16 trials，预计约 1.5–2 小时。
 
+## 6.1 自定义测试 Task（流程验证）
+
+新增两个小型 Python Task，用于验证 DeepSWE v1.1 的完整任务链路，不用于衡量模型能力，也不加入正式的 `frontier-regression-4`。它们由现有 Task catalog 自动发现，可在 UI 中单独选择；目录和 `task_id` 以 `test-` 开头，标题以 `[TEST]` 开头，`category = "test_validation"`，避免与正式回归任务混淆。
+
+| Task ID | 显示标题 | 验证内容 | Base commit | F2P / P2P |
+|---|---|---|---|---|
+| `test-python-slugify-workflow` | `[TEST] Python slugify workflow` | 字符串 slug 规范化、类型和边界处理 | `d292555c23c1bf40f0fd410ce0371a06d81bfaf4` | 5 / 3 |
+| `test-python-summary-workflow` | `[TEST] Python summary workflow` | 数值汇总、生成器单次消费、类型校验 | `4e74fd3c99da38da9c8f1cc10c0477ffb4e7bf79` | 5 / 3 |
+
+两个 Task 均保留与正式任务一致的完整框架:
+
+```text
+task.toml
+instruction.md
+pre_artifacts.sh
+environment/{Dockerfile,repo/}
+solution/{solve.sh,solution.patch}
+tests/{Dockerfile,config.json,test.sh,test.patch,grader.py,base_repo/}
+```
+
+制作约束:
+
+- `environment/repo`、`tests/base_repo` 与 `task.toml` / `tests/config.json` / `pre_artifacts.sh` 声明的 base commit 必须一致；Agent 与 verifier 镜像均需实际构建并检查仓库 SHA
+- Agent 必须提交修改；`pre_artifacts.sh` 用 `git diff <base> HEAD` 生成 `/logs/artifacts/model.patch`，未提交修改不会进入评分
+- P2P 保护原有行为，在 pristine base 和修复后都必须通过；每个 F2P 在 pristine base 必须因目标行为未实现而失败，不能用缺少模块、缺少函数等 collection error 代替
+- `tests/grader.py` 使用仓库统一版本；JUnit 白名单 ID 必须与报告中的 `classname.name` 完全一致，报告缺失的 ID 按失败处理
+- 所有进 Linux 容器执行的 `.sh` 必须为 LF；测试环境与 Agent 环境分离，隐藏 `test.patch` 只在 verifier 阶段应用
+
+新增 Task 按以下阶梯验收，任一层失败都不进入下一层:
+
+| 层级 | 验收条件 | 两个 Task 的结果 |
+|---|---|---|
+| 静态结构 | TOML/JSON 可解析、脚本为 LF、两份 base repo 与配置 SHA 一致 | 通过 |
+| 构建与 Patch | Agent/verifier 镜像构建成功；solution、hidden test、生成的 model patch 可应用 | 通过 |
+| `nop` 边界 | 不提交修改时 `Reward=0`，P2P `3/3`、F2P `0/5` | 通过 |
+| `oracle` 边界 | 参考解或等价生成 Patch 时 `Reward=1`，P2P `3/3`、F2P `5/5` | 通过 |
+| 真实模型 | 有真实 trajectory、非零模型用量与费用、模型 commit、`model.patch`、verifier `reward.json` | 通过 |
+
+2026-07-15 使用 `mini-swe-agent 2.4.5` 实际调用 `openai/gpt-5.6-sol`（`xhigh`）完成了两次付费 Trial；这不是 `nop` 或 `oracle` 模拟结果:
+
+| Task | Agent steps | 输入 / 缓存 / 输出 Token | Agent 执行 / Trial 总耗时 | Reward | 费用 |
+|---|---:|---:|---:|---:|---:|
+| slugify | 9 | 64,492 / 46,592 / 3,500 | 1m40s / 8m47s | 1（F2P 5/5，P2P 3/3） | $0.217796 |
+| summary | 12 | 99,683 / 70,144 / 5,471 | 2m11s / 3m46s | 1（F2P 5/5，P2P 3/3） | $0.346897 |
+
+两次真实模型调用合计费用 `$0.564693`。可审计产物分别位于 `jobs/test-validation/actual-model-slugify-real/test-python-slugify-workflow__uRSZtjG` 与 `jobs/test-validation/actual-model-summary-real-3/test-python-summary-workflow__p7fXg3f`。以后新增自定义 Task 时，复制最接近的测试 Task，替换题目仓库、base commit、instruction、solution 与 F2P/P2P，再完整重跑上述五层验收；只跑 `nop` / `oracle` 不能标记为“真实模型实测通过”。
+
 ## 7. 成本计算
 
-GPT-5.6-SOL 官方价(每 1M Token):
+单价按 Run 的 `model` 查表取得，数据源 https://models.dev（社区维护的全量 provider/model 定价库）。精简快照 `data/model-pricing.json` 随仓库分发（156 provider / 5000+ 模型），`POST /api/pricing/sync` 手动刷新，`GET /api/pricing/meta` 查看快照元信息；实现见 `backend/app/pricing.py`。查价支持裸模型名与 `provider/model` 前缀，同名多 provider 时按优先级（openai > anthropic > google > …）确定性取价。
 
-| Tier | 输入 | 缓存读 | 缓存写 | 输出 |
-|---|---:|---:|---:|---:|
-| Standard | $5.00 | $0.50 | $6.25 | $30.00 |
-| Batch/Flex | $2.50 | $0.25 | $3.125 | $15.00 |
-| Priority | $10.00 | $1.00 | $12.50 | $60.00 |
+未收录的模型回退默认价（即 GPT-5.6-SOL 档，与旧硬编码口径一致，历史 Run 数字不变）：输入 $5.00 / 缓存读 $0.50 / 输出 $30.00（每 1M Token）。Batch ×0.5、Priority ×2.0 的 tier 倍率仍全局套用。
 
-按运行创建时所选 tier 计算。Pier stats 不区分 cache-write,估算暂不含该项,`cache_write_tokens` 存 `null`。UI 区分 API 报告费用与按 Token 的估算费用。价格来源:https://developers.openai.com/api/docs/pricing
+按运行创建时所选 tier 计算。Pier stats 不区分 cache-write,估算暂不含该项,`cache_write_tokens` 存 `null`。UI 区分 API 报告费用与按 Token 的估算费用;Run 详情的 `pricing` 字段标注估算所用单价及来源（`models.dev` / `default`）。用量护栏（Run/Trial 预算熔断）在缺少上报费用时按同一套单价估算。
 
 ## 8. 结果与数据
 
@@ -106,7 +149,33 @@ GPT-5.6-SOL 官方价(每 1M Token):
   - 瞬时故障分类:503/429/连接类失败重分类为 `TransientAgentInfrastructureError` 触发 pier 重试,模型/代码失败不重试;退避延迟经 `DEEPSWE_PIER_RETRY_DELAYS` 配置
   - Docker 子网固定:trial 网络按路径哈希从 `10.240.0.0/12` 池分配 /29 对(`DEEPSWE_DOCKER_NETWORK_POOL` 可改),避开 Docker 的 192.168.* fallback 池与局域网冲突
   - Run 相关字段:`retry_infrastructure_errors`、`infrastructure_max_retries`、`agent_max_steps`(原 `claude_max_turns`,现对全部 agent 生效)
-- **进程生命周期**:启动时收割上次残留非终态运行(按 PID 终止 pier 进程树,psutil 校验命令行防 PID 复用误杀;Docker 定向清理;标记 `interrupted`);退出时终止仍在运行的 pier 子进程;取消/落库共用状态锁,终态不可反向覆盖
+- **模型重试与时间预算**:LiteLLM/Codex 的请求或流重试发生在单个 Agent 交互内部,不增加 `n_agent_steps`;但退避等待属于 Agent 进程墙钟时间,计入 `agent_timeout_seconds`。已用 `etree-xml-diff-patch` 实例核实:出现模型重试时仍以 `10000` 秒触发 `AgentTimeoutError`,而步数未因重试增加
+- **进程生命周期**:启动时收割上次残留非终态运行(按 PID 终止 pier 进程树,psutil 校验命令行防 PID 复用误杀;Docker 定向清理;标记 `interrupted`);退出时终止仍在运行的 pier 子进程;取消/落库共用状态锁,终态不可反向覆盖;全局 Trial 队列在 Run 终态、取消、异常退出和启动收割时同步清理,避免泄漏并发槽位
+
+## 10.1 Docker 镜像构建与 `preparing_environment`
+
+`preparing_environment` 覆盖基础镜像元数据检查/拉取、Task 环境镜像、Agent 安装层、egress proxy、容器创建与健康检查。首次运行新 Task 或本机没有缓存时，这一阶段持续数分钟属于正常现象，且尚未进入模型调用；是否真的卡住应以 Docker build 记录、Trial 日志和文件更新时间判断，不能只看 UI 阶段名称。
+
+Pier 对每个新 Trial 都可能调用一次 `docker compose build`，但“执行 build 检查”不等于“完整重建”。Docker 会按 Dockerfile 指令和构建上下文复用 BuildKit 层缓存，即使 Trial 使用新的随机镜像名，未变化的基础层、Agent 安装层和依赖层仍可共享。
+
+需要实际重建相应镜像层的情况:
+
+- 首次运行、镜像或 BuildKit 缓存已被清理、Docker Desktop 重置，或切换 Docker daemon/context/平台
+- 修改 `environment/Dockerfile`、基础镜像 digest、系统/Python 依赖，或 `environment/repo` 中被 `COPY` 进 Agent 镜像的文件
+- 修改 verifier 的 `tests/Dockerfile`、`grader.py`、`test.sh`、`test.patch`、`config.json` 或 `base_repo`
+- 更换 Agent 类型/安装版本/Pier 安装指纹，或修改 `extra_python_packages` 等进入 Agent 安装层的参数
+- 显式启用 `force_build`
+
+通常不改变镜像内容的运行时变化:模型、reasoning effort、凭据和模型 URL、并发/重复次数、预算、重试与 timeout；仅修改 `instruction.md`、`solution/`、`pre_artifacts.sh` 或展示 metadata 也不要求主动清理镜像。它们仍可能让 Pier 创建新的 Trial/镜像标签并执行缓存检查。
+
+Docker Compose v5 默认可能把构建交给 Buildx Bake。Windows 上并行构建若长期无输出，可在**启动 UI 前的同一个 PowerShell 会话**禁用 Bake 编排:
+
+```powershell
+$env:COMPOSE_BAKE = "false"
+.\run-ui.ps1
+```
+
+已启动的 UI/backend 不会自动获得后来设置的环境变量，必须重启。`COMPOSE_BAKE=false` 只把 Compose 从 `docker buildx bake` 路径切回普通逐服务构建，不跳过构建、不关闭 BuildKit 缓存，也不能修复镜像仓库、Debian 包或 GitHub release 的 403/超时等网络错误。
 
 ## 11. Docker 资源清理(阶段一至三已实现)
 
@@ -123,19 +192,19 @@ GPT-5.6-SOL 官方价(每 1M Token):
 ## 12. UI 页面
 
 - **Dashboard**:Docker/Pier/模型 API 健康、当前 Job、最近结果与基线、通过率/耗时/费用变化、降智告警摘要
-- **New Run**:agent(单个或三 Agent 同跑,三 Agent 创建三条独立 Run)、模型、effort、任务选择(展示官方通过率/耗时)、重复次数、并发、双 timeout、基础设施重试、verifier 开关、tier
-- **Live**:SSE 按 `result.json` mtime 指纹推送(5 秒兜底;含 regression 字段、不含 Patch 正文),断线自动重连;阶段流转 queued→preflight→environment→agent→patch→verifier→终态;点击 Trial 按需拉取 Patch/错误/日志;多 Agent 切换;取消
+- **New Run**:agent(单个或三 Agent 同跑,三 Agent 由批量接口创建三条独立 Run)、模型、effort、任务选择(展示官方通过率/耗时)、重复次数、verifier 开关、tier;提交前展示全局并发占用,若本次有 Trial 不能立即启动则明确确认排队数量
+- **Live**:SSE 按 `result.json` mtime 指纹推送(5 秒兜底;含 regression 字段、不含 Patch 正文),断线自动重连;阶段流转 queued→preflight→environment→agent→patch→verifier→终态;展示系统级运行中/排队中数量和当前 Run 的队列占用;点击 Trial 按需拉取 Patch/错误/日志;多 Agent 切换;取消
 - **Results**:通过率、Reward、Partial、F2P/P2P、双耗时、Token/费用、steps、失败原因、Patch/日志;多选批量删除(运行中必须先取消;删除先清 Docker 再清索引/基线/artifacts/日志)
 - **Compare**:最多 8 次运行,Task × Run 通过率矩阵;口径区分——官方严格可比仅 mini-swe-agent ↔ 官方 mini-swe-agent,Codex/Claude Code 对官方为参考比较,严格纵向比较要求同 agent/版本/模型/配置
-- **Tasks**:113 任务的 task.toml 解析;官方通过率与平均耗时已实现(聚合自官方 `artifacts/v1.1/trials.json`,口径同官方站点 "ALL MODEL EFFORTS",缓存分发于 `data/official-task-stats-v1.1.json`,可手动同步刷新)
-- **Settings**:凭据路径、Jobs 目录、默认配置、运行预算、Docker 存储与清理卡片、价格表/tier
+- **Tasks**:catalog 自动解析 113 个官方任务与 2 个 `[TEST]` 自定义任务的 `task.toml`;官方任务的通过率与平均耗时已实现(聚合自官方 `artifacts/v1.1/trials.json`,口径同官方站点 "ALL MODEL EFFORTS",缓存分发于 `data/official-task-stats-v1.1.json`,可手动同步刷新)
+- **Settings**:凭据路径、Jobs 目录、默认配置、全局最大并行 Task 数、运行预算、Docker 存储与清理卡片、价格表/tier
 - **Diagnostics**:Docker daemon、模型 API 可达性(不携带 Token)、Pier 版本与补丁(`pier-secret-env`、`pier-claude-utf8`,特征检测防升级误报)、容器 Agent 实际版本(Trial 完成后取 `agent_info.version`)、磁盘内存、Docker 存储四项(镜像/缓存/孤儿/清理策略)
 
 ## 13. 当前状态
 
-第一版验收链路全部完成,约 95%+。经历三轮:第一轮交付 → 第二轮修复代码审查确认的 15 项缺陷 + Docker 清理集成 → 第三轮(2026-07-12)修复试运行暴露的护栏缺失与网络问题(CRLF 预检、subagent 禁用、用量熔断、瞬时重试、子网固定、官方统计)。
+第一版验收链路全部完成,约 95%+。经历四轮:第一轮交付 → 第二轮修复代码审查确认的 15 项缺陷 + Docker 清理集成 → 第三轮(2026-07-12)修复试运行暴露的护栏缺失与网络问题(CRLF 预检、subagent 禁用、用量熔断、瞬时重试、子网固定、官方统计) → 第四轮(2026-07-15)补齐两个 `[TEST]` Python 自定义 Task，并完成评分边界与真实模型付费验证。
 
-验证现状:后端 pytest 66 项、前端 `tsc --noEmit` 与 Vite 构建、本机 Docker 清理集成测试(alpine 标签五项)、pier 0.3.0 源码核对均通过。
+验证现状:后端 pytest 120 项、前端 `tsc --noEmit` 与 Vite 构建、本机 Docker 清理集成测试(alpine 标签五项)、Pier 0.3.0 全局队列补丁握手与源码核对均通过；自定义 Task 相关后端专项测试 32 项通过，两个 Task 的 `nop=0`、`oracle=1`、真实模型 `Reward=1` 全部符合预期。
 
 真实付费验证:
 
@@ -160,4 +229,4 @@ GPT-5.6-SOL 官方价(每 1M Token):
 
 ## 15. 验收标准(第一版)
 
-三 Agent 可选、六档 effort、两行凭据安全读取、默认 4 题或任选、并发默认 2 可改、实时 Trial 状态/日志、可取消、通过率/F2P/P2P/耗时/Token/费用可见、多运行比较、基线+回归告警、官方价格计费、Token 与凭据零泄漏(数据库/日志/前端)。
+三 Agent 可选、六档 effort、两行凭据安全读取、默认 4 题或任选、全局最大并行 Task 数可配置且跨所有 Run/Agent/重试严格生效、超额 Trial 自动 FIFO 排队并在空槽出现时补位、提交时明确提示立即启动数与排队数、实时 Trial 状态/日志、可取消、通过率/F2P/P2P/耗时/Token/费用可见、多运行比较、基线+回归告警、官方价格计费、Token 与凭据零泄漏(数据库/日志/前端)。

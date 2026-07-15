@@ -4,15 +4,17 @@ from sqlalchemy import select
 from .config import settings
 from .database import SessionLocal
 from .models import Setting
-from .schemas import SettingsUpdate
+from .schemas import MAX_PARALLEL_AGENT_COUNT, MAX_PARALLEL_TASKS, SettingsUpdate
 from .security import read_credential
 
-KEYS = (
-    "credential_file", "jobs_dir", "default_agent", "default_model", "default_effort", "default_concurrency",
+CURRENT_KEYS = (
+    "credential_file", "jobs_dir", "default_agent", "default_model", "default_effort", "max_parallel_tasks",
     "agent_timeout_seconds", "verifier_timeout_seconds", "infrastructure_max_retries", "agent_max_steps",
     "docker_cleanup_after_run", "docker_cleanup_on_delete", "docker_cache_retention_hours", "docker_cache_warning_gb",
     "run_budget_usd", "trial_budget_usd",
 )
+LEGACY_KEYS = ("default_concurrency",)
+KEYS = CURRENT_KEYS + LEGACY_KEYS
 
 def _defaults() -> dict:
     return {
@@ -21,7 +23,7 @@ def _defaults() -> dict:
         "default_agent": settings.default_agent,
         "default_model": settings.default_model,
         "default_effort": settings.default_effort,
-        "default_concurrency": settings.default_concurrency,
+        "max_parallel_tasks": settings.max_parallel_tasks,
         "agent_timeout_seconds": settings.agent_timeout_seconds,
         "verifier_timeout_seconds": settings.verifier_timeout_seconds,
         "infrastructure_max_retries": settings.infrastructure_max_retries,
@@ -36,12 +38,24 @@ def _defaults() -> dict:
 
 def get_preferences() -> dict:
     values = _defaults()
+    stored = {}
     with SessionLocal() as db:
         for row in db.scalars(select(Setting).where(Setting.key.in_(KEYS))).all():
             try:
-                values[row.key] = json.loads(row.value)
+                stored[row.key] = json.loads(row.value)
             except (json.JSONDecodeError, TypeError):
                 continue
+    for key in CURRENT_KEYS:
+        if key in stored:
+            values[key] = stored[key]
+    if "max_parallel_tasks" not in stored and "default_concurrency" in stored:
+        legacy = stored["default_concurrency"]
+        if isinstance(legacy, int) and not isinstance(legacy, bool):
+            # 旧值是每 Agent 配额，按三 Agent 同跑时的总容量迁移。
+            values["max_parallel_tasks"] = min(
+                legacy * MAX_PARALLEL_AGENT_COUNT,
+                MAX_PARALLEL_TASKS,
+            )
     values["credential_file"] = str(values["credential_file"])
     values["jobs_dir"] = str(values["jobs_dir"])
     return values
@@ -55,6 +69,10 @@ def update_preferences(payload: SettingsUpdate) -> dict:
                 row.value = json.dumps(value, ensure_ascii=False)
             else:
                 db.add(Setting(key=key, value=json.dumps(value, ensure_ascii=False)))
+        if "max_parallel_tasks" in changes:
+            legacy = db.get(Setting, "default_concurrency")
+            if legacy:
+                db.delete(legacy)
         db.commit()
     return get_preferences()
 

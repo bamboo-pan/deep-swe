@@ -1,11 +1,18 @@
 """Process-local DeepSWE customizations for the pier CLI."""
 
+import asyncio
 import json
 import os
 
+from global_queue import release_slot, trial_task_name, try_acquire_slot
 from networking import trial_network_subnets
 from runtime import install_retry_trial_names, install_safe_metric_display
-from transient import TRANSIENT_EXCEPTION_TYPE, is_transient_agent_failure
+from transient import (
+    TRANSIENT_EXCEPTION_TYPE,
+    TRANSIENT_VERIFIER_EXCEPTION_TYPE,
+    is_transient_agent_failure,
+    retry_transient_verifier,
+)
 
 
 def _install_safe_docker_networks() -> None:
@@ -40,12 +47,16 @@ def _install_safe_docker_networks() -> None:
 _install_safe_docker_networks()
 
 
-def _install_retry_backoff() -> None:
+def _configured_retry_delays() -> tuple[float, ...]:
     raw = os.environ.get("DEEPSWE_PIER_RETRY_DELAYS", "")
     try:
-        delays = tuple(float(value) for value in raw.split(",") if value)
+        return tuple(float(value) for value in raw.split(",") if value)
     except ValueError:
-        return
+        return ()
+
+
+def _install_retry_backoff() -> None:
+    delays = _configured_retry_delays()
     if not delays:
         return
 
@@ -62,6 +73,100 @@ def _install_retry_backoff() -> None:
 
 
 _install_retry_backoff()
+
+
+def _install_verifier_infrastructure_retry() -> None:
+    try:
+        from pier.trial.trial import Trial
+    except ImportError:
+        return
+
+    original_verify = getattr(Trial, "_verify_with_retry", None)
+    if original_verify is None:
+        return
+
+    try:
+        max_retries = max(
+            int(os.environ.get("DEEPSWE_VERIFIER_INFRA_MAX_RETRIES", "0")),
+            0,
+        )
+    except ValueError:
+        max_retries = 0
+    delays = _configured_retry_delays() or (1.0,)
+
+    async def verify_with_infrastructure_retry(self):
+        def log_retry(retry_number, retry_limit, delay, exc):
+            logger = getattr(self, "_logger", None)
+            if logger is not None:
+                logger.debug(
+                    "Verifier infrastructure failure "
+                    f"{type(exc).__name__}; retry {retry_number}/{retry_limit} "
+                    f"in {delay:.2f} seconds"
+                )
+
+        return await retry_transient_verifier(
+            lambda: original_verify(self),
+            max_retries=max_retries,
+            delays=delays,
+            on_retry=log_retry,
+        )
+
+    Trial._verify_with_retry = verify_with_infrastructure_retry
+
+
+_install_verifier_infrastructure_retry()
+
+
+def _install_global_trial_queue() -> None:
+    database_path = os.environ.get("DEEPSWE_GLOBAL_QUEUE_DB")
+    raw_run_id = os.environ.get("DEEPSWE_RUN_ID")
+    if not database_path and not raw_run_id:
+        return
+    if not database_path or not raw_run_id:
+        raise RuntimeError("Incomplete DeepSWE global queue environment")
+    try:
+        run_id = int(raw_run_id)
+        fallback_limit = int(os.environ.get("DEEPSWE_GLOBAL_QUEUE_LIMIT", "1"))
+        poll_seconds = float(os.environ.get("DEEPSWE_GLOBAL_QUEUE_POLL_SECONDS", "0.2"))
+    except ValueError as exc:
+        raise RuntimeError("Invalid DeepSWE global queue environment") from exc
+    if run_id < 1 or fallback_limit < 1 or poll_seconds <= 0:
+        raise RuntimeError("Invalid DeepSWE global queue limits")
+
+    try:
+        from pier.trial.queue import TrialQueue
+    except ImportError:
+        return
+
+    async def run_trial_with_global_slot(self, trial_config):
+        entry_id = None
+        async with self._semaphore:
+            while entry_id is None:
+                entry_id = await asyncio.to_thread(
+                    try_acquire_slot,
+                    database_path,
+                    run_id,
+                    trial_task_name(trial_config),
+                    trial_config.trial_name,
+                    fallback_limit,
+                )
+                if entry_id is None:
+                    await asyncio.sleep(poll_seconds)
+            try:
+                return await self._execute_trial_with_retries(trial_config)
+            finally:
+                await asyncio.shield(asyncio.to_thread(
+                    release_slot, database_path, run_id, entry_id
+                ))
+
+    TrialQueue._run_trial = run_trial_with_global_slot
+
+
+_install_global_trial_queue()
+
+if os.environ.get("DEEPSWE_VERIFY_GLOBAL_QUEUE_PATCH") == "1":
+    print("DEEPSWE_GLOBAL_QUEUE_PATCH_OK", flush=True)
+    os._exit(0)
 
 
 def _install_retry_runtime_guards() -> None:
@@ -114,11 +219,33 @@ def _install_transient_failure_classification() -> None:
     async def run_with_transient_classification(self):
         result = await original_run(self)
         info = result.exception_info
-        if info and is_transient_agent_failure(
-            info.exception_type,
-            f"{info.exception_message}\n{agent_log_tail(self)}",
+        log_tail = (
+            agent_log_tail(self)
+            if info and info.exception_type == "NonZeroAgentExitCodeError"
+            else None
+        )
+        if (
+            info
+            and info.exception_type != TRANSIENT_VERIFIER_EXCEPTION_TYPE
+            and is_transient_agent_failure(
+                info.exception_type,
+                info.exception_message,
+                agent_log_tail=log_tail,
+            )
         ):
             info.exception_type = TRANSIENT_EXCEPTION_TYPE
+            try:
+                self._trial_paths.result_path.write_text(
+                    result.model_dump_json(indent=4),
+                    encoding="utf-8",
+                )
+            except (AttributeError, OSError) as exc:
+                logger = getattr(self, "_logger", None)
+                if logger is not None:
+                    logger.debug(
+                        "Failed to persist transient exception classification: "
+                        f"{exc}"
+                    )
         return result
 
     Trial.run = run_with_transient_classification

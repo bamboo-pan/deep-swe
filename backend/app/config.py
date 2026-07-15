@@ -12,7 +12,7 @@ class AppSettings(BaseSettings):
     default_agent: str = "mini-swe-agent"
     default_model: str = "gpt-5.6-sol"
     default_effort: str = "high"
-    default_concurrency: int = 2
+    max_parallel_tasks: int = 6
     agent_timeout_seconds: int = 5400
     verifier_timeout_seconds: int = 1800
     infrastructure_max_retries: int = 4

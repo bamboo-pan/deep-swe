@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlparse
 import psutil
-from sqlalchemy import select
+from sqlalchemy import select, text
 from .config import settings
 from .database import SessionLocal
 from .docker_cleanup import (
@@ -22,19 +22,27 @@ from .docker_cleanup import (
     sanitize_compose_project_name,
 )
 from .models import ACTIVE_STATES, TERMINAL_STATES, Run
-from .preferences import credential_path, current_secrets, get_preferences, jobs_path
+from .preferences import credential_path, current_secrets, get_preferences
 from .pier_retry_patch.networking import trial_network_subnets
 from .results import (
     _json as read_json, aggregate_trial_results, estimate_cost, jobs_root_for,
     pier_trial_prefix, run_code, run_detail as parsed_run_detail,
     run_task_progress, run_trial_progress, trial_folder,
 )
-from .schemas import RunDraft, concurrency_advice, total_parallel_tasks
+from .scheduler import (
+    clear_run_queue, enqueue_retry_trials, enqueue_runs, queue_admission,
+    queue_database_path, queue_status, requested_trial_count,
+)
+from .schemas import MAX_PARALLEL_TASKS, RunBatchDraft, RunDraft
 from .security import read_credential, redact
 
 _processes: dict[int, subprocess.Popen] = {}
 _retrying: dict[int, str] = {}
+_cancel_requested: set[int] = set()
 _lock = threading.Lock()
+_creation_lock = threading.Lock()
+_queue_patch_verify_lock = threading.Lock()
+_queue_patch_verified = False
 # 取消与结果落库都要做「读状态→写状态」，用同一把锁避免最后写者赢
 _state_lock = threading.Lock()
 
@@ -222,37 +230,73 @@ def _declared_timeouts(tasks: list[str]) -> tuple[float, float]:
             verifier_values.append(float(verifier_timeout))
     return max(agent_values, default=5400.0), max(verifier_values, default=1800.0)
 
-def create_run(draft: RunDraft) -> Run:
-    parallel_tasks = total_parallel_tasks(draft)
-    advice = concurrency_advice(parallel_tasks)
-    if advice["level"] == "blocked":
-        raise ValueError(advice["message"])
-    if advice["requires_confirmation"] and not draft.confirm_high_concurrency:
-        raise ValueError(f"总并行 Trial 数 {parallel_tasks} 需要高负载确认")
+def create_runs_with_admission(draft: RunBatchDraft) -> tuple[list[Run], dict]:
     preferences = get_preferences()
+    max_parallel_tasks = int(preferences["max_parallel_tasks"])
     infrastructure_max_retries = int(preferences["infrastructure_max_retries"])
+    requested = requested_trial_count(
+        draft.tasks, draft.attempts_per_task, len(draft.agents)
+    )
+    with _creation_lock:
+        with SessionLocal() as db:
+            db.execute(text("BEGIN IMMEDIATE"))
+            admission = queue_admission(
+                requested, db=db, limit=max_parallel_tasks
+            )
+            runs = []
+            for agent in draft.agents:
+                mapping = _reasoning_effort_adapter(agent, draft.reasoning_effort)
+                run = Run(
+                    status="queued", job_name=f"pending-{uuid.uuid4().hex}",
+                    jobs_dir=str(preferences["jobs_dir"]), agent=agent, model=draft.model,
+                    reasoning_effort=draft.reasoning_effort, reasoning_effort_adapter=mapping,
+                    reasoning_effort_effective=None,  # 有效值只能来自运行后的观测，创建时未知
+                    tasks_json=json.dumps(draft.tasks), attempts_per_task=draft.attempts_per_task,
+                    concurrency=max_parallel_tasks,
+                    agent_timeout_seconds=int(preferences["agent_timeout_seconds"]),
+                    verifier_timeout_seconds=int(preferences["verifier_timeout_seconds"]),
+                    retry_infrastructure_errors=infrastructure_max_retries > 0,
+                    infrastructure_max_retries=infrastructure_max_retries,
+                    agent_max_steps=int(preferences["agent_max_steps"]),
+                    codex_request_max_retries=draft.codex_request_max_retries,
+                    codex_stream_max_retries=draft.codex_stream_max_retries,
+                    codex_stream_idle_timeout_seconds=draft.codex_stream_idle_timeout_seconds,
+                    verification=draft.verification, service_tier=draft.service_tier,
+                )
+                db.add(run)
+                db.flush()
+                run.job_name = f"run-{run.id:06d}-{agent}"
+                runs.append(run)
+            enqueue_runs(db, runs, draft.tasks, draft.attempts_per_task)
+            db.commit()
+            for run in runs:
+                db.refresh(run)
+            run_ids = [run.id for run in runs]
+    for run_id in run_ids:
+        try:
+            threading.Thread(target=_execute, args=(run_id,), daemon=True).start()
+        except Exception as exc:
+            clear_run_queue(run_id)
+            with SessionLocal() as db:
+                run = db.get(Run, run_id)
+                if run:
+                    run.status = "failed"
+                    run.error = f"无法启动 Run 执行线程：{exc}"
+                    run.finished_at = datetime.now(UTC)
+                    db.commit()
     with SessionLocal() as db:
-        mapping = _reasoning_effort_adapter(draft.agent, draft.reasoning_effort)
-        run = Run(
-            status="queued", job_name=f"pending-{uuid.uuid4().hex}", jobs_dir=str(jobs_path()), agent=draft.agent, model=draft.model,
-            reasoning_effort=draft.reasoning_effort, reasoning_effort_adapter=mapping,
-            reasoning_effort_effective=None,  # 有效值只能来自运行后的观测，创建时未知
-            tasks_json=json.dumps(draft.tasks), attempts_per_task=draft.attempts_per_task,
-            concurrency=draft.concurrency,
-            agent_timeout_seconds=int(preferences["agent_timeout_seconds"]),
-            verifier_timeout_seconds=int(preferences["verifier_timeout_seconds"]),
-            retry_infrastructure_errors=infrastructure_max_retries > 0,
-            infrastructure_max_retries=infrastructure_max_retries,
-            agent_max_steps=int(preferences["agent_max_steps"]),
-            codex_request_max_retries=draft.codex_request_max_retries,
-            codex_stream_max_retries=draft.codex_stream_max_retries,
-            codex_stream_idle_timeout_seconds=draft.codex_stream_idle_timeout_seconds,
-            verification=draft.verification, service_tier=draft.service_tier)
-        db.add(run); db.flush()
-        run.job_name = f"run-{run.id:06d}-{draft.agent}"
-        db.commit(); db.refresh(run); run_id = run.id
-    threading.Thread(target=_execute, args=(run_id,), daemon=True).start()
-    with SessionLocal() as db: return db.get(Run, run_id)
+        return [db.get(Run, run_id) for run_id in run_ids], admission
+
+def create_runs(draft: RunBatchDraft) -> list[Run]:
+    runs, _admission = create_runs_with_admission(draft)
+    return runs
+
+def create_run(draft: RunDraft) -> Run:
+    batch = RunBatchDraft(
+        agents=[draft.agent],
+        **draft.model_dump(exclude={"agent"}),
+    )
+    return create_runs(batch)[0]
 
 def _crlf_scripts(tasks: list[str]) -> list[str]:
     bad = []
@@ -312,6 +356,13 @@ def _network_failure_summary(text: str) -> str | None:
     lowered = text.lower()
     if "api error: the operation timed out" in lowered:
         return "模型 API 请求超时"
+    if re.search(r"\beof\b", lowered) and re.search(
+        r"failed to (?:do request|resolve source metadata|fetch|pull)"
+        r"|\b(?:head|get)\s+\"https?://[^\"]+"
+        r"|\b(?:registry|manifest|source metadata)\b",
+        lowered,
+    ):
+        return "Docker/镜像仓库连接意外中断（EOF）"
     error_context = re.compile(
         r"(?:\b[a-z]*(?:connection|protocol|transport|read|write|timeout|network|api)[a-z]*error\b"
         r"|\b(?:exception|traceback|failed|failure)\b)",
@@ -342,10 +393,15 @@ def _run_failure_summary(job_dir: Path, supervisor_log: Path | None = None) -> s
             summary = _network_failure_summary(str(message or ""))
             if summary:
                 return summary
-            for path in sorted((folder / "agent").glob("*.txt")):
-                summary = _network_failure_summary(_tail_text(path))
-                if summary:
-                    return summary
+            if exception.get("exception_type") in {
+                None,
+                "NonZeroAgentExitCodeError",
+                "TransientAgentInfrastructureError",
+            }:
+                for path in sorted((folder / "agent").glob("*.txt")):
+                    summary = _network_failure_summary(_tail_text(path))
+                    if summary:
+                        return summary
         for path in (job_dir / "job.log",):
             summary = _network_failure_summary(_tail_text(path))
             if summary:
@@ -366,7 +422,7 @@ def _run_failure_summary(job_dir: Path, supervisor_log: Path | None = None) -> s
             return f"Pier: {lines[-1][:3500]}"
     return None
 
-def _completed_trials_cost(job_dir: Path, service_tier: str) -> float:
+def _completed_trials_cost(job_dir: Path, service_tier: str, model: str | None = None) -> float:
     """累计已落盘 Trial 的费用；pier 报告值优先，缺失时按 token 估算。"""
     total = 0.0
     if not job_dir.is_dir():
@@ -378,7 +434,7 @@ def _completed_trials_cost(job_dir: Path, service_tier: str) -> float:
         cost = agent_result.get("cost_usd")
         if not isinstance(cost, (int, float)):
             cost = estimate_cost(agent_result.get("n_input_tokens"), agent_result.get("n_cache_tokens"),
-                                 agent_result.get("n_output_tokens"), service_tier)
+                                 agent_result.get("n_output_tokens"), service_tier, model)
         if isinstance(cost, (int, float)):
             total += cost
     return total
@@ -417,7 +473,7 @@ def _terminate_tree(pid: int) -> None:
         except (ProcessLookupError, PermissionError):
             pass
 
-def _trial_usage(trial: Path, service_tier: str) -> tuple[float | None, int | None]:
+def _trial_usage(trial: Path, service_tier: str, model: str | None = None) -> tuple[float | None, int | None]:
     """进行中 Trial 的实时费用与步数；已落盘（有 result.json）的返回空，由 Run 级累计覆盖。
     容器内 agent 会在运行期间持续更新 ATIF 格式的 agent/trajectory.json（三个 agent 通用）；
     cost_usd 缺失（自建网关无价格表）时按 token 估算，mini 原生 trajectory 作最后兜底。"""
@@ -431,7 +487,7 @@ def _trial_usage(trial: Path, service_tier: str) -> tuple[float | None, int | No
     cost = final.get("total_cost_usd")
     if not isinstance(cost, (int, float)):
         cost = estimate_cost(final.get("total_prompt_tokens"), final.get("total_cached_tokens"),
-                             final.get("total_completion_tokens"), service_tier)
+                             final.get("total_completion_tokens"), service_tier, model)
     if cost is None:
         stats = ((read_json(trial / "agent" / "mini-swe-agent.trajectory.json").get("info") or {})
                  .get("model_stats") or {})
@@ -468,7 +524,8 @@ def _terminate_trial(trial: Path, reason: str) -> bool:
     return True
 
 def _wait_with_guard(proc: subprocess.Popen, job_dir: Path, service_tier: str,
-                     agent: str, max_steps: int, base_cost_usd: float = 0.0) -> str | None:
+                     agent: str, max_steps: int, base_cost_usd: float = 0.0,
+                     model: str | None = None) -> str | None:
     """等待 pier 结束，期间周期核查用量。单 Trial 超限只掐该 Trial 的容器，
     其余任务继续；Run 级累计超限或失控体征才终止整个进程树。"""
     prefs = get_preferences()
@@ -493,7 +550,7 @@ def _wait_with_guard(proc: subprocess.Popen, job_dir: Path, service_tier: str,
             for trial in job_dir.iterdir():
                 if not trial.is_dir() or trial.name in terminated:
                     continue
-                cost, steps = _trial_usage(trial, service_tier)
+                cost, steps = _trial_usage(trial, service_tier, model)
                 inflight_cost += cost or 0.0
                 trial_reason = None
                 if trial_budget > 0 and cost is not None and cost >= trial_cost_line:
@@ -504,7 +561,7 @@ def _wait_with_guard(proc: subprocess.Popen, job_dir: Path, service_tier: str,
                     terminated.add(trial.name)
         reason = _runaway_reason(job_dir)
         if not reason and run_budget > 0:
-            spent = base_cost_usd + _completed_trials_cost(job_dir, service_tier) + inflight_cost
+            spent = base_cost_usd + _completed_trials_cost(job_dir, service_tier, model) + inflight_cost
             if spent >= run_budget:
                 reason = f"累计费用 ${spent:.2f}（含进行中 Trial）达到 Run 预算上限 ${run_budget:.2f}"
         if reason:
@@ -515,7 +572,11 @@ def _wait_with_guard(proc: subprocess.Popen, job_dir: Path, service_tier: str,
                 pass
             return f"用量护栏自动终止：{reason}"
 
-def _pier_process_env() -> dict[str, str]:
+def _pier_process_env(
+    run_id: int,
+    verifier_infrastructure_max_retries: int = 0,
+    global_queue_limit: int | None = None,
+) -> dict[str, str]:
     process_env = os.environ.copy()
     # Windows 的默认 locale 可能无法读取 UTF-8 trajectory 或输出 Unicode 状态字符。
     process_env["PYTHONUTF8"] = "1"
@@ -526,7 +587,47 @@ def _pier_process_env() -> dict[str, str]:
     process_env["DEEPSWE_PIER_RETRY_DELAYS"] = ",".join(
         str(delay) for delay in INFRASTRUCTURE_RETRY_DELAYS_SEC
     )
+    process_env["DEEPSWE_VERIFIER_INFRA_MAX_RETRIES"] = str(
+        max(int(verifier_infrastructure_max_retries), 0)
+    )
+    process_env["DEEPSWE_GLOBAL_QUEUE_DB"] = str(queue_database_path())
+    process_env["DEEPSWE_RUN_ID"] = str(run_id)
+    process_env["DEEPSWE_GLOBAL_QUEUE_LIMIT"] = str(
+        max(
+            int(
+                global_queue_limit
+                if global_queue_limit is not None
+                else get_preferences()["max_parallel_tasks"]
+            ),
+            1,
+        )
+    )
     return process_env
+
+def _verify_global_queue_patch(run_id: int) -> None:
+    global _queue_patch_verified
+    if _queue_patch_verified:
+        return
+    with _queue_patch_verify_lock:
+        if _queue_patch_verified:
+            return
+        executable = shutil.which("pier")
+        if not executable:
+            raise RuntimeError("未找到 Pier，无法验证全局 Trial 队列补丁")
+        process_env = _pier_process_env(run_id)
+        process_env["DEEPSWE_VERIFY_GLOBAL_QUEUE_PATCH"] = "1"
+        result = subprocess.run(
+            [executable, "--version"],
+            cwd=settings.tasks_dir.parent,
+            env=process_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0 or "DEEPSWE_GLOBAL_QUEUE_PATCH_OK" not in result.stdout:
+            detail = (result.stderr or result.stdout or "Pier 未返回补丁握手标记").strip()
+            raise RuntimeError(f"全局 Trial 队列补丁验证失败：{detail[:1000]}")
+        _queue_patch_verified = True
 
 def _execute(run_id: int):
     secret_dir = None
@@ -538,19 +639,25 @@ def _execute(run_id: int):
             tasks, agent, model, effort, attempts, concurrency, job_name = json.loads(run.tasks_json), run.agent, run.model, run.reasoning_effort, run.attempts_per_task, run.concurrency, run.job_name
             service_tier = run.service_tier
             jobs_root = jobs_root_for(run)
+        _verify_global_queue_patch(run_id)
         cred = read_credential(credential_path())
         _preflight(tasks, cred.url)
         secret_dir, auth = _write_secret_auth(cred.token)
         command_model = f"openai/{model}" if agent == "mini-swe-agent" and "/" not in model else model
         agent_divisor, verifier_divisor = _declared_timeouts(tasks)
-        args = [shutil.which("pier") or "pier", "run", "-p", str(settings.tasks_dir), "--agent", agent, "--model", command_model, "-n", str(concurrency), "-k", str(attempts), "-y", "--job-name", job_name, "--jobs-dir", str(jobs_root), "--agent-timeout-multiplier", str(run.agent_timeout_seconds / agent_divisor), "--verifier-timeout-multiplier", str(run.verifier_timeout_seconds / verifier_divisor)]
+        local_concurrency = min(MAX_PARALLEL_TASKS, len(tasks) * attempts)
+        args = [shutil.which("pier") or "pier", "run", "-p", str(settings.tasks_dir), "--agent", agent, "--model", command_model, "-n", str(local_concurrency), "-k", str(attempts), "-y", "--job-name", job_name, "--jobs-dir", str(jobs_root), "--agent-timeout-multiplier", str(run.agent_timeout_seconds / agent_divisor), "--verifier-timeout-multiplier", str(run.verifier_timeout_seconds / verifier_divisor)]
         args += _pier_retry_args(
             run.retry_infrastructure_errors, run.infrastructure_max_retries
         )
         if not run.verification:
             args.append("--disable-verification")
         for task in tasks: args += ["-i", task]
-        process_env = _pier_process_env()
+        process_env = _pier_process_env(
+            run_id,
+            run.infrastructure_max_retries
+            if run.retry_infrastructure_errors else 0,
+        )
         try:
             trial_budget = float(get_preferences().get("trial_budget_usd") or 0)
         except (TypeError, ValueError):
@@ -590,15 +697,23 @@ def _execute(run_id: int):
             raise ValueError(f"不支持的 agent: {agent}")
         jobs_root.mkdir(parents=True, exist_ok=True)
         log_path = jobs_root / f"{job_name}.supervisor.log"
+        with SessionLocal() as db:
+            queued_run = db.get(Run, run_id)
+            if queued_run and queued_run.status not in TERMINAL_STATES:
+                queued_run.status = "queued"
+                db.commit()
         with log_path.open("w", encoding="utf-8") as log:
-            proc = subprocess.Popen(
-                args, cwd=settings.tasks_dir.parent, env=process_env, stdout=log, stderr=subprocess.STDOUT,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
-                start_new_session=os.name != "nt")
-            with _lock: _processes[run_id] = proc
+            with _lock:
+                if run_id in _cancel_requested:
+                    return
+                proc = subprocess.Popen(
+                    args, cwd=settings.tasks_dir.parent, env=process_env, stdout=log, stderr=subprocess.STDOUT,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+                    start_new_session=os.name != "nt")
+                _processes[run_id] = proc
             with SessionLocal() as db:
-                run = db.get(Run, run_id); run.status = "running"; run.pid = proc.pid; db.commit()
-            guard_error = _wait_with_guard(proc, jobs_root / job_name, service_tier, agent, run.agent_max_steps)
+                run = db.get(Run, run_id); run.pid = proc.pid; db.commit()
+            guard_error = _wait_with_guard(proc, jobs_root / job_name, service_tier, agent, run.agent_max_steps, model=model)
         if guard_error:
             with _state_lock, SessionLocal() as db:
                 run = db.get(Run, run_id)
@@ -613,7 +728,13 @@ def _execute(run_id: int):
                 run.status = "failed"; run.error = redact(str(exc), current_secrets()); run.finished_at = datetime.now(UTC)
                 db.commit()
     finally:
-        with _lock: _processes.pop(run_id, None)
+        with _lock:
+            _processes.pop(run_id, None)
+            _cancel_requested.discard(run_id)
+        try:
+            clear_run_queue(run_id)
+        except Exception:
+            pass
         if secret_dir: shutil.rmtree(secret_dir, ignore_errors=True)
         _cleanup_after_run(run_id, job_name, jobs_root)
 
@@ -683,6 +804,7 @@ def _reserve_retry_batch(run_id: int, batch_id: str) -> bool:
     with _lock:
         if run_id in _retrying or run_id in _processes:
             return False
+        _cancel_requested.discard(run_id)
         _retrying[run_id] = batch_id
         return True
 
@@ -693,6 +815,8 @@ def _register_retry_process(
 ) -> bool:
     with _lock:
         if _retrying.get(run_id) != batch_id:
+            return False
+        if run_id in _cancel_requested:
             return False
         current = _processes.get(run_id)
         if current is not None and current is not proc:
@@ -712,6 +836,7 @@ def _release_retry_batch(
         if proc is None or current is proc:
             _processes.pop(run_id, None)
         _retrying.pop(run_id, None)
+        _cancel_requested.discard(run_id)
 
 def _retry_specs(run: Run, trial_ids: list[str]) -> list[dict]:
     unique_ids = list(dict.fromkeys(trial_ids))
@@ -816,10 +941,15 @@ def _prepare_retry_config(
         ["TransientAgentInfrastructureError"]
         if run.infrastructure_max_retries > 0 else []
     )
-    process_env = _pier_process_env()
+    current_preferences = {**get_preferences(), **(preferences or {})}
+    process_env = _pier_process_env(
+        run.id,
+        run.infrastructure_max_retries,
+        global_queue_limit=int(current_preferences["max_parallel_tasks"]),
+    )
     process_env["DEEPSWE_RETRY_JOB_NAME"] = retry_name
     process_env["DEEPSWE_RETRY_TRIAL_NAMES"] = json.dumps(runtime_trial_ids)
-    current_preferences = preferences or get_preferences()
+    config["n_concurrent_trials"] = min(MAX_PARALLEL_TASKS, len(specs))
     try:
         trial_budget = float(current_preferences.get("trial_budget_usd") or 0)
     except (TypeError, ValueError):
@@ -1205,7 +1335,7 @@ def _budget_value(preferences: dict, key: str) -> float:
     except (TypeError, ValueError):
         return 0.0
 
-def _visible_trial_cost(trial: dict, service_tier: str) -> float:
+def _visible_trial_cost(trial: dict, service_tier: str, model: str | None = None) -> float:
     reported = trial.get("reported_cost_usd")
     if isinstance(reported, (int, float)) and not isinstance(reported, bool):
         return float(reported)
@@ -1214,6 +1344,7 @@ def _visible_trial_cost(trial: dict, service_tier: str) -> float:
         trial.get("cached_tokens"),
         trial.get("output_tokens"),
         service_tier,
+        model,
     )
     return float(estimated or 0)
 
@@ -1280,6 +1411,7 @@ def _execute_retry(run_id: int, specs: list[dict], batch_id: str) -> None:
             infrastructure_max_retries = int(preferences["infrastructure_max_retries"])
             run.agent_timeout_seconds = int(preferences["agent_timeout_seconds"])
             run.verifier_timeout_seconds = int(preferences["verifier_timeout_seconds"])
+            run.concurrency = int(preferences["max_parallel_tasks"])
             run.retry_infrastructure_errors = infrastructure_max_retries > 0
             run.infrastructure_max_retries = infrastructure_max_retries
             run.agent_max_steps = int(preferences["agent_max_steps"])
@@ -1292,8 +1424,10 @@ def _execute_retry(run_id: int, specs: list[dict], batch_id: str) -> None:
             retry_name = retry_job_name(run.job_name, batch_id)
             service_tier = run.service_tier
             agent = run.agent
+            model = run.model
             max_steps = run.agent_max_steps
             original_dir = jobs_root / run.job_name
+        _verify_global_queue_patch(run_id)
         if not retry_dir.is_dir():
             raise RuntimeError("重试工作目录缺失")
         metadata = _retry_request_metadata(retry_dir)
@@ -1319,7 +1453,7 @@ def _execute_retry(run_id: int, specs: list[dict], batch_id: str) -> None:
             except Exception:
                 pass
 
-        base_cost_usd = _completed_trials_cost(original_dir, service_tier)
+        base_cost_usd = _completed_trials_cost(original_dir, service_tier, model)
         run_budget = _budget_value(preferences, "run_budget_usd")
         if run_budget > 0 and base_cost_usd >= run_budget:
             raise RuntimeError(
@@ -1335,7 +1469,16 @@ def _execute_retry(run_id: int, specs: list[dict], batch_id: str) -> None:
         jobs_root.mkdir(parents=True, exist_ok=True)
         supervisor_log = jobs_root / f"{retry_name}.supervisor.log"
         args = [shutil.which("pier") or "pier", "run", "--config", str(config_path), "-y"]
+        _set_retry_marker_state(original_dir, specs, "queued")
+        with SessionLocal() as db:
+            current = db.get(Run, run_id)
+            if current and current.status not in TERMINAL_STATES:
+                current.status = "queued"
+                db.commit()
         with supervisor_log.open("w", encoding="utf-8") as log:
+            with _lock:
+                if run_id in _cancel_requested:
+                    return
             proc = subprocess.Popen(
                 args,
                 cwd=settings.tasks_dir.parent,
@@ -1345,14 +1488,12 @@ def _execute_retry(run_id: int, specs: list[dict], batch_id: str) -> None:
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
                 start_new_session=os.name != "nt",
             )
-            _set_retry_marker_state(original_dir, specs, "preparing_environment")
             if not _register_retry_process(run_id, batch_id, proc):
                 _terminate_tree(proc.pid)
                 raise RuntimeError("重试批次已被替换，拒绝登记旧进程")
             with SessionLocal() as db:
                 current = db.get(Run, run_id)
                 if current:
-                    current.status = "running"
                     current.pid = proc.pid
                     db.commit()
             guard_error = _wait_with_guard(
@@ -1362,6 +1503,7 @@ def _execute_retry(run_id: int, specs: list[dict], batch_id: str) -> None:
                 agent,
                 max_steps,
                 base_cost_usd,
+                model,
             )
 
         if guard_error:
@@ -1430,6 +1572,10 @@ def _execute_retry(run_id: int, specs: list[dict], batch_id: str) -> None:
                 db.commit()
     finally:
         _release_retry_batch(run_id, batch_id, proc)
+        try:
+            clear_run_queue(run_id)
+        except Exception:
+            pass
         if secret_dir:
             shutil.rmtree(secret_dir, ignore_errors=True)
         if (
@@ -1462,7 +1608,7 @@ def retry_trials(run_id: int, trial_ids: list[str]) -> dict:
             selected_ids = {spec["trial_id"] for spec in specs}
             detail = parsed_run_detail(run, include_patches=False)
             retained_cost = sum(
-                _visible_trial_cost(trial, run.service_tier)
+                _visible_trial_cost(trial, run.service_tier, run.model)
                 for trial in detail["trials"]
                 if trial["id"] not in selected_ids
             )
@@ -1474,6 +1620,13 @@ def retry_trials(run_id: int, trial_ids: list[str]) -> dict:
             if not _reserve_retry_batch(run_id, batch_id):
                 raise RuntimeError("上一批 Trial 重试仍在收尾，暂不能提交新重试")
             reserved = True
+            clear_run_queue(run_id, db=db)
+            admission = queue_admission(
+                len(specs),
+                db=db,
+                limit=int(preferences["max_parallel_tasks"]),
+            )
+            enqueue_retry_trials(db, run_id, specs, batch_id)
             jobs_root = jobs_root_for(run)
             original_dir = jobs_root / run.job_name
             retry_name = retry_job_name(run.job_name, batch_id)
@@ -1527,6 +1680,7 @@ def retry_trials(run_id: int, trial_ids: list[str]) -> dict:
         ).start()
     except Exception:
         _release_retry_batch(run_id, batch_id)
+        clear_run_queue(run_id)
         with _state_lock, SessionLocal() as db:
             run = db.get(Run, run_id)
             if run:
@@ -1548,6 +1702,7 @@ def retry_trials(run_id: int, trial_ids: list[str]) -> dict:
         "retry_job_name": retry_name,
         "trial_ids": [spec["trial_id"] for spec in specs],
         "retry_count": len(specs),
+        "admission": admission,
     }
 
 def _cleanup_after_run(run_id: int, job_name: str | None, jobs_root: Path | None) -> None:
@@ -1630,21 +1785,28 @@ def cancel_run(run_id: int) -> bool:
     with _lock:
         proc = _processes.get(run_id)
         retry_batch_id = _retrying.get(run_id)
-    if not proc: return False
-    _terminate_tree(proc.pid)
-    try:
-        proc.wait(timeout=20)
-    except subprocess.TimeoutExpired:
-        pass
+        if proc is None:
+            _cancel_requested.add(run_id)
     with _state_lock, SessionLocal() as db:
         run = db.get(Run, run_id)
         if not run:
+            with _lock:
+                _cancel_requested.discard(run_id)
             return False
         job_name, jobs_root = run.job_name, jobs_root_for(run)
         if run.status in TERMINAL_STATES:
             # 进程恰好已正常结束并落库，不把 completed 改写成 cancelled
+            with _lock:
+                _cancel_requested.discard(run_id)
             return False
         run.status = "cancelled"; run.finished_at = datetime.now(UTC); db.commit()
+    if proc is not None:
+        _terminate_tree(proc.pid)
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            pass
+    clear_run_queue(run_id)
     cleanup_name = (
         retry_job_name(job_name, retry_batch_id)
         if retry_batch_id else job_name
@@ -1752,17 +1914,20 @@ def reap_orphaned_runs() -> None:
                     message += f"；重试结果恢复失败：{recovery_error}"
                 run.error = run.error or message
                 db.commit()
+        clear_run_queue(run_id)
 
 def shutdown_processes() -> None:
     """服务退出时终止仍在运行的 pier 子进程，防止孤儿进程继续调用付费 API。"""
     with _lock: items = list(_processes.items())
-    for _run_id, proc in items:
+    for run_id, proc in items:
         if proc.poll() is None:
             _terminate_tree(proc.pid)
+        clear_run_queue(run_id)
 
 def serialize(run: Run) -> dict:
     progress = run_trial_progress(run)
-    return {"id":run.id,"run_code":run_code(run.id),"job_name":run.job_name,"status":run.status,"agent":run.agent,"model":run.model,"reasoning_effort":run.reasoning_effort,"reasoning_effort_adapter":run.reasoning_effort_adapter,"reasoning_effort_effective":run.reasoning_effort_effective,"pier_version":run.pier_version,"tasks":json.loads(run.tasks_json),"attempts_per_task":run.attempts_per_task,"concurrency":run.concurrency,"agent_timeout_seconds":run.agent_timeout_seconds,"verifier_timeout_seconds":run.verifier_timeout_seconds,"retry_infrastructure_errors":run.retry_infrastructure_errors,"infrastructure_max_retries":run.infrastructure_max_retries,"agent_max_steps":run.agent_max_steps,"codex_request_max_retries":run.codex_request_max_retries,"codex_stream_max_retries":run.codex_stream_max_retries,"codex_stream_idle_timeout_seconds":run.codex_stream_idle_timeout_seconds,"created_at":run.created_at,"finished_at":run.finished_at,"passed":run.passed,"reward":run.reward,"progress":progress,"task_progress":run_task_progress(run),"input_tokens":run.input_tokens,"cached_tokens":run.cached_tokens,"uncached_input_tokens":max((run.input_tokens or 0)-(run.cached_tokens or 0),0),"output_tokens":run.output_tokens,"cost_usd":run.cost_usd,"reported_cost_usd":run.cost_usd,"estimated_cost_usd":estimate_cost(run.input_tokens,run.cached_tokens,run.output_tokens,run.service_tier),"service_tier":run.service_tier,"error":run.error}
+    queue = queue_status(run.id)
+    return {"id":run.id,"run_code":run_code(run.id),"job_name":run.job_name,"status":run.status,"agent":run.agent,"model":run.model,"reasoning_effort":run.reasoning_effort,"reasoning_effort_adapter":run.reasoning_effort_adapter,"reasoning_effort_effective":run.reasoning_effort_effective,"pier_version":run.pier_version,"tasks":json.loads(run.tasks_json),"attempts_per_task":run.attempts_per_task,"concurrency":run.concurrency,"queue":queue,"agent_timeout_seconds":run.agent_timeout_seconds,"verifier_timeout_seconds":run.verifier_timeout_seconds,"retry_infrastructure_errors":run.retry_infrastructure_errors,"infrastructure_max_retries":run.infrastructure_max_retries,"agent_max_steps":run.agent_max_steps,"codex_request_max_retries":run.codex_request_max_retries,"codex_stream_max_retries":run.codex_stream_max_retries,"codex_stream_idle_timeout_seconds":run.codex_stream_idle_timeout_seconds,"created_at":run.created_at,"finished_at":run.finished_at,"passed":run.passed,"reward":run.reward,"progress":progress,"task_progress":run_task_progress(run),"input_tokens":run.input_tokens,"cached_tokens":run.cached_tokens,"uncached_input_tokens":max((run.input_tokens or 0)-(run.cached_tokens or 0),0),"output_tokens":run.output_tokens,"cost_usd":run.cost_usd,"reported_cost_usd":run.cost_usd,"estimated_cost_usd":estimate_cost(run.input_tokens,run.cached_tokens,run.output_tokens,run.service_tier,run.model),"service_tier":run.service_tier,"error":run.error}
 
 def list_runs() -> list[dict]:
     with SessionLocal() as db: return [serialize(r) for r in db.scalars(select(Run).order_by(Run.id.desc())).all()]

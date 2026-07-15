@@ -1,0 +1,47 @@
+diff --git a/tests/test_task_summary.py b/tests/test_task_summary.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_task_summary.py
+@@ -0,0 +1,42 @@
++from decimal import Decimal
++
++import pytest
++
++from flowcheck import summarize_numbers
++
++
++def test_summary_returns_complete_empty_schema():
++    assert summarize_numbers([]) == {
++        "count": 0,
++        "total": 0,
++        "average": None,
++        "minimum": None,
++        "maximum": None,
++    }
++
++
++def test_summary_calculates_minimum_and_maximum():
++    result = summarize_numbers([3, -1, 2.5])
++    assert result["minimum"] == -1
++    assert result["maximum"] == 3
++
++
++def test_summary_consumes_generators_once():
++    result = summarize_numbers(value for value in [2, 8])
++    assert result == {
++        "count": 2,
++        "total": 10,
++        "average": 5,
++        "minimum": 2,
++        "maximum": 8,
++    }
++
++
++def test_summary_rejects_boolean_values():
++    with pytest.raises(TypeError):
++        summarize_numbers([1, True])
++
++
++def test_summary_rejects_non_builtin_numeric_values():
++    with pytest.raises(TypeError):
++        summarize_numbers([Decimal("1.5")])

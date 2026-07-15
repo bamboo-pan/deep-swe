@@ -49,6 +49,23 @@ class Run(Base):
     cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+class TrialQueueEntry(Base):
+    __tablename__ = "trial_queue_entries"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(Integer, index=True)
+    task_name: Mapped[str] = mapped_column(String(300))
+    attempt: Mapped[int] = mapped_column(Integer)
+    state: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    trial_name: Mapped[str | None] = mapped_column(String(300), nullable=True, index=True)
+    queue_order: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    owner_pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    batch_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+    queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
 class Baseline(Base):
     __tablename__ = "baselines"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

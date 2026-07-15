@@ -1,0 +1,20 @@
+{
+  "base_commit": "d292555c23c1bf40f0fd410ce0371a06d81bfaf4",
+  "f2p_node_ids": [
+    "tests.test_task_slugify.test_slugify_collapses_punctuation_and_whitespace",
+    "tests.test_task_slugify.test_slugify_trims_separator_runs",
+    "tests.test_task_slugify.test_slugify_uses_fallback_for_empty_result",
+    "tests.test_task_slugify.test_slugify_preserves_ascii_digits",
+    "tests.test_task_slugify.test_slugify_rejects_non_string_values"
+  ],
+  "p2p_node_ids": [
+    "tests.test_text_existing.test_collapse_spaces_handles_mixed_whitespace",
+    "tests.test_text_existing.test_collapse_spaces_preserves_words",
+    "tests.test_text_existing.test_slugify_keeps_simple_labels"
+  ],
+  "grade": {
+    "format": "junit",
+    "tool_label": "pytest",
+    "reports": ["/logs/verifier/pytest.xml"]
+  }
+}

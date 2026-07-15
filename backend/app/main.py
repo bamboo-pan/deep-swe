@@ -28,19 +28,25 @@ from .docker_cleanup import (
 from .models import ACTIVE_STATES, TERMINAL_STATES, Baseline, Run, Setting
 from .official_stats import load_official_stats, official_stats_meta, sync_official_stats
 from .preferences import KEYS as PREFERENCE_KEYS, get_preferences, update_preferences
+from .pricing import pricing_meta, sync_pricing
 from .provider_catalog import EFFORT_ORDER, get_provider_catalog
 from .results import (
     compare_runs, deleted_trial_entries, jobs_root_for, list_details, parse_timestamp,
     run_detail as parsed_run_detail, task_catalog, trial_detail, trial_folder, trial_log,
 )
 from .runner import (
-    cancel_run, create_run, get_run, list_runs, reap_orphaned_runs,
-    retry_job_names, retry_trials, run_log, shutdown_processes,
+    cancel_run, create_run, create_runs_with_admission, get_run, list_runs,
+    reap_orphaned_runs, retry_job_names, retry_trials, run_log, serialize,
+    shutdown_processes,
+)
+from .scheduler import (
+    clear_inactive_queue_entries, clear_run_queue, queue_admission, queue_status,
+    requested_trial_count,
 )
 from .schemas import (
-    MAX_CONCURRENCY_PER_RUN, BaselineDraft, CompareAnalysisRequest, CompareRequest,
-    DockerCleanupRequest, RestorePayload, RetryTrialsDraft, RunDraft, SettingsUpdate,
-    concurrency_advice, total_parallel_tasks,
+    BaselineDraft, CompareAnalysisRequest, CompareRequest, DockerCleanupRequest,
+    RestorePayload, RetryTrialsDraft, RunBatchDraft, RunDraft, SettingsUpdate,
+    concurrency_advice,
 )
 from .security import is_safe_job_name, read_credential
 from .task_suite import DEFAULT_TASKS, DEFAULT_TASK_SUITE_NAME
@@ -48,6 +54,7 @@ from .task_suite import DEFAULT_TASKS, DEFAULT_TASK_SUITE_NAME
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    clear_inactive_queue_entries()
     if os.environ.get("DEEPSWE_SKIP_STARTUP_REAP") != "1":
         reap_orphaned_runs()
     yield
@@ -95,7 +102,7 @@ def _provider_bootstrap(preferences: dict, *, force_refresh: bool = False) -> di
         },
     }
 
-def _provider_selection_error(draft: RunDraft) -> str | None:
+def _provider_selection_error(draft: RunDraft | RunBatchDraft) -> str | None:
     preferences = get_preferences()
     catalog = get_provider_catalog(preferences["default_model"], preferences["default_effort"])
     if not catalog["models_authoritative"]:
@@ -141,7 +148,6 @@ def bootstrap():
             "agent": preferences["default_agent"],
             "model": provider["default_model"],
             "reasoning_effort": provider["default_effort"],
-            "concurrency": preferences["default_concurrency"],
         },
         "agents": ["mini-swe-agent", "codex", "claude-code"],
         "models": provider["models"],
@@ -153,7 +159,6 @@ def bootstrap():
         "setting_options": {
             "credential_files": credential_options,
             "jobs_dirs": job_options,
-            "concurrency": list(range(1, MAX_CONCURRENCY_PER_RUN + 1)),
         },
         "task_suite": {"name": DEFAULT_TASK_SUITE_NAME, "tasks": task_choices},
     }
@@ -164,15 +169,38 @@ def diagnostics(): return run_checks()
 @app.get("/api/concurrency/{value}")
 def concurrency(value: int): return concurrency_advice(value)
 
+@app.get("/api/scheduler")
+def scheduler_status(): return queue_status()
+
+def _run_queue_preview(draft: RunDraft | RunBatchDraft, run_count: int) -> dict:
+    max_parallel_tasks = int(get_preferences()["max_parallel_tasks"])
+    requested = requested_trial_count(
+        draft.tasks, draft.attempts_per_task, run_count
+    )
+    admission = queue_admission(requested, limit=max_parallel_tasks)
+    return {
+        "valid": True,
+        "trial_count": requested,
+        "max_parallel_tasks": max_parallel_tasks,
+        "concurrency": concurrency_advice(min(max_parallel_tasks, requested)),
+        "admission": admission,
+    }
+
 @app.post("/api/runs/validate")
 def validate_run(draft: RunDraft):
     missing = [task for task in draft.tasks if not (settings.tasks_dir / task).is_dir()]
-    parallel_tasks = total_parallel_tasks(draft)
-    advice = concurrency_advice(parallel_tasks)
     if missing: raise HTTPException(422, detail={"missing_tasks": missing})
     if selection_error := _provider_selection_error(draft):
         raise HTTPException(422, detail=selection_error)
-    return {"valid": advice["level"] != "blocked", "trial_count": len(draft.tasks) * draft.attempts_per_task, "total_parallel_tasks": parallel_tasks, "concurrency": advice}
+    return _run_queue_preview(draft, 1)
+
+@app.post("/api/runs/batch/validate")
+def validate_run_batch(draft: RunBatchDraft):
+    missing = [task for task in draft.tasks if not (settings.tasks_dir / task).is_dir()]
+    if missing: raise HTTPException(422, detail={"missing_tasks": missing})
+    if selection_error := _provider_selection_error(draft):
+        raise HTTPException(422, detail=selection_error)
+    return _run_queue_preview(draft, len(draft.agents))
 
 @app.post("/api/runs")
 def start_run(draft: RunDraft):
@@ -182,6 +210,21 @@ def start_run(draft: RunDraft):
         raise HTTPException(422, detail=selection_error)
     try: return create_run(draft)
     except ValueError as exc: raise HTTPException(422,detail=str(exc))
+
+@app.post("/api/runs/batch")
+def start_run_batch(draft: RunBatchDraft):
+    missing = [task for task in draft.tasks if not (settings.tasks_dir / task).is_dir()]
+    if missing: raise HTTPException(422, detail={"missing_tasks": missing})
+    if selection_error := _provider_selection_error(draft):
+        raise HTTPException(422, detail=selection_error)
+    try:
+        runs, admission = create_runs_with_admission(draft)
+        return {
+            "runs": [serialize(run) for run in runs],
+            "admission": admission,
+            "scheduler": queue_status(),
+        }
+    except ValueError as exc: raise HTTPException(422, detail=str(exc))
 
 @app.get("/api/runs")
 def runs(): return list_runs()
@@ -326,6 +369,7 @@ def delete_run(run_id:int):
         run=db.get(Run,run_id)
         if run:
             db.execute(delete(Baseline).where(Baseline.run_id==run_id))
+            clear_run_queue(run_id, db=db)
             db.delete(run); db.commit()
     target=_safe_job_dir(jobs_root, job_name)
     if target:
@@ -349,7 +393,11 @@ def delete_run(run_id:int):
 
 def _run_fingerprint(run: Run) -> tuple:
     """轻量变化指纹：状态 + result.json mtime + 5 秒兜底刷新（阶段探测依赖的其他文件不逐个 stat）。"""
-    parts = [run.status, str(run.finished_at), int(time.monotonic() // 5)]
+    queue = queue_status(run.id)
+    parts = [
+        run.status, str(run.finished_at), queue["running"], queue["queued"],
+        int(time.monotonic() // 5),
+    ]
     root = jobs_root_for(run) / run.job_name
     if root.exists():
         for path in sorted(root.rglob("result.json")):
@@ -450,11 +498,28 @@ def sync_official():
     except Exception as exc:
         raise HTTPException(502, f"官方统计同步失败：{exc}")
 
+@app.get("/api/pricing/meta")
+def read_pricing_meta(): return pricing_meta()
+
+@app.post("/api/pricing/sync")
+def refresh_pricing():
+    try:
+        return sync_pricing()
+    except Exception as exc:
+        raise HTTPException(502, f"模型定价同步失败：{exc}")
+
 @app.get("/api/settings")
 def read_settings(): return get_preferences()
 
 @app.put("/api/settings")
 def save_settings(payload: SettingsUpdate):
+    if payload.max_parallel_tasks is not None:
+        running = queue_status()["running"]
+        if payload.max_parallel_tasks < running:
+            raise HTTPException(
+                409,
+                f"当前有 {running} 个 Trial 正在运行，最大并行 Task 数不能降到 {payload.max_parallel_tasks}",
+            )
     preferences = update_preferences(payload)
     provider = _provider_bootstrap(preferences, force_refresh=True)
     corrections = {}

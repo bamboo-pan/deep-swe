@@ -4,10 +4,10 @@ import subprocess
 from pathlib import Path
 from urllib.parse import quote
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from app.main import app
 from app.database import SessionLocal
-from app.models import Run, Setting
+from app.models import Run, Setting, TrialQueueEntry
 from app.security import is_safe_job_name, read_credential, redact
 
 def test_command_check_timeout_is_non_blocking_warning(monkeypatch):
@@ -31,6 +31,7 @@ def test_lifespan_can_skip_startup_reap_for_side_by_side_server(monkeypatch):
     calls = []
     monkeypatch.setenv("DEEPSWE_SKIP_STARTUP_REAP", "1")
     monkeypatch.setattr(main, "init_db", lambda: calls.append("init"))
+    monkeypatch.setattr(main, "clear_inactive_queue_entries", lambda: calls.append("queue"))
     monkeypatch.setattr(main, "reap_orphaned_runs", lambda: calls.append("reap"))
     monkeypatch.setattr(main, "shutdown_processes", lambda: calls.append("shutdown"))
 
@@ -40,7 +41,7 @@ def test_lifespan_can_skip_startup_reap_for_side_by_side_server(monkeypatch):
 
     asyncio.run(exercise())
 
-    assert calls == ["init", "running", "shutdown"]
+    assert calls == ["init", "queue", "running", "shutdown"]
 
 def test_bootstrap_has_frontier_regression_suite():
     with TestClient(app) as client:
@@ -141,12 +142,106 @@ def test_empty_task_list_is_rejected():
     with TestClient(app) as client:
         assert client.post("/api/runs",json={"agent":"codex","tasks":[]}).status_code==422
 
-def test_run_validation_counts_trials_and_rejects_missing_task():
+def test_run_validation_counts_trials_and_rejects_missing_task(monkeypatch):
+    from app import main
+
+    preferences = main.get_preferences()
+    monkeypatch.setattr(main, "get_preferences", lambda: {
+        **preferences,
+        "max_parallel_tasks": 72,
+    })
+    with SessionLocal() as db:
+        db.execute(delete(TrialQueueEntry))
+        db.commit()
     with TestClient(app) as client:
-        good=client.post("/api/runs/validate",json={"tasks":["actionlint-action-pinning-lint"],"attempts_per_task":4,"concurrency":72,"parallel_agent_count":3})
+        good=client.post("/api/runs/validate",json={"tasks":["actionlint-action-pinning-lint"],"attempts_per_task":4})
         assert good.status_code==200 and good.json()["trial_count"]==4
-        assert good.json()["total_parallel_tasks"]==12
+        assert good.json()["max_parallel_tasks"]==72
+        assert good.json()["admission"]["immediate_trials"]==4
+        assert good.json()["admission"]["queued_trials"]==0
         assert client.post("/api/runs/validate",json={"tasks":["not-a-real-task"]}).status_code==422
+
+def test_batch_validation_warns_when_global_slots_are_full(monkeypatch):
+    from app import main, scheduler
+
+    preferences = main.get_preferences()
+    limited = {**preferences, "max_parallel_tasks": 2}
+    monkeypatch.setattr(main, "get_preferences", lambda: limited)
+    monkeypatch.setattr(scheduler, "get_preferences", lambda: limited)
+    with TestClient(app) as client:
+        with SessionLocal() as db:
+            db.execute(delete(TrialQueueEntry))
+            db.add_all([
+                TrialQueueEntry(
+                    run_id=900001 + index,
+                    task_name=f"busy-{index}",
+                    attempt=1,
+                    state="running",
+                    queue_order=index + 1,
+                )
+                for index in range(2)
+            ])
+            db.commit()
+        try:
+            preview = client.post("/api/runs/batch/validate", json={
+                "agents": ["mini-swe-agent", "codex", "claude-code"],
+                "tasks": ["actionlint-action-pinning-lint"],
+            }).json()
+            status = client.get("/api/scheduler").json()
+            assert preview["admission"]["immediate_trials"] == 0
+            assert preview["admission"]["queued_trials"] == 3
+            assert status["running"] == 2 and status["available"] == 0
+        finally:
+            with SessionLocal() as db:
+                db.execute(delete(TrialQueueEntry))
+                db.commit()
+
+def test_settings_cannot_lower_limit_below_running_trials():
+    with TestClient(app) as client:
+        with SessionLocal() as db:
+            db.execute(delete(TrialQueueEntry))
+            db.add_all([
+                TrialQueueEntry(
+                    run_id=910001 + index,
+                    task_name=f"busy-{index}",
+                    attempt=1,
+                    state="running",
+                    queue_order=index + 1,
+                )
+                for index in range(2)
+            ])
+            db.commit()
+        try:
+            response = client.put("/api/settings", json={"max_parallel_tasks": 1})
+            assert response.status_code == 409
+            assert "2 个 Trial" in response.json()["detail"]
+        finally:
+            with SessionLocal() as db:
+                db.execute(delete(TrialQueueEntry))
+                db.commit()
+
+def test_batch_run_creation_uses_server_side_agent_group(monkeypatch):
+    from app import main
+
+    captured = {}
+    monkeypatch.setattr(main, "_provider_selection_error", lambda _draft: None)
+    def fake_create(draft):
+        captured["draft"] = draft
+        return [], {
+            "limit": 6, "running": 0, "queued": 0, "available": 6,
+            "total": 0, "requested_trials": 3, "immediate_trials": 3,
+            "queued_trials": 0, "waiting_ahead": 0, "total_queued_after": 0,
+        }
+    monkeypatch.setattr(main, "create_runs_with_admission", fake_create)
+    with TestClient(app) as client:
+        response = client.post("/api/runs/batch", json={
+            "agents": ["mini-swe-agent", "codex", "claude-code"],
+            "tasks": ["actionlint-action-pinning-lint"],
+        })
+    assert response.status_code == 200
+    assert response.json()["admission"]["immediate_trials"] == 3
+    assert captured["draft"].agents == ["mini-swe-agent", "codex", "claude-code"]
+    assert "concurrency" not in type(captured["draft"]).model_fields
 
 def test_run_detail_404_and_cancel_inactive():
     with TestClient(app) as client:
@@ -279,6 +374,7 @@ def test_settings_persist_retry_runtime_limits_and_cost_guards(monkeypatch):
         "default_effort": preferences["default_effort"],
     })
     keys = (
+        "max_parallel_tasks",
         "agent_timeout_seconds", "verifier_timeout_seconds",
         "infrastructure_max_retries", "agent_max_steps",
         "trial_budget_usd", "run_budget_usd",
@@ -286,6 +382,7 @@ def test_settings_persist_retry_runtime_limits_and_cost_guards(monkeypatch):
     with TestClient(app) as client:
         original = client.get("/api/settings").json()
         payload = {
+            "max_parallel_tasks": 9,
             "agent_timeout_seconds": 7200,
             "verifier_timeout_seconds": 2400,
             "infrastructure_max_retries": 2,
@@ -300,6 +397,34 @@ def test_settings_persist_retry_runtime_limits_and_cost_guards(monkeypatch):
             assert {key: saved[key] for key in keys} == payload
         finally:
             client.put("/api/settings", json={key: original[key] for key in keys})
+
+def test_legacy_per_agent_concurrency_migrates_to_global_limit():
+    from app.preferences import get_preferences
+
+    keys = ("default_concurrency", "max_parallel_tasks")
+    with SessionLocal() as db:
+        original = {
+            key: row.value
+            for key in keys
+            if (row := db.get(Setting, key)) is not None
+        }
+        for key in keys:
+            row = db.get(Setting, key)
+            if row:
+                db.delete(row)
+        db.add(Setting(key="default_concurrency", value="4"))
+        db.commit()
+    try:
+        assert get_preferences()["max_parallel_tasks"] == 12
+    finally:
+        with SessionLocal() as db:
+            for key in keys:
+                row = db.get(Setting, key)
+                if row:
+                    db.delete(row)
+            for key, value in original.items():
+                db.add(Setting(key=key, value=value))
+            db.commit()
 
 def test_job_name_whitelist():
     assert is_safe_job_name("ui-20260711-123456-abc123")

@@ -1,0 +1,29 @@
+diff --git a/tests/test_task_slugify.py b/tests/test_task_slugify.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_task_slugify.py
+@@ -0,0 +1,24 @@
++import pytest
++
++from flowcheck import slugify_label
++
++
++def test_slugify_collapses_punctuation_and_whitespace():
++    assert slugify_label("Hello,   World!") == "hello-world"
++
++
++def test_slugify_trims_separator_runs():
++    assert slugify_label("---Release  Candidate---") == "release-candidate"
++
++
++def test_slugify_uses_fallback_for_empty_result():
++    assert slugify_label("... !!!") == "untitled"
++
++
++def test_slugify_preserves_ascii_digits():
++    assert slugify_label("Build 2026.07") == "build-2026-07"
++
++
++def test_slugify_rejects_non_string_values():
++    with pytest.raises(TypeError):
++        slugify_label(123)

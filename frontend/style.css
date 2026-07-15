@@ -268,6 +268,25 @@ h1 {
   color: #49dda7;
   font-size: 12px;
 }
+.queuecap {
+  display: grid;
+  gap: 4px;
+  min-width: 190px;
+  text-align: right;
+}
+.queuecap b {
+  color: #49dda7;
+  font: 600 12px "IBM Plex Mono";
+}
+.queuecap small,
+.queueusage {
+  color: #6f8e83;
+  font: 11px "IBM Plex Mono";
+}
+.queueusage {
+  margin-top: 5px;
+  overflow-wrap: anywhere;
+}
 h2 {
   font-size: 17px;
   margin-top: 0;
@@ -1137,6 +1156,13 @@ select {
   }
   .toggles {
     flex-direction: column;
+  }
+  .panelhead {
+    flex-wrap: wrap;
+  }
+  .queuecap {
+    min-width: 0;
+    text-align: left;
   }
   .healthring {
     min-height: 160px;

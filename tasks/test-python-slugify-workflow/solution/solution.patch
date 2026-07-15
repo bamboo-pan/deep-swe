@@ -1,0 +1,21 @@
+diff --git a/flowcheck/text.py b/flowcheck/text.py
+--- a/flowcheck/text.py
++++ b/flowcheck/text.py
+@@ -1,4 +1,6 @@
+ """Small text helpers used by the workflow test fixture."""
+ 
++import re
++
+ 
+ def collapse_spaces(value: str) -> str:
+@@ -8,5 +10,8 @@ def collapse_spaces(value: str) -> str:
+ 
+ 
+ def slugify_label(value: str) -> str:
+-    """Return a lowercase label with regular spaces replaced by hyphens."""
+-    return value.strip().lower().replace(" ", "-")
++    """Convert a label to a deterministic ASCII slug."""
++    if not isinstance(value, str):
++        raise TypeError("value must be a string")
++    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
++    return slug or "untitled"

@@ -1,6 +1,6 @@
 # DeepSWE 工具开发经验总结
 
-更新时间:2026-07-12。本文提炼自原 `CODEX-PIER-WINDOWS-NOTES.md`、`review.md`(2026-07-11 代码审查,15 项 CONFIRMED 缺陷)、`审查报告.md`(2026-07-12 试运行事故复盘)。所有缺陷均已修复,此处保留根因与法则。项目现状见 `PROJECT-PLAN.md`。
+更新时间:2026-07-15。本文提炼自原 `CODEX-PIER-WINDOWS-NOTES.md`、`review.md`(2026-07-11 代码审查,15 项 CONFIRMED 缺陷)、`审查报告.md`(2026-07-12 试运行事故复盘)及两个 Python 自定义 Task 的端到端实测。所有缺陷均已修复,此处保留根因与法则。项目现状见 `PROJECT-PLAN.md`。
 
 ## 1. Windows 宿主机 × Linux 容器的三类必踩坑
 
@@ -124,3 +124,115 @@ Docker 清理模块沉淀的通用原则:
 - **文档的"已完成"必须与代码核实**:第一轮进度文档声称"Docker 清理已完成",实际约 98% 失效;"记录 effort 三值",实际有效值是创建时复制的。审查(多角度并行扫描 + 对抗性验证 + 上游源码核对 + 实测复现)把完成度判定拉回真实
 - backend 重启会孤儿化 running 的 run(UI 标 `interrupted`),重启前确认无活动运行;启动收割只是兜底
 - 工程卫生的实际代价:前端依赖 `latest` = 不可复现构建(与工具自身主张矛盾);测试未隔离凭据路径 → pytest 读开发者真实密钥文件;CSV 无 BOM → 中文 Excel 乱码,未转义 `=` 前缀 → 公式注入
+
+## 9. 自定义 Task 制作与实测
+
+`test-python-slugify-workflow` 与 `test-python-summary-workflow` 证明了新增 Task 可以很小，但框架不能缩水。测试用途 Task 也必须完整经过 Agent、提交、Patch 提取、独立 verifier 和隐藏评分链路，否则只能验证局部脚本，不能验证真实流程。
+
+### 9.1 完整结构与命名
+
+最小可复用结构:
+
+```text
+tasks/<test-task-id>/
+  task.toml
+  instruction.md
+  pre_artifacts.sh
+  environment/{Dockerfile,repo/}
+  solution/{solve.sh,solution.patch}
+  tests/{Dockerfile,config.json,test.sh,test.patch,grader.py,base_repo/}
+```
+
+- 测试用途必须显式命名:目录和 `task_id` 以 `test-` 开头，`display_title` 以 `[TEST]` 开头，`category = "test_validation"`，`language` 填真实语言
+- `task.toml` 采用 DeepSWE `schema_version = "1.1"`，声明 `/logs/artifacts/model.patch`、独立 verifier、资源与超时；测试 Task 留在 catalog 中按需选择，不混入正式回归 suite
+- `grader.py` 使用 `tools/verifier/grader.py` 的统一版本，题目差异只放在 `tests/config.json` 和 task-local `test.sh`；无必要不要分叉评分器
+- Agent 镜像负责提供可工作的起始仓库，verifier 镜像负责提供 pristine base、隐藏测试和评分依赖；两者能分别构建才算结构完整
+
+### 9.2 Base commit 与 Patch 是同一条契约
+
+- 为 fixture 建一个确定性的本地 Git base commit；`environment/repo` 与 `tests/base_repo` 必须来自同一 commit
+- 同一 SHA 至少出现在 `task.toml` 的 `base_commit_hash`、`tests/config.json` 的 `base_commit` 和 `pre_artifacts.sh` 的 `git diff <base> HEAD` 中，修改任何一处都要同步其余位置
+- 两个 Docker 镜像构建后都要在容器内执行 `git rev-parse HEAD`，不能只相信复制目录或配置文本
+- `solution.patch`、隐藏 `test.patch` 与真实 `model.patch` 都必须能从同一 base 干净应用；先做 apply check，再进入付费运行
+- Agent 必须 commit。评分链只读取 `git diff <base> HEAD`，工作区里“代码已经改好但未提交”仍会得到空 Patch 和 `Reward=0`
+
+### 9.3 P2P/F2P 的设计原则
+
+- P2P 是原有行为保护线，在 pristine base 上先通过，修复后仍通过；它不是为了提高测试数量
+- F2P 是修复证据，每一项都应在 pristine base 上失败、在 oracle 上通过。优先提供“存在但实现不完整”的函数，让失败落在断言层；缺少 import、模块或函数造成的 collection error 只证明测试跑不起来，不是高质量 F2P 证据
+- `nop` 的理想边界是 P2P 全过、F2P 全败；本次两个 Task 均为 P2P `3/3`、F2P `0/5`、`Reward=0`
+- oracle 或等价生成 Patch 应为 P2P `3/3`、F2P `5/5`、`Reward=1`。如果 nop/oracle 不能形成清晰的 0/1 边界，先修题目，不要调用模型
+- JUnit 白名单 node ID 必须逐字等于报告中的 `classname.name`。评分器把报告里缺失、跳过或拼错的 ID 都按失败处理，不能靠测试进程退出码推断通过
+
+### 9.4 固定验证阶梯
+
+以后新增 Task 按固定顺序执行:
+
+1. 解析 `task.toml` 与 `tests/config.json`，检查字段、路径和 `.sh` 的 LF
+2. 对比 Agent/verifier 两份 base repo，确认内容与 commit SHA 相同
+3. 分别构建 Agent 和 verifier Docker 镜像，区分构建失败与题目失败
+4. 在两个镜像内核对 `git rev-parse HEAD` 与配置 SHA
+5. 检查 `solution.patch`、`test.patch`，并实际运行 `pre_artifacts.sh` 生成非空 `model.patch`
+6. 跑 `nop`，预期 `Reward=0` 且 P2P 全过、F2P 全败
+7. 跑 oracle/参考解，预期 `Reward=1` 且 P2P/F2P 全过
+8. 最后跑一次真实模型 Trial，检查 trajectory、commit、Patch、verifier 与费用证据
+
+`nop` 和 oracle 只验证评分上下界，不会调用模型。一个 Task 只有同时留下以下证据，才能写成“真实模型实测通过”:
+
+- `agent_result` 非空，trajectory 中存在真实模型交互，steps、token 和费用均非零
+- 模型完成 Git commit，而不是只修改工作区
+- `pre_artifacts.sh` 生成了非空 `/logs/artifacts/model.patch`
+- verifier 生成 `/logs/verifier/reward.json`；流程验证 Task 的预期结果为 `Reward=1`
+
+`agent_result = null`、没有 trajectory/API 调用、只有环境构建日志，或者仅跑了 `nop` / oracle，都不能计为真实模型验证。
+
+### 9.5 基础设施失败不能算模型失败
+
+- Windows checkout 后首先检查 LF；Rich/Pier CLI 在 GBK 终端输出异常时用 `PYTHONUTF8=1` 或显式 UTF-8
+- Docker Compose Bake 卡住时可用 `COMPOSE_BAKE=false` 排除 Bake 路径；Debian 包下载等瞬时网络错误应重试或换用已预装 `curl/git/gcc/make` 的 Agent 基础镜像
+- GitHub release 下载返回 403 时，可为镜像构建配置代理/镜像地址；这属于构建环境修复，不应改变 verifier 的离线约束或把失败归因给模型
+- PowerShell 调 Pier 时使用参数数组，确保 `extra_python_packages=["litellm[proxy]"]` 仍是列表；字符串被错误展开后会在 Dockerfile 中按字符拆包
+- 新 Task 先用 low/medium、单 Task、单 Trial 冒烟，确认 `reward.json` 后再提高 effort 或并发；环境失败与模型解题失败必须分别统计
+
+### 9.6 镜像重建、缓存与 Bake
+
+看到 `preparing_environment` 时先区分“正在正常构建”和“构建已停滞”。该阶段不只创建容器，还包括基础镜像元数据解析/拉取、Task 环境、Agent 安装层、egress proxy 与健康检查；首次运行新 Task 时持续数分钟并不代表模型或题目卡死。模型 API 调用从 `agent_running` 才开始。
+
+Pier 可能为每个 Trial 执行 `docker compose build` 并生成新的随机镜像标签，但 Dockerfile 和上下文没有变化时，BuildKit 会复用已有层。判断是否“真正重建”应看构建日志中步骤是 `CACHED` 还是重新执行，而不是只看是否出现 build 命令。
+
+| 变化 | 是否需要重建 | 原因 |
+|---|---|---|
+| 首次运行、镜像/BuildKit 缓存被清理、Docker Desktop 重置或切换 daemon/context/平台 | 是 | 本机没有可复用镜像层 |
+| `environment/Dockerfile`、基础镜像 digest、系统/Python 依赖 | 是 | Agent 环境层输入变化 |
+| `environment/repo` 中被 `COPY` 的代码或 base fixture | 是 | `COPY` 层及其后续层失效 |
+| `tests/Dockerfile`、`grader.py`、`test.sh`、`test.patch`、`config.json`、`base_repo` | 是，至少 verifier | verifier 构建上下文或评分内容变化 |
+| Agent 类型/版本/Pier 安装指纹、`extra_python_packages` | 是，至少 Agent 安装层 | 容器内 Agent 工具链变化 |
+| 模型、effort、凭据、模型 URL、并发、重复、预算、重试、timeout | 通常否 | 运行时配置，不进入镜像 |
+| `instruction.md`、`solution/`、`pre_artifacts.sh`、展示 metadata | 通常否 | 本身不改变镜像内容，但仍会创建新 Trial 并检查缓存 |
+
+Docker Compose v5 可能默认把 Compose 构建交给 Buildx Bake。Bake 是构建编排入口，不是 Task 或模型设置；Windows 上多 Trial 并行时可能长时间无进度输出。临时关闭方式:
+
+```powershell
+$env:COMPOSE_BAKE = "false"
+.\run-ui.ps1
+```
+
+环境变量必须在启动 UI/backend 前设置，子进程才能继承；UI 已运行时需停止后重启。它只改为普通逐服务构建，不会跳过镜像构建，也不会关闭 BuildKit 层缓存。若根因是 Docker Hub、apt 或 GitHub release 的 403/超时，仍需单独解决网络或镜像源。
+
+排查顺序:
+
+1. 看 Trial 目录是否持续生成/更新 `agent-build-context`、`trial.log` 与 Compose 文件
+2. 用 `docker buildx history ls` 查看 build 是 `Running`、`Completed` 还是 `Error`
+3. 用 `docker buildx history logs <BUILD_ID>` 定位卡在基础镜像、apt、uv/Agent 安装还是镜像导出
+4. build 已完成且容器已启动后，后端 `/api/runs/<id>` 应进入 `agent_running`；UI 仍显示旧阶段时刷新页面或检查 SSE 连接
+
+### 9.7 本次真实调用证据
+
+2026-07-15 使用 `mini-swe-agent 2.4.5` 和 `openai/gpt-5.6-sol`（`xhigh`）完成两次真实付费 Trial:
+
+| Task | Steps | 输入 / 缓存 / 输出 Token | 费用 | 结果 |
+|---|---:|---:|---:|---|
+| `test-python-slugify-workflow` | 9 | 64,492 / 46,592 / 3,500 | $0.217796 | `Reward=1`，F2P 5/5，P2P 3/3 |
+| `test-python-summary-workflow` | 12 | 99,683 / 70,144 / 5,471 | $0.346897 | `Reward=1`，F2P 5/5，P2P 3/3 |
+
+合计费用 `$0.564693`。两个 Trial 都有模型 trajectory、提交记录、`model.patch` 与 verifier `reward.json`，因此可确认是实际模型调用后的端到端通过，不是由参考 Patch 代替。原始产物路径记录在 `PROJECT-PLAN.md` §6.1。

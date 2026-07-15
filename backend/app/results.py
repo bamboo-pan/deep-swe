@@ -11,6 +11,8 @@ from .models import Baseline, Run
 from .official_stats import configuration_stats, load_official_stats, normalize_model_name
 from .preferences import current_secrets, jobs_path
 from .pier_retry_patch.transient import is_transient_agent_failure
+from .pricing import DEFAULT_PRICING, pricing_for_model
+from .scheduler import queue_status
 from .security import redact
 from .task_suite import CONTROL_TASK
 
@@ -87,14 +89,23 @@ def _seconds(start, finish) -> float | None:
     except TypeError:  # naive 与 aware 混用
         return None
 
-def estimate_cost(input_tokens: int | None, cached_tokens: int | None, output_tokens: int | None, tier: str = "standard") -> float | None:
-    # Pier stats 不区分 cache-write token，因此估算不含 cache-write（$6.25/1M）项，
+def estimate_cost(input_tokens: int | None, cached_tokens: int | None, output_tokens: int | None, tier: str = "standard", model: str | None = None) -> float | None:
+    # 单价取自 models.dev 快照（见 pricing.py），未收录的模型退回 DEFAULT_PRICING。
+    # Pier stats 不区分 cache-write token，因此估算不含 cache-write 项，
     # 对应字段在结果结构中恒为 null。
     if input_tokens is None and output_tokens is None:
         return None
+    pricing = pricing_for_model(model) or DEFAULT_PRICING
     total_input, cached, output = input_tokens or 0, cached_tokens or 0, output_tokens or 0
     uncached = max(total_input - cached, 0)
-    return (uncached * 5 + cached * .5 + output * 30) / 1_000_000 * TIER_MULTIPLIER.get(tier, 1.0)
+    cache_read = pricing.get("cache_read", pricing["input"])  # 无缓存折扣价的模型按原价计
+    amount = uncached * pricing["input"] + cached * cache_read + output * pricing["output"]
+    return amount / 1_000_000 * TIER_MULTIPLIER.get(tier, 1.0)
+
+def _pricing_details(model: str | None) -> dict:
+    """估算所用单价及其来源，供 UI/API 消费者核对估算口径。"""
+    found = pricing_for_model(model)
+    return {**(found or DEFAULT_PRICING), "source": "models.dev" if found else "default"}
 
 def pier_trial_prefix(task: str) -> str:
     """pier 生成 trial 目录名时把任务名截断到 32 字符并去尾部 _-。"""
@@ -168,7 +179,9 @@ def _trial(folder: Path, include_patch: bool = True, expected_tasks: list[str] |
     if failure_type or (reward is not None and reward < 1 and patch_bytes == 0):
         agent_log_tail = _agent_log_tail(folder)
     if is_transient_agent_failure(
-        failure_type, f"{failure_message or ''}\n{agent_log_tail}"
+        failure_type,
+        failure_message,
+        agent_log_tail=agent_log_tail,
     ):
         failure_type = "InfrastructureNetworkError"
     # 守护线程按单 Trial 限额掐容器时会留下 guard.json；容器被杀的报错样子像
@@ -593,7 +606,11 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
         any(t.get("reward") == 1 for t in trials if t["task"] == task)
         for task in expected_tasks if task in remaining_tasks
     )
-    stage = run.status if run.status in terminal_defaults else next((t["status"] for t in trials if t["status"] not in {"queued", "completed", "failed"}), run.status)
+    queue = queue_status(run.id)
+    if run.status not in terminal_defaults and not queue["running"] and queue["queued"]:
+        stage = "queued"
+    else:
+        stage = run.status if run.status in terminal_defaults else next((t["status"] for t in trials if t["status"] not in {"queued", "completed", "failed"}), run.status)
     total = len(trials)
     configured_visible_total = max(
         len(expected_tasks) * run.attempts_per_task - len(deleted_entries), 0
@@ -625,6 +642,7 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
         "reasoning_effort_effective": run.reasoning_effort_effective,
         "pier_version": run.pier_version,
         "tasks": expected_tasks, "attempts_per_task": run.attempts_per_task, "concurrency": run.concurrency,
+        "queue": queue,
         "agent_timeout_seconds": run.agent_timeout_seconds, "verifier_timeout_seconds": run.verifier_timeout_seconds,
         "verification": run.verification, "retry_infrastructure_errors": run.retry_infrastructure_errors,
         "infrastructure_max_retries": run.infrastructure_max_retries,
@@ -637,7 +655,8 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
         "input_tokens": input_tokens, "cached_tokens": cached_tokens, "uncached_input_tokens": max((input_tokens or 0) - (cached_tokens or 0), 0),
         "cache_write_tokens": None,  # Pier 未返回该字段，按约定存 null
         "output_tokens": output_tokens, "reported_cost_usd": reported_cost,
-        "estimated_cost_usd": estimate_cost(input_tokens, cached_tokens, output_tokens, run.service_tier),
+        "estimated_cost_usd": estimate_cost(input_tokens, cached_tokens, output_tokens, run.service_tier, run.model),
+        "pricing": _pricing_details(run.model),
         "error": run.error, "progress": {"completed": completed, "total": total, "passed": passed, "percent": round(completed / total * 100) if total else 0},
         "task_progress": {"passed": passed_tasks, "total": len(remaining_tasks)},
         "deleted_trials": len(deleted_entries),
@@ -837,7 +856,7 @@ def compare_runs(run_ids: list[int], selections: list[tuple[int, str]] | None = 
                 present = [t[field] for t in values if t.get(field) is not None]
                 return mean(present) if present else None
             estimated_costs = [
-                estimate_cost(t.get("input_tokens"), t.get("cached_tokens"), t.get("output_tokens"), detail["service_tier"])
+                estimate_cost(t.get("input_tokens"), t.get("cached_tokens"), t.get("output_tokens"), detail["service_tier"], detail["model"])
                 for t in values
             ]
             estimated_costs = [value for value in estimated_costs if value is not None]

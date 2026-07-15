@@ -45,7 +45,6 @@ type Boot = {
     agent: string;
     model: string;
     reasoning_effort: string;
-    concurrency: number;
   };
   agents: string[];
   models: string[];
@@ -61,11 +60,35 @@ type Boot = {
   setting_options: {
     credential_files: string[];
     jobs_dirs: string[];
-    concurrency: number[];
   };
   task_suite: { name: string; tasks: TaskChoice[] };
 };
 type Check = { name: string; status: string; message: string };
+type QueueStatus = {
+  limit: number;
+  running: number;
+  queued: number;
+  available: number;
+  total: number;
+};
+type QueueAdmission = QueueStatus & {
+  requested_trials: number;
+  immediate_trials: number;
+  queued_trials: number;
+  waiting_ahead: number;
+  total_queued_after: number;
+};
+type RunValidation = {
+  valid: boolean;
+  trial_count: number;
+  max_parallel_tasks: number;
+  admission: QueueAdmission;
+};
+type RunCreationResponse = {
+  runs: Run[];
+  admission: QueueAdmission;
+  scheduler: QueueStatus;
+};
 type Trial = {
   id: string;
   task: string;
@@ -115,6 +138,7 @@ type Run = {
   tasks: string[];
   attempts_per_task: number;
   concurrency: number;
+  queue?: QueueStatus;
   infrastructure_max_retries?: number;
   agent_max_steps?: number;
   codex_request_max_retries?: number;
@@ -158,7 +182,7 @@ type Prefs = {
   default_agent: string;
   default_model: string;
   default_effort: string;
-  default_concurrency: number;
+  max_parallel_tasks: number;
   agent_timeout_seconds: number;
   verifier_timeout_seconds: number;
   infrastructure_max_retries: number;
@@ -356,6 +380,7 @@ function App() {
   const [boot, setBoot] = useState<Boot>();
   const [checks, setChecks] = useState<Check[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
+  const [scheduler, setScheduler] = useState<QueueStatus>();
   const [tab, setTab] = useState("dashboard");
   const [navigationCollapsed, setNavigationCollapsed] = useState(
     () => localStorage.getItem("deepswe-navigation-collapsed") === "true",
@@ -377,7 +402,6 @@ function App() {
   const [allAgents, setAllAgents] = useState(false);
   const [model, setModel] = useState("gpt-5.6-sol");
   const [effort, setEffort] = useState("high");
-  const [concurrency, setConcurrency] = useState(2);
   // 自由数字输入以字符串保存，允许中途清空；提交时统一解析校验
   const [attempts, setAttempts] = useState("1");
   const [selectedTasks, setSelectedTasks] = useState<string[]>([]);
@@ -387,9 +411,13 @@ function App() {
   const [verification, setVerification] = useState(true);
   const [tier, setTier] = useState("standard");
   const refreshRuns = () =>
-    request<Run[]>("/api/runs")
-      .then((nextRuns) => {
+    Promise.all([
+      request<Run[]>("/api/runs"),
+      request<QueueStatus>("/api/scheduler"),
+    ])
+      .then(([nextRuns, nextScheduler]) => {
         setRuns(nextRuns);
+        setScheduler(nextScheduler);
       })
       .catch(() => {});
   const refreshCompareRuns = () =>
@@ -418,7 +446,6 @@ function App() {
       setAgent(x.defaults.agent);
       setModel(x.defaults.model);
       setEffort(x.defaults.reasoning_effort);
-      setConcurrency(x.defaults.concurrency);
       setSelectedTasks([]);
     });
     refresh();
@@ -498,15 +525,8 @@ function App() {
   const attemptsNum = parseInt(attempts, 10);
   const trialCount =
     selectedTasks.length * (Number.isFinite(attemptsNum) ? attemptsNum : 0);
-  const parallelAgentCount = allAgents ? boot?.agents.length || 0 : 1;
-  const activeWorkersPerAgent = Math.min(concurrency, trialCount);
-  const totalParallelTasks = activeWorkersPerAgent * parallelAgentCount;
-  const parallelRisk =
-    totalParallelTasks <= 12
-      ? { className: "normal", label: "正常" }
-      : totalParallelTasks <= 18
-        ? { className: "warning", label: "资源峰值警告" }
-        : { className: "danger", label: "需要高负载确认" };
+  const requestedTrialCount =
+    trialCount * (allAgents ? boot?.agents.length || 0 : 1);
   const selectModel = (nextModel: string) => {
     const supported = boot?.model_efforts[nextModel] || boot?.efforts || [];
     setModel(nextModel);
@@ -530,71 +550,60 @@ function App() {
       return setNotice("Codex 流重试次数需为 0-10 的整数");
     if (!Number.isFinite(codexStreamIdleTimeoutNum) || codexStreamIdleTimeoutNum < 30 || codexStreamIdleTimeoutNum > 1800)
       return setNotice("Codex 流空闲超时需为 30-1800 秒");
-    if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 72)
-      return setNotice("每 Agent 并发数需为 1-72 的整数");
     const agents = allAgents ? boot!.agents : [agent];
-    const parallelTasks =
-      Math.min(concurrency, selectedTasks.length * attemptsNum) * agents.length;
-    if (parallelTasks > 72)
-      return setNotice("总并行 Trial 数不能超过 72");
-    if (
-      parallelTasks >= 19 &&
-      !confirm(
-        `将同时运行最多 ${parallelTasks} 个 Trial。模型调用阶段通常资源占用较低，但集中构建和验证可能造成 CPU、磁盘与内存峰值。\n确认继续？`,
-      )
-    )
-      return;
+    const payload = {
+      agents,
+      model,
+      reasoning_effort: effort,
+      tasks: selectedTasks,
+      attempts_per_task: attemptsNum,
+      codex_request_max_retries: codexRequestMaxRetriesNum,
+      codex_stream_max_retries: codexStreamMaxRetriesNum,
+      codex_stream_idle_timeout_seconds: codexStreamIdleTimeoutNum,
+      verification,
+      service_tier: tier,
+    };
     setStarting(true);
-    setNotice("正在创建运行…");
-    const results = await Promise.allSettled(
-      agents.map((current) =>
-        request<Run>("/api/runs", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            agent: current,
-            model,
-            reasoning_effort: effort,
-            tasks: selectedTasks,
-            attempts_per_task: attemptsNum,
-            concurrency,
-            parallel_agent_count: agents.length,
-            confirm_high_concurrency: parallelTasks >= 19,
-            codex_request_max_retries: codexRequestMaxRetriesNum,
-            codex_stream_max_retries: codexStreamMaxRetriesNum,
-            codex_stream_idle_timeout_seconds: codexStreamIdleTimeoutNum,
-            verification,
-            service_tier: tier,
-          }),
-        }),
-      ),
-    );
-    setStarting(false);
-    const created = results
-      .filter(
-        (r): r is PromiseFulfilledResult<Run> => r.status === "fulfilled",
-      )
-      .map((r) => r.value);
-    const failed = results.filter((r) => r.status === "rejected");
-    if (created.length) {
+    setNotice("正在检查全局队列…");
+    try {
+      const preview = await request<RunValidation>("/api/runs/batch/validate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const expected = preview.admission;
+      if (
+        expected.queued_trials > 0 &&
+        !confirm(
+          `全局最大并发为 ${expected.limit}，当前运行 ${expected.running} 个，前方已有 ${expected.waiting_ahead} 个等待。\n` +
+          `本次 ${expected.requested_trials} 个 Trial 中，预计 ${expected.immediate_trials} 个可立即启动，${expected.queued_trials} 个进入队列。\n确认创建？`,
+        )
+      ) {
+        setNotice("已取消创建");
+        return;
+      }
+      setNotice("正在创建运行…");
+      const response = await request<RunCreationResponse>("/api/runs/batch", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const created = response.runs;
+      if (!created.length) throw new Error("后端未返回已创建的 Run");
+      setScheduler(response.scheduler);
       setSelectedRun(created[0].id);
       setActiveTrial(null);
       setTrialLog("");
       setTab("live");
       refreshRuns();
-    }
-    if (failed.length) {
-      setNotice(
-        `已创建 ${created.length} 个运行，${failed.length} 个失败：${String(
-          (failed[0] as PromiseRejectedResult).reason,
-        )}`,
-      );
-    } else {
-      setNotice(
-        allAgents
-          ? `已并行创建 ${created.length} 个 Agent 运行（总并行 Trial 上限 ${created.length * Math.min(concurrency, selectedTasks.length * attemptsNum)}）`
-          : "运行已创建",
-      );
+      const admission = response.admission;
+      setNotice(admission.queued_trials
+        ? `已创建 ${created.length} 个 Run：${admission.immediate_trials} 个 Trial 可立即启动，${admission.queued_trials} 个已进入全局队列`
+        : `已创建 ${created.length} 个 Run，${admission.immediate_trials} 个 Trial 可立即启动`);
+    } catch (error) {
+      setNotice(`创建失败：${String(error)}`);
+    } finally {
+      setStarting(false);
     }
   };
   const openRun = (id: number) => {
@@ -653,6 +662,8 @@ function App() {
   };
   const savePrefs = async () => {
     if (!prefs) return;
+    if (!Number.isInteger(prefs.max_parallel_tasks) || prefs.max_parallel_tasks < 1 || prefs.max_parallel_tasks > 72)
+      return setNotice("最大并行 Task 数需为 1-72 的整数");
     if (!Number.isInteger(prefs.agent_timeout_seconds) || prefs.agent_timeout_seconds < 60 || prefs.agent_timeout_seconds > 21600)
       return setNotice("Agent 超时需为 60-21600 秒");
     if (!Number.isInteger(prefs.verifier_timeout_seconds) || prefs.verifier_timeout_seconds < 60 || prefs.verifier_timeout_seconds > 7200)
@@ -661,19 +672,24 @@ function App() {
       return setNotice("基础设施重试次数需为 0-6 的整数");
     if (!Number.isInteger(prefs.agent_max_steps) || prefs.agent_max_steps < 10 || prefs.agent_max_steps > 500)
       return setNotice("最大步数需为 10-500 的整数");
-    const saved = await request<Prefs>("/api/settings", {
-      method: "PUT",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(prefs),
-    });
-    const nextBoot = await request<Boot>("/api/bootstrap");
-    setPrefs(saved);
-    setBoot(nextBoot);
-    if (!nextBoot.models.includes(model)) {
-      setModel(nextBoot.defaults.model);
-      setEffort(nextBoot.defaults.reasoning_effort);
+    try {
+      const saved = await request<Prefs>("/api/settings", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(prefs),
+      });
+      const nextBoot = await request<Boot>("/api/bootstrap");
+      setPrefs(saved);
+      setBoot(nextBoot);
+      if (!nextBoot.models.includes(model)) {
+        setModel(nextBoot.defaults.model);
+        setEffort(nextBoot.defaults.reasoning_effort);
+      }
+      refreshRuns();
+      setNotice("设置已保存");
+    } catch (error) {
+      setNotice(`设置保存失败：${String(error)}`);
     }
-    setNotice("设置已保存");
   };
   const restore = async (file: File) => {
     try {
@@ -810,9 +826,9 @@ function App() {
       )
     )
       return false;
-    let result: { retry_count: number };
+    let result: { retry_count: number; admission?: QueueAdmission };
     try {
-      result = await request<{ retry_count: number }>(
+      result = await request<{ retry_count: number; admission?: QueueAdmission }>(
         `/api/runs/${runId}/trials/retry`,
         {
           method: "POST",
@@ -833,8 +849,11 @@ function App() {
     if (nextRuns.status === "fulfilled") setRuns(nextRuns.value);
     setActiveTrial(null);
     setTrialLog("");
+    refreshRuns();
     refreshCompareRuns();
-    setNotice(`已提交 ${result.retry_count} 条 Trial 重试，旧结果将原位替换`);
+    setNotice(result.admission?.queued_trials
+      ? `已提交 ${result.retry_count} 条 Trial 重试：${result.admission.immediate_trials} 条可立即启动，${result.admission.queued_trials} 条排队`
+      : `已提交 ${result.retry_count} 条 Trial 重试，旧结果将原位替换`);
     return true;
   };
   if (!boot)
@@ -920,7 +939,12 @@ function App() {
           </div>
         )}
         {tab === "dashboard" && (
-          <Dashboard latest={latest} checks={checks} openRun={openRun} />
+          <Dashboard
+            latest={latest}
+            checks={checks}
+            scheduler={scheduler}
+            openRun={openRun}
+          />
         )}
         {tab === "new run" && (
           <section className="panel agentmode">
@@ -946,9 +970,6 @@ function App() {
               />{" "}
               三 Agent 同时跑
             </label>
-            <b>
-              总并行 Trial 上限 {totalParallelTasks}
-            </b>
           </section>
         )}
         {tab === "new run" && (
@@ -958,9 +979,13 @@ function App() {
                 <h2>运行配置</h2>
                 <p>所有选择都会记录在本次运行中，便于严格复现。</p>
               </div>
-              <b>
-                {trialCount} TRIALS
-              </b>
+              <div className="queuecap">
+                <b>{requestedTrialCount} TRIALS</b>
+                <small>
+                  全局 {scheduler?.running ?? 0}/{scheduler?.limit ?? "—"} ·
+                  排队 {scheduler?.queued ?? 0}
+                </small>
+              </div>
             </div>
             <div className="formgrid">
               <label>
@@ -1013,20 +1038,6 @@ function App() {
                   value={attempts}
                   onChange={(e) => setAttempts(e.target.value)}
                 />
-              </label>
-              <label>
-                每 Agent 并发数
-                <input
-                  type="number"
-                  min="1"
-                  max="72"
-                  step="1"
-                  value={concurrency}
-                  onChange={(e) => setConcurrency(+e.target.value)}
-                />
-                <small className={`risk ${parallelRisk.className}`}>
-                  总并行 {totalParallelTasks} · {parallelRisk.label}
-                </small>
               </label>
               {(agent === "codex" || allAgents) && (
                 <>
@@ -1146,6 +1157,7 @@ function App() {
           <Live
             runs={runs}
             detail={detail && !terminal.has(detail.status) ? detail : null}
+            scheduler={scheduler}
             selectRun={(id) => {
               // 切换 Agent 视图时清掉上一个运行的 Trial 详情，防止 A 的 patch 挂在 B 下
               setSelectedRun(id);
@@ -1210,10 +1222,12 @@ function App() {
 function Dashboard({
   latest,
   checks,
+  scheduler,
   openRun,
 }: {
   latest?: Run;
   checks: Check[];
+  scheduler?: QueueStatus;
   openRun: (id: number) => void;
 }) {
   const ready = checks.filter((c) => c.status === "ok").length;
@@ -1247,6 +1261,11 @@ function Dashboard({
         <Metric label="报告费用" value={money(latest?.reported_cost_usd)} />
         <Metric label="Agent" value={latest?.agent || "—"} />
         <Metric label="任务数" value={latest?.tasks?.length ?? "—"} />
+        <Metric
+          label="全局并发"
+          value={scheduler ? `${scheduler.running}/${scheduler.limit}` : "—"}
+        />
+        <Metric label="排队 Trial" value={scheduler?.queued ?? "—"} />
       </section>
       <Diagnostics checks={checks} />
     </>
@@ -1255,6 +1274,7 @@ function Dashboard({
 function Live({
   runs,
   detail,
+  scheduler,
   selectRun,
   cancel,
   openTrial,
@@ -1263,6 +1283,7 @@ function Live({
 }: {
   runs: Run[];
   detail: Run | null;
+  scheduler?: QueueStatus;
   selectRun: (id: number) => void;
   cancel: () => void;
   openTrial: (t: Trial) => void;
@@ -1296,7 +1317,12 @@ function Live({
             <h2>{detail.run_code || `RUN-${String(detail.id).padStart(6, "0")}`}</h2>
             <p>
               {detail.agent} · {detail.model} · {detail.reasoning_effort} ·
-              concurrency {detail.concurrency}
+              创建时全局上限 {detail.concurrency}
+            </p>
+            <p className="queueusage">
+              全局运行 {scheduler?.running ?? 0}/{scheduler?.limit ?? "—"} ·
+              全局排队 {scheduler?.queued ?? 0} · 当前 Run 运行 {detail.queue?.running ?? 0} ·
+              当前 Run 排队 {detail.queue?.queued ?? 0}
             </p>
             <code className="technicalid">Pier Job：{detail.job_name}</code>
           </div>
@@ -1522,7 +1548,7 @@ function Results({
               <span><b>Agent</b>{detail.agent}</span>
               <span><b>模型</b>{detail.model}</span>
               <span><b>思考强度</b>{detail.reasoning_effort}</span>
-              <span><b>并发</b>{detail.concurrency}</span>
+              <span><b>创建时全局上限</b>{detail.concurrency}</span>
             </section>
             {detail.error && (
               <div className="runerror" role="alert">
@@ -2360,15 +2386,15 @@ function Settings({
             </select>
           </label>
           <label>
-            默认并发
+            最大并行 Task 数
             <input
               type="number"
               min="1"
               max="72"
               step="1"
-              value={prefs.default_concurrency}
+              value={prefs.max_parallel_tasks}
               onChange={(e) =>
-                setPrefs({ ...prefs, default_concurrency: +e.target.value })
+                setPrefs({ ...prefs, max_parallel_tasks: +e.target.value })
               }
             />
           </label>
