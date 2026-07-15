@@ -48,6 +48,28 @@ export OPENAI_API_KEY=...
 pier run -p deep-swe/tasks --agent mini-swe-agent --model openai/gpt-5.5
 ```
 
+### Local test-task images
+
+The two `[TEST]` Python tasks use stable Docker tags ending in `:local`. Before
+each UI run, the backend checks the Dockerfile/build-context checksum and
+automatically builds missing or stale environment and verifier images. Build
+logs are written to `data/local-image-builds/`. No separate image-preparation
+command is required.
+
+Later runs reuse an image while its checksum matches; changing a Dockerfile,
+fixture, verifier file, or a referenced local base image triggers the affected
+rebuild. Docker images stay in the local Docker daemon and should not be
+committed as `.tar` archives.
+
+The `:local` tags are machine-local. On a fresh checkout, the first selected UI
+run performs the initial build before any model call; normal reruns use the
+existing images and avoid remote base-image metadata delays.
+For a separate verifier, the runtime keeps a shared `:local` verifier tag after
+each trial (containers and temporary resources are still removed), so concurrent
+or later trials do not try to pull that image from a registry. Pier may still
+build the per-agent installation layer on the first run; BuildKit reuses that
+layer on later runs while the agent fingerprint and task base image are unchanged.
+
 ## What is Pier
 
 [Pier](https://github.com/datacurve-ai/pier) is a [Harbor](https://www.harborframework.com/docs/tasks)-compatible framework for sandboxed coding-agent evals. It began as a fork of Harbor to support CLI agents in air-gapped tasks: Harbor blocks all outbound traffic in `allow_internet = false` tasks, including dependency installs and LLM API calls. Pier adds per-agent network allowlists, giving agents only the network access they need while keeping the task environment isolated.

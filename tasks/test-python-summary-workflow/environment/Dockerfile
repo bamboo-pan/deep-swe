@@ -1,5 +1,8 @@
-FROM python@sha256:9bed8554e926c07c6f908841d5ee88c33e8df9236b191526bbce81a9062ab43a
+FROM python@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b
 
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git \
+ && rm -rf /var/lib/apt/lists/*
 RUN python -m pip install --no-cache-dir pytest==8.4.1
 
 ENV PYTHONDONTWRITEBYTECODE=1

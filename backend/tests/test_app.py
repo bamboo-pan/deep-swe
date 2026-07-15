@@ -2,6 +2,7 @@ import asyncio
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import quote
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
@@ -9,6 +10,41 @@ from app.main import app
 from app.database import SessionLocal
 from app.models import Run, Setting, TrialQueueEntry
 from app.security import is_safe_job_name, read_credential, redact
+
+def test_run_fingerprint_tracks_each_trial_stage_marker(tmp_path, monkeypatch):
+    from app import main
+
+    job = "stage-fingerprint"
+    run = SimpleNamespace(
+        id=123,
+        status="running",
+        finished_at=None,
+        job_name=job,
+        jobs_dir=str(tmp_path),
+    )
+    monkeypatch.setattr(main, "queue_status", lambda _run_id: {"running": 1, "queued": 0})
+    monkeypatch.setattr(main.time, "monotonic", lambda: 10.0)
+
+    folder = tmp_path / job / "task-a__x1"
+    signatures = [main._run_fingerprint(run)]
+    folder.mkdir(parents=True)
+    (folder / "config.json").write_text("{}", encoding="utf-8")
+    signatures.append(main._run_fingerprint(run))
+    (folder / "agent").mkdir()
+    (folder / "agent" / "trajectory.json").write_text("{}", encoding="utf-8")
+    signatures.append(main._run_fingerprint(run))
+    (folder / "artifacts").mkdir()
+    (folder / "artifacts" / "model.patch").write_text("diff", encoding="utf-8")
+    signatures.append(main._run_fingerprint(run))
+    (folder / "verifier").mkdir()
+    (folder / "verifier" / "run.log").write_text("running", encoding="utf-8")
+    signatures.append(main._run_fingerprint(run))
+    (folder / "verifier" / "reward.json").write_text("{}", encoding="utf-8")
+    signatures.append(main._run_fingerprint(run))
+    (folder / "result.json").write_text("{}", encoding="utf-8")
+    signatures.append(main._run_fingerprint(run))
+
+    assert len(set(signatures)) == len(signatures)
 
 def test_command_check_timeout_is_non_blocking_warning(monkeypatch):
     from app import diagnostics

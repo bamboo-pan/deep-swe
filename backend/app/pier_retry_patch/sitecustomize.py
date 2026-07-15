@@ -5,6 +5,7 @@ import json
 import os
 
 from global_queue import release_slot, trial_task_name, try_acquire_slot
+from local_image_retention import preserve_local_prebuilt_image
 from networking import trial_network_subnets
 from runtime import install_retry_trial_names, install_safe_metric_display
 from transient import (
@@ -45,6 +46,47 @@ def _install_safe_docker_networks() -> None:
 
 
 _install_safe_docker_networks()
+
+
+def _install_local_prebuilt_image_retention() -> None:
+    """Preserve shared ``:local`` images while still deleting trial resources."""
+    try:
+        from pier.environments.docker.docker import DockerEnvironment
+    except ImportError:
+        return
+
+    original_run_compose = DockerEnvironment._run_docker_compose_command
+    if getattr(original_run_compose, "_deepswe_local_image_retention", False):
+        return
+
+    async def run_compose_preserving_local_image(
+        self,
+        command,
+        check=True,
+        timeout_sec=None,
+        process_env_overrides=None,
+    ):
+        task_env_config = getattr(self, "task_env_config", None)
+        command = preserve_local_prebuilt_image(
+            command,
+            image=getattr(task_env_config, "docker_image", None),
+            use_prebuilt=bool(getattr(self, "_use_prebuilt", False)),
+        )
+        return await original_run_compose(
+            self,
+            command,
+            check=check,
+            timeout_sec=timeout_sec,
+            process_env_overrides=process_env_overrides,
+        )
+
+    run_compose_preserving_local_image._deepswe_local_image_retention = True
+    DockerEnvironment._run_docker_compose_command = (
+        run_compose_preserving_local_image
+    )
+
+
+_install_local_prebuilt_image_retention()
 
 
 def _configured_retry_delays() -> tuple[float, ...]:

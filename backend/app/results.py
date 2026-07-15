@@ -118,10 +118,16 @@ def _trial_stage(folder: Path, result: dict) -> str:
     retry_status = _json(folder / "retry-state.json").get("status")
     if isinstance(retry_status, str) and retry_status:
         return retry_status
-    if (folder / "verifier" / "run.log").exists():
+    verifier = folder / "verifier"
+    if (verifier / "reward.json").exists() or (verifier / "reward.txt").exists():
+        return "finalizing"
+    if (verifier / "run.log").exists():
         return "verifier"
     if (folder / "artifacts" / "model.patch").exists():
-        return "extracting_patch"
+        config = _json(folder / "config.json")
+        if ((config.get("verifier") or {}).get("disable") is True):
+            return "finalizing"
+        return "preparing_verifier"
     agent = folder / "agent"
     if agent.exists() and any(p.is_file() for p in agent.rglob("*")):
         return "agent_running"

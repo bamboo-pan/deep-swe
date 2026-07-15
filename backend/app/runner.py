@@ -21,6 +21,7 @@ from .docker_cleanup import (
     DockerCleanupPolicy, cleanup_job_resources, docker_available,
     sanitize_compose_project_name,
 )
+from .local_images import ensure_local_task_images
 from .models import ACTIVE_STATES, TERMINAL_STATES, Run
 from .preferences import credential_path, current_secrets, get_preferences
 from .pier_retry_patch.networking import trial_network_subnets
@@ -323,6 +324,11 @@ def _preflight(tasks: list[str], proxy_url: str | None = None) -> None:
         raise RuntimeError(f"Docker 不可用: {message}")
     if proxy_url:
         _docker_proxy_connectivity(proxy_url)
+    ensure_local_task_images(
+        settings.tasks_dir,
+        tasks,
+        log_dir=settings.tasks_dir.parent / "data" / "local-image-builds",
+    )
 
 def _tail_text(path: Path, limit: int = 200_000) -> str:
     try:

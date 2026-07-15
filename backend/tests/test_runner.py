@@ -667,6 +667,30 @@ def test_preflight_rejects_crlf_scripts(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(runner, "docker_available", lambda: (True, "ok"))
     runner._preflight(["t1"])
 
+def test_preflight_prepares_local_images_after_connectivity(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(runner.settings, "tasks_dir", tmp_path)
+    (tmp_path / "t1").mkdir()
+    calls = []
+    monkeypatch.setattr(runner, "docker_available", lambda: (True, "ok"))
+    monkeypatch.setattr(
+        runner, "_docker_proxy_connectivity", lambda url: calls.append(("proxy", url))
+    )
+    monkeypatch.setattr(
+        runner,
+        "ensure_local_task_images",
+        lambda tasks_dir, tasks, **kwargs: calls.append(
+            ("images", tasks_dir, tasks, kwargs["log_dir"])
+        ),
+    )
+    runner._preflight(["t1"], "http://127.0.0.1:9887/v1")
+    assert calls[0] == ("proxy", "http://127.0.0.1:9887/v1")
+    assert calls[1] == (
+        "images",
+        tmp_path,
+        ["t1"],
+        tmp_path.parent / "data" / "local-image-builds",
+    )
+
 def test_completed_trials_cost_prefers_reported_then_estimates(tmp_path: Path):
     t1=tmp_path/"task-a__x1"; t1.mkdir(parents=True)
     (t1/"result.json").write_text(json.dumps({"agent_result":{"cost_usd":2.5}}), encoding="utf-8")
@@ -740,6 +764,44 @@ def test_verification_failure_has_actionable_reason(tmp_path: Path):
     assert trial["failure_type"] == "VerificationFailed"
     assert "F2P 7/9" in trial["failure_message"]
     assert trial["failure_summary"].startswith("VerificationFailed:")
+
+def test_trial_stage_progresses_through_verifier_markers(tmp_path: Path):
+    folder = tmp_path / "task-a__x1"
+    assert results._trial_stage(folder, {}) == "queued"
+
+    folder.mkdir(parents=True)
+    (folder / "config.json").write_text(
+        json.dumps({"verifier": {"disable": False}}), encoding="utf-8"
+    )
+    assert results._trial_stage(folder, {}) == "preparing_environment"
+
+    (folder / "agent").mkdir()
+    (folder / "agent" / "trajectory.json").write_text("{}", encoding="utf-8")
+    assert results._trial_stage(folder, {}) == "agent_running"
+
+    (folder / "artifacts").mkdir()
+    (folder / "artifacts" / "model.patch").write_text("diff", encoding="utf-8")
+    assert results._trial_stage(folder, {}) == "preparing_verifier"
+
+    (folder / "verifier").mkdir()
+    (folder / "verifier" / "run.log").write_text("running", encoding="utf-8")
+    assert results._trial_stage(folder, {}) == "verifier"
+
+    (folder / "verifier" / "reward.json").write_text("{}", encoding="utf-8")
+    assert results._trial_stage(folder, {}) == "finalizing"
+
+    final_result = {"task_name": "task-a", "verifier_result": {"rewards": {"reward": 1}}}
+    write_result(folder, final_result)
+    assert results._trial_stage(folder, final_result) == "completed"
+
+def test_disabled_verifier_moves_to_finalizing_after_patch(tmp_path: Path):
+    folder = tmp_path / "task-a__x1"
+    (folder / "artifacts").mkdir(parents=True)
+    (folder / "artifacts" / "model.patch").write_text("diff", encoding="utf-8")
+    (folder / "config.json").write_text(
+        json.dumps({"verifier": {"disable": True}}), encoding="utf-8"
+    )
+    assert results._trial_stage(folder, {}) == "finalizing"
 
 def test_empty_patch_from_cost_limit_is_not_reported_as_verification_failure(tmp_path: Path):
     folder=tmp_path/"task-a__x1"

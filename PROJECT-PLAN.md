@@ -156,6 +156,8 @@ tests/{Dockerfile,config.json,test.sh,test.patch,grader.py,base_repo/}
 
 `preparing_environment` 覆盖基础镜像元数据检查/拉取、Task 环境镜像、Agent 安装层、egress proxy、容器创建与健康检查。首次运行新 Task 或本机没有缓存时，这一阶段持续数分钟属于正常现象，且尚未进入模型调用；是否真的卡住应以 Docker build 记录、Trial 日志和文件更新时间判断，不能只看 UI 阶段名称。
 
+Live 阶段按单个 Trial 展示为 `queued → preparing_environment → agent_running → preparing_verifier → verifier → finalizing → completed/failed`。`model.patch` 出现只表示 Agent 已提交并进入 verifier 准备，不再把后续镜像构建和隐藏测试统称为 `extracting_patch`；`completed` 仍只在最终 `result.json` 写出后计数。
+
 Pier 对每个新 Trial 都可能调用一次 `docker compose build`，但“执行 build 检查”不等于“完整重建”。Docker 会按 Dockerfile 指令和构建上下文复用 BuildKit 层缓存，即使 Trial 使用新的随机镜像名，未变化的基础层、Agent 安装层和依赖层仍可共享。
 
 需要实际重建相应镜像层的情况:
@@ -168,14 +170,33 @@ Pier 对每个新 Trial 都可能调用一次 `docker compose build`，但“执
 
 通常不改变镜像内容的运行时变化:模型、reasoning effort、凭据和模型 URL、并发/重复次数、预算、重试与 timeout；仅修改 `instruction.md`、`solution/`、`pre_artifacts.sh` 或展示 metadata 也不要求主动清理镜像。它们仍可能让 Pier 创建新的 Trial/镜像标签并执行缓存检查。
 
-Docker Compose v5 默认可能把构建交给 Buildx Bake。Windows 上并行构建若长期无输出，可在**启动 UI 前的同一个 PowerShell 会话**禁用 Bake 编排:
+Docker Compose v5 默认可能把构建交给 Buildx Bake。`run-ui.ps1` 在未显式设置时自动给 backend 继承 `COMPOSE_BAKE=false`；手动运行 backend 或 Pier 时，Windows 上并行构建若长期无输出，可在**启动进程前的同一个 PowerShell 会话**禁用 Bake 编排:
 
 ```powershell
 $env:COMPOSE_BAKE = "false"
 .\run-ui.ps1
 ```
 
-已启动的 UI/backend 不会自动获得后来设置的环境变量，必须重启。`COMPOSE_BAKE=false` 只把 Compose 从 `docker buildx bake` 路径切回普通逐服务构建，不跳过构建、不关闭 BuildKit 缓存，也不能修复镜像仓库、Debian 包或 GitHub release 的 403/超时等网络错误。
+已启动的 UI/backend 不会自动获得后来设置的环境变量，必须重启。`COMPOSE_BAKE=false` 只把 Compose 从 `docker buildx bake` 路径切回普通逐服务构建，不跳过构建、不关闭 BuildKit 缓存，也不能修复镜像仓库、Debian 包或 GitHub release 的 403/超时等网络错误。用户显式设置 `COMPOSE_BAKE=true` 时，启动脚本不会覆盖该选择。
+
+全局并发槽位按完整 Trial 单独释放：只有该 Trial 的 Agent、verifier、Patch/结果处理全部返回后才调用 `release_slot`；同一批次的其他 Trial 仍运行时，FIFO 队列中的下一个 Trial 可以立即占用释放的槽位，不需要等待整批结束。
+
+### 10.2 本地稳定镜像与按需复用
+
+两个 `[TEST]` Python Task 的 `[environment].docker_image` 与
+`[verifier.environment].docker_image` 使用 `:local` 标签。后端 preflight
+直接调用 `backend/app/local_images.py`，不再提供额外的手动准备脚本：
+
+- 首次运行或镜像不存在时，分别构建 `environment/` 与 `tests/` 上下文，并把上下文 SHA-256 写入 Docker label `io.deepswe.local-context-sha256`。
+- 镜像存在且 label 与当前 Dockerfile、fixture、测试脚本、grader、patch、config 及依赖本地镜像 digest 一致时直接复用，不调用 Docker build。
+- 基础环境镜像变化会传递到引用它的 verifier checksum；同一标签不会静默使用过期 verifier。
+- `environment_mode="separate"` 时必须为本地 verifier 配置独立 `docker_image`，不能让它继承 Agent 环境的同一标签，否则隐藏测试不会进入预构建镜像。
+- 构建日志写入 `data/local-image-builds/`（运行数据，不提交 Git）；构建失败会在 preflight 错误中给出日志路径。
+- `:local` 标签只保证当前 Docker daemon/平台可用，不把 `.tar` 镜像归档放进仓库。多人或 CI 共享时应推送到稳定 registry，并将 `docker_image` 改为 registry digest/tag。
+
+当前 Windows Docker Desktop 实测：两个 slim Python 基础环境和 verifier 镜像约 `337 MB`/个（大量层共享）；首次四镜像准备约 `188 秒`，第二次 checksum 命中全部 `reused`，耗时约 `0.4 秒`。镜像实际大小会随 Docker 基础镜像、平台和 Agent 安装指纹变化，不能把 `docker image ls` 中每个标签的大小简单相加。
+
+Pier 的 separate verifier 默认会在 trial 结束时执行 `down --rmi all`；对直接使用 `:local` 的共享 verifier，这会删除标签并让后续 trial 错误地回源拉取。运行时补丁已限定移除该清理命令中的 `--rmi all`（只对 `use_prebuilt + :local` 生效），容器/卷/孤儿资源仍照常清理。2026-07-15 的真实 `RUN-000009`（两个 Task、各 1 trial）以 2/2 passed、0 errors 完成，两个 verifier 标签在 Run 后仍存在；两个 trial 环境准备 12.1s/11.9s。
 
 ## 11. Docker 资源清理(阶段一至三已实现)
 
@@ -193,7 +214,7 @@ $env:COMPOSE_BAKE = "false"
 
 - **Dashboard**:Docker/Pier/模型 API 健康、当前 Job、最近结果与基线、通过率/耗时/费用变化、降智告警摘要
 - **New Run**:agent(单个或三 Agent 同跑,三 Agent 由批量接口创建三条独立 Run)、模型、effort、任务选择(展示官方通过率/耗时)、重复次数、verifier 开关、tier;提交前展示全局并发占用,若本次有 Trial 不能立即启动则明确确认排队数量
-- **Live**:SSE 按 `result.json` mtime 指纹推送(5 秒兜底;含 regression 字段、不含 Patch 正文),断线自动重连;阶段流转 queued→preflight→environment→agent→patch→verifier→终态;展示系统级运行中/排队中数量和当前 Run 的队列占用;点击 Trial 按需拉取 Patch/错误/日志;多 Agent 切换;取消
+- **Live**:SSE 按每个 Trial 的 Agent/Patch/verifier/reward/result 标志文件指纹即时推送(5 秒兜底;含 regression 字段、不含 Patch 正文),断线自动重连;阶段流转 queued→preflight→environment→agent→preparing_verifier→verifier→finalizing→终态;展示系统级运行中/排队中数量和当前 Run 的队列占用;点击 Trial 按需拉取 Patch/错误/日志;多 Agent 切换;取消
 - **Results**:通过率、Reward、Partial、F2P/P2P、双耗时、Token/费用、steps、失败原因、Patch/日志;多选批量删除(运行中必须先取消;删除先清 Docker 再清索引/基线/artifacts/日志)
 - **Compare**:最多 8 次运行,Task × Run 通过率矩阵;口径区分——官方严格可比仅 mini-swe-agent ↔ 官方 mini-swe-agent,Codex/Claude Code 对官方为参考比较,严格纵向比较要求同 agent/版本/模型/配置
 - **Tasks**:catalog 自动解析 113 个官方任务与 2 个 `[TEST]` 自定义任务的 `task.toml`;官方任务的通过率与平均耗时已实现(聚合自官方 `artifacts/v1.1/trials.json`,口径同官方站点 "ALL MODEL EFFORTS",缓存分发于 `data/official-task-stats-v1.1.json`,可手动同步刷新)
@@ -204,7 +225,7 @@ $env:COMPOSE_BAKE = "false"
 
 第一版验收链路全部完成,约 95%+。经历四轮:第一轮交付 → 第二轮修复代码审查确认的 15 项缺陷 + Docker 清理集成 → 第三轮(2026-07-12)修复试运行暴露的护栏缺失与网络问题(CRLF 预检、subagent 禁用、用量熔断、瞬时重试、子网固定、官方统计) → 第四轮(2026-07-15)补齐两个 `[TEST]` Python 自定义 Task，并完成评分边界与真实模型付费验证。
 
-验证现状:后端 pytest 120 项、前端 `tsc --noEmit` 与 Vite 构建、本机 Docker 清理集成测试(alpine 标签五项)、Pier 0.3.0 全局队列补丁握手与源码核对均通过；自定义 Task 相关后端专项测试 32 项通过，两个 Task 的 `nop=0`、`oracle=1`、真实模型 `Reward=1` 全部符合预期。
+验证现状:后端 pytest 150 项、前端 `tsc --noEmit` 与 Vite 构建、本机 Docker 清理集成测试(alpine 标签五项)、Pier 0.3.0 全局队列补丁握手与源码核对均通过；自定义 Task 相关后端专项测试、Local image checksum/reuse 测试、依赖失效测试和 `:local` verifier 保留测试均通过，Live 阶段与逐 Trial SSE 指纹测试通过，两个 Task 的 `nop=0`、`oracle=1`、真实模型 `Reward=1` 全部符合预期。2026-07-15 新增本地镜像实测：四个稳定 `:local` 镜像首次准备约 188 秒，第二次全部复用约 0.4 秒；Pier `nop` 环境准备约 2 秒，`oracle` 两题均 `Reward=1`；修复 verifier 清理后，真实 `RUN-000009` 两个 trial 均通过且结束后本地 verifier 标签仍在。
 
 真实付费验证:
 

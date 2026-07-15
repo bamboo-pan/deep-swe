@@ -351,7 +351,16 @@ function Status({
       ? "success"
       : ["failed", "cancelled", "interrupted"].includes(value)
         ? "failure"
-        : ["preflight", "running", "preparing_environment", "agent_running", "extracting_patch", "verifier"].includes(value)
+        : [
+            "preflight",
+            "running",
+            "preparing_environment",
+            "agent_running",
+            "extracting_patch",
+            "preparing_verifier",
+            "verifier",
+            "finalizing",
+          ].includes(value)
           ? "active"
           : "waiting";
   return (

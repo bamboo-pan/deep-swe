@@ -391,8 +391,34 @@ def delete_run(run_id:int):
         }
     return response
 
+_STAGE_MARKERS = (
+    "agent",
+    "artifacts/model.patch",
+    "verifier/run.log",
+    "verifier/reward.json",
+    "verifier/reward.txt",
+    "result.json",
+    "retry-state.json",
+)
+
+
+def _stage_marker_signature(path: Path) -> str:
+    """Return a cheap existence/mtime/size signature for a stage marker."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return "-"
+    if path.is_dir():
+        try:
+            child_count = sum(1 for _ in path.iterdir())
+        except OSError:
+            child_count = -1
+        return f"dir:{stat.st_mtime_ns}:{child_count}"
+    return f"{stat.st_mtime_ns}:{stat.st_size}"
+
+
 def _run_fingerprint(run: Run) -> tuple:
-    """轻量变化指纹：状态 + result.json mtime + 5 秒兜底刷新（阶段探测依赖的其他文件不逐个 stat）。"""
+    """Track per-Trial stage markers with a five-second safety refresh."""
     queue = queue_status(run.id)
     parts = [
         run.status, str(run.finished_at), queue["running"], queue["queued"],
@@ -400,11 +426,18 @@ def _run_fingerprint(run: Run) -> tuple:
     ]
     root = jobs_root_for(run) / run.job_name
     if root.exists():
-        for path in sorted(root.rglob("result.json")):
-            try:
-                parts.append(f"{path.name}:{path.stat().st_mtime_ns}")
-            except OSError:
-                pass
+        parts.append(f"job-result:{_stage_marker_signature(root / 'result.json')}")
+        try:
+            trials = sorted(
+                path for path in root.iterdir()
+                if path.is_dir() and "__" in path.name
+            )
+        except OSError:
+            trials = []
+        for trial in trials:
+            parts.append(f"trial:{trial.name}")
+            for marker in _STAGE_MARKERS:
+                parts.append(f"{trial.name}/{marker}:{_stage_marker_signature(trial / marker)}")
     return tuple(parts)
 
 @app.get("/api/runs/{run_id}/events")

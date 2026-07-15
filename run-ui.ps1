@@ -13,6 +13,10 @@ try {
     $venv = Join-Path $root '.venv'
     $py = Join-Path $venv 'Scripts\python.exe'
 
+    # Docker Compose v5 Bake may stay silent while resolving metadata on Windows.
+    # Keep an explicit user choice, otherwise use the more predictable path.
+    if (-not $env:COMPOSE_BAKE) { $env:COMPOSE_BAKE = 'false' }
+
     # $ErrorActionPreference 对原生命令无效（PowerShell 5.1），必须显式检查退出码
     if (-not (Test-Path $venv)) {
         python -m venv $venv
