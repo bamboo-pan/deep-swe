@@ -24,6 +24,7 @@ import {
   SquareX,
   Trash2,
   Upload,
+  Volume2,
   Wifi,
 } from "lucide-react";
 import "./style.css";
@@ -175,6 +176,11 @@ type Run = {
     reset_seconds?: number | null;
   } | null;
 };
+type VoiceProgressSnapshot = {
+  completed: number;
+  status: string;
+  terminalTrialIds: Set<string>;
+};
 type TaskInfo = {
   id: string;
   task_number: number;
@@ -325,6 +331,31 @@ const compactMoney = (value: number | null | undefined) =>
 const compactNumber = (value: number | null | undefined) =>
   value == null ? "—" : value.toFixed(Number.isInteger(value) ? 0 : 1);
 const terminal = new Set(["completed", "failed", "cancelled", "interrupted"]);
+const voiceProgressStorageKey = "deepswe-progress-voice-enabled";
+const voiceTerminalTrials = new Set(["completed", "failed", "cancelled", "interrupted"]);
+const voiceProgressSupported =
+  "speechSynthesis" in window && "SpeechSynthesisUtterance" in window;
+const voiceSnapshot = (run: Run): VoiceProgressSnapshot => ({
+  completed: run.progress?.completed || 0,
+  status: run.status,
+  terminalTrialIds: new Set(
+    (run.trials || [])
+      .filter((trial) => voiceTerminalTrials.has(trial.status))
+      .map((trial) => trial.id),
+  ),
+});
+const speakProgress = (message: string) => {
+  if (!voiceProgressSupported || !message) return;
+  const utterance = new SpeechSynthesisUtterance(message);
+  utterance.lang = "zh-CN";
+  utterance.rate = 1;
+  const voices = window.speechSynthesis.getVoices();
+  const chineseVoice =
+    voices.find((voice) => voice.lang.toLowerCase() === "zh-cn") ||
+    voices.find((voice) => voice.lang.toLowerCase().startsWith("zh"));
+  if (chineseVoice) utterance.voice = chineseVoice;
+  window.speechSynthesis.speak(utterance);
+};
 const parseCompareSelection = (key: string) => {
   const separator = key.indexOf(":");
   if (separator <= 0 || separator === key.length - 1) return null;
@@ -423,6 +454,16 @@ function App() {
   const [prefs, setPrefs] = useState<Prefs>();
   const [notice, setNotice] = useState("");
   const providerAlertKey = useRef("");
+  const [voiceEnabled, setVoiceEnabled] = useState(
+    () =>
+      voiceProgressSupported &&
+      localStorage.getItem(voiceProgressStorageKey) === "true",
+  );
+  const voiceEnabledRef = useRef(voiceEnabled);
+  const voiceSnapshots = useRef<Map<number, VoiceProgressSnapshot>>(new Map());
+  const voiceSnapshotsReady = useRef(false);
+  const pendingVoiceMessages = useRef<string[]>([]);
+  const voiceAnnouncementTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const [starting, setStarting] = useState(false);
   const [agent, setAgent] = useState("mini-swe-agent");
   const [allAgents, setAllAgents] = useState(false);
@@ -436,6 +477,37 @@ function App() {
   const [codexStreamIdleTimeout, setCodexStreamIdleTimeout] = useState("600");
   const [verification, setVerification] = useState(true);
   const [tier, setTier] = useState("standard");
+  const rememberVoiceProgress = (items: Run[]) =>
+    new Map(items.map((run) => [run.id, voiceSnapshot(run)]));
+  const queueVoiceAnnouncements = (messages: string[]) => {
+    pendingVoiceMessages.current.push(...messages);
+    clearTimeout(voiceAnnouncementTimer.current);
+    voiceAnnouncementTimer.current = setTimeout(() => {
+      const combined = [...new Set(pendingVoiceMessages.current)].join("。");
+      pendingVoiceMessages.current = [];
+      if (voiceEnabledRef.current) speakProgress(combined);
+    }, 650);
+  };
+  const changeVoiceEnabled = (enabled: boolean) => {
+    if (enabled && !voiceProgressSupported) {
+      setNotice("当前浏览器不支持语音播报，请使用最新版 Chrome 或 Edge");
+      return;
+    }
+    voiceEnabledRef.current = enabled;
+    voiceSnapshots.current = rememberVoiceProgress(runs);
+    voiceSnapshotsReady.current = true;
+    pendingVoiceMessages.current = [];
+    clearTimeout(voiceAnnouncementTimer.current);
+    window.speechSynthesis?.cancel();
+    setVoiceEnabled(enabled);
+    localStorage.setItem(voiceProgressStorageKey, String(enabled));
+    if (enabled) {
+      speakProgress("语音进度提醒已开启。任务执行结束后将播报当前进度。");
+      setNotice("语音进度提醒已开启");
+    } else {
+      setNotice("语音进度提醒已关闭");
+    }
+  };
   const refreshRuns = () =>
     Promise.all([
       request<Run[]>("/api/runs"),
@@ -479,6 +551,74 @@ function App() {
       String(navigationCollapsed),
     );
   }, [navigationCollapsed]);
+  useEffect(() => {
+    const nextSnapshots = rememberVoiceProgress(runs);
+    if (!voiceSnapshotsReady.current) {
+      voiceSnapshots.current = nextSnapshots;
+      voiceSnapshotsReady.current = true;
+      return;
+    }
+    const messages: string[] = [];
+    if (voiceEnabledRef.current) {
+      for (const run of runs) {
+        const previous = voiceSnapshots.current.get(run.id);
+        if (!previous) continue;
+        const current = nextSnapshots.get(run.id)!;
+        const becameTerminal = terminal.has(run.status) && !terminal.has(previous.status);
+        const completedDelta = current.completed - previous.completed;
+        const newlyFinished = (run.trials || []).filter(
+          (trial) =>
+            voiceTerminalTrials.has(trial.status) &&
+            !previous.terminalTrialIds.has(trial.id) &&
+            trial.resource_name,
+        );
+        if (completedDelta > 0 && (!becameTerminal || newlyFinished.length > 0)) {
+          let completion = `${completedDelta} 个任务执行已结束`;
+          if (newlyFinished.length === 1) {
+            const trial = newlyFinished[0];
+            const attempt =
+              run.attempts_per_task > 1 && trial.attempt
+                ? `，第 ${trial.attempt} 次执行`
+                : "";
+            completion = `Task ${trial.task_title || trial.task}${attempt}${
+              trial.status === "completed" ? "已完成" : "已结束"
+            }`;
+          } else if (newlyFinished.length > 1) {
+            completion = `${newlyFinished.length} 个任务执行已结束`;
+          }
+          messages.push(
+            `运行 ${run.id}，${completion}。当前进度 ${current.completed}/${
+              run.progress?.total || 0
+            }，通过 ${run.progress?.passed || 0} 项`,
+          );
+        }
+        if (becameTerminal) {
+          const statusText =
+            run.status === "completed"
+              ? "已完成"
+              : run.status === "failed"
+                ? "执行失败"
+                : run.status === "cancelled"
+                  ? "已取消"
+                  : "已中断";
+          messages.push(
+            `运行 ${run.id}${statusText}。最终进度 ${current.completed}/${
+              run.progress?.total || 0
+            }，通过 ${run.progress?.passed || 0} 项`,
+          );
+        }
+      }
+    }
+    voiceSnapshots.current = nextSnapshots;
+    if (messages.length) queueVoiceAnnouncements(messages);
+  }, [runs]);
+  useEffect(
+    () => () => {
+      clearTimeout(voiceAnnouncementTimer.current);
+      window.speechSynthesis?.cancel();
+    },
+    [],
+  );
   useEffect(() => {
     request<Boot>("/api/bootstrap").then((x) => {
       setBoot(x);
@@ -1255,6 +1395,9 @@ function App() {
             restore={restore}
             boot={boot}
             notify={setNotice}
+            voiceEnabled={voiceEnabled}
+            voiceSupported={voiceProgressSupported}
+            onVoiceEnabledChange={changeVoiceEnabled}
           />
         )}
         {tab === "diagnostics" && <Diagnostics checks={checks} />}
@@ -2389,6 +2532,9 @@ function Settings({
   restore,
   boot,
   notify,
+  voiceEnabled,
+  voiceSupported,
+  onVoiceEnabledChange,
 }: {
   prefs?: Prefs;
   setPrefs: (p: Prefs) => void;
@@ -2396,6 +2542,9 @@ function Settings({
   restore: (f: File) => void;
   boot: Boot;
   notify: (message: string) => void;
+  voiceEnabled: boolean;
+  voiceSupported: boolean;
+  onVoiceEnabledChange: (enabled: boolean) => void;
 }) {
   if (!prefs) return <Empty text="正在读取设置…" />;
   const defaultEfforts =
@@ -2412,6 +2561,28 @@ function Settings({
   };
   return (
     <>
+      <section className="panel form voicesettings">
+        <div className="voicesettingscopy">
+          <Volume2 />
+          <div>
+            <h2>语音进度提醒</h2>
+            <p className="muted">
+              Task 执行结束和 Run 收尾时播报当前完成数与通过数。设置仅保存在当前浏览器，不影响任务执行。
+            </p>
+          </div>
+        </div>
+        <button
+          type="button"
+          className={`voicetoggle ${voiceEnabled ? "enabled" : ""}`}
+          role="switch"
+          aria-checked={voiceEnabled}
+          disabled={!voiceSupported}
+          onClick={() => onVoiceEnabledChange(!voiceEnabled)}
+        >
+          <span aria-hidden="true"><i /></span>
+          {voiceSupported ? (voiceEnabled ? "已开启" : "已关闭") : "浏览器不支持"}
+        </button>
+      </section>
       <section className="panel form">
         <h2>本机设置</h2>
         <div className="formgrid">

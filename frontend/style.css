@@ -482,6 +482,79 @@ h2 {
 .form {
   max-width: 1000px;
 }
+.voicesettings {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 28px;
+}
+.voicesettingscopy {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+}
+.voicesettingscopy > svg {
+  width: 22px;
+  flex: 0 0 auto;
+  color: #45dda5;
+}
+.voicesettingscopy h2 {
+  margin-bottom: 7px;
+}
+.voicesettingscopy p {
+  max-width: 650px;
+  margin: 0;
+  line-height: 1.6;
+}
+.voicetoggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+  border: 1px solid #29483d;
+  border-radius: 999px;
+  padding: 8px 12px 8px 8px;
+  background: #0b1814;
+  color: #789389;
+  cursor: pointer;
+  font: 600 11px "IBM Plex Mono";
+}
+.voicetoggle > span {
+  display: block;
+  width: 34px;
+  height: 19px;
+  padding: 2px;
+  border-radius: 999px;
+  background: #233a32;
+  transition: background 160ms ease;
+}
+.voicetoggle i {
+  display: block;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: #789389;
+  transition: transform 160ms ease, background 160ms ease;
+}
+.voicetoggle.enabled {
+  border-color: #328a69;
+  color: #54efb4;
+}
+.voicetoggle.enabled > span {
+  background: #1d664e;
+}
+.voicetoggle.enabled i {
+  transform: translateX(15px);
+  background: #69f0bd;
+}
+.voicetoggle:focus-visible {
+  outline: 2px solid #54efb4;
+  outline-offset: 2px;
+}
+.voicetoggle:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
 .formgrid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -1233,6 +1306,10 @@ select {
     padding: 24px;
   }
   .toggles {
+    flex-direction: column;
+  }
+  .voicesettings {
+    align-items: flex-start;
     flex-direction: column;
   }
   .panelhead {
