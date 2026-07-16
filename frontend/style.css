@@ -344,6 +344,11 @@ h1 {
   color: #d7e7e1;
   font: 600 17px "IBM Plex Mono";
 }
+.providerqueuemetrics b.providercoderates {
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
 .providerqueuebar {
   height: 5px;
   overflow: hidden;
@@ -767,9 +772,39 @@ select {
   color: inherit;
   cursor: pointer;
 }
-.trialgrid button span:last-child {
+.trialgrid button > span:last-child {
   color: #718c82;
   font-size: 11px;
+}
+.trialtelemetry {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+.trialtelemetry > span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid #173b30;
+  border-radius: 5px;
+  background: #091713;
+}
+.trialtelemetry small {
+  color: #607e73;
+  font-size: 9px;
+}
+.trialtelemetry b {
+  color: #c8d9d3;
+  font: 600 11px "IBM Plex Mono";
+  overflow-wrap: anywhere;
+}
+.trialtelemetry b.success { color: #54e7ae; }
+.trialtelemetry b.warning { color: #efb344; }
+.trialtelemetry b.error { color: #f17b82; }
+.trialtelemetry b.idle { color: #607e73; }
+@media (max-width: 620px) {
+  .trialtelemetry { grid-template-columns: 1fr; }
 }
 .trialgrid button code,
 .technicalid {

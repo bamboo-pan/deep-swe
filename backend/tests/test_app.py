@@ -428,6 +428,8 @@ def test_settings_persist_retry_runtime_limits_and_cost_guards(monkeypatch):
     keys = (
         "max_parallel_tasks",
         "provider_rpm",
+        "provider_max_concurrency", "provider_max_retries",
+        "provider_retry_interval_seconds",
         "agent_timeout_seconds", "verifier_timeout_seconds",
         "infrastructure_max_retries", "agent_max_steps",
         "trial_budget_usd", "run_budget_usd",
@@ -437,6 +439,9 @@ def test_settings_persist_retry_runtime_limits_and_cost_guards(monkeypatch):
         payload = {
             "max_parallel_tasks": 9,
             "provider_rpm": 30,
+            "provider_max_concurrency": 5,
+            "provider_max_retries": 4,
+            "provider_retry_interval_seconds": 7,
             "agent_timeout_seconds": 7200,
             "verifier_timeout_seconds": 2400,
             "infrastructure_max_retries": 2,

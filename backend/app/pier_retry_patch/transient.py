@@ -10,6 +10,14 @@ from typing import TypeVar
 
 TRANSIENT_EXCEPTION_TYPE = "TransientAgentInfrastructureError"
 TRANSIENT_VERIFIER_EXCEPTION_TYPE = "TransientVerifierInfrastructureError"
+CONTEXT_LIMIT_EXCEPTION_TYPE = "ContextLimitExceededError"
+
+_CONTEXT_LIMIT_MARKERS = (
+    "context_too_large",
+    "context window of this model",
+    "exceeds the context window",
+    "context window exceeded",
+)
 
 
 class TransientVerifierInfrastructureError(RuntimeError):
@@ -25,9 +33,15 @@ _TRANSIENT_MARKERS = (
     "unexpected status 502",
     "unexpected status 503",
     "unexpected status 504",
+    "unexpected status 522",
+    "unexpected status 524",
     "502 bad gateway",
     "503 service unavailable",
     "504 gateway timeout",
+    "522 unassigned",
+    "524 unassigned",
+    '"message":"status 522"',
+    '"message":"status 524"',
     "api error: the operation timed out",
     '"terminal_reason":"api_error"',
     "connection reset",
@@ -93,6 +107,23 @@ def _message_is_transient(exception_type: str | None, message: str | None) -> bo
         return False
     lowered = " ".join(message.lower().split())
     return any(marker in lowered for marker in _TRANSIENT_MARKERS) or _has_contextual_eof(message)
+
+
+def is_context_limit_failure(
+    exception_type: str | None,
+    message: str | None,
+    *,
+    agent_log_tail: str | None = None,
+) -> bool:
+    """Recognize a non-retryable model context-window rejection."""
+    if exception_type == CONTEXT_LIMIT_EXCEPTION_TYPE:
+        return True
+    text = " ".join(
+        part.lower()
+        for part in (message or "", agent_log_tail or "")
+        if part
+    )
+    return any(marker in text for marker in _CONTEXT_LIMIT_MARKERS)
 
 
 def is_transient_agent_failure(

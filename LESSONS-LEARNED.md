@@ -264,3 +264,15 @@ $env:COMPOSE_BAKE = "false"
 - 修复必须同时完成两项：把 `host.docker.internal` 加入精确域名白名单，把 8765 加入 Squid 的 `Safe_ports`/`SSL_ports`。这只开放本地 DeepSWE 代理，不扩大其他互联网访问范围。
 - 排障应分三段验证：Docker 到 `host.docker.internal:8765` 的 TCP 连通、本地 DeepSWE 代理到真实 provider 的 HTTP 响应、Pier Squid 对目标域名和端口的 ACL。只做前两段会漏掉本次问题。
 - Live 页应直接显示 RPM、过去 60 秒请求数、等待请求数、当前可用额度和下次放行倒计时；否则用户只能看到 Agent“卡住”，无法区分模型执行、RPM 排队和 provider 冷却。
+
+### 9.9 Provider 活动并发与统一请求重试
+
+- RPM 和活动请求并发解决的是两个不同约束。RPM 控制滚动 60 秒内的请求启动总数；活动并发控制当前仍连接到上游 Provider 的请求数。只配置 RPM 仍可能在窗口刚开始时同时发出大量请求，触发 Provider 的连接并发上限。
+- 并发槽必须只覆盖真实上游连接生命周期。请求进入固定重试等待前先释放槽位，下一次尝试再重新申请；否则睡眠中的失败请求会占满 Provider 并发，健康请求无法发送。
+- 异步服务中不能用 `asyncio.to_thread()` 包装会长期阻塞的 `threading.Condition.acquire()` 来等待并发槽。协程取消不会停止后台线程；线程稍后取得槽位时已经没有协程负责释放，会形成永久槽位泄漏。应使用 `asyncio.Condition`，并在等待协程取消时通过 `finally` 回收 waiting 计数。
+- 槽位释放要放在嵌套 `finally` 中。即使 `upstream.aclose()` 或 `client.aclose()` 自身抛错，也必须释放活动请求计数；测试不能只覆盖正常流结束，还要覆盖等待取消和关闭异常。
+- 429 告警写入 SQLite 只是可观测性，必须 best-effort。告警记录失败只能写后端 warning，不能让本来可继续重试或已成功的模型请求变成 500。
+- 统一入口的语义必须明确：`provider_max_retries` 是“首次请求之外的重试次数”，固定间隔由 `provider_retry_interval_seconds` 控制；每次尝试重新计入 RPM，重试等待不占活动连接。
+- 请求代理只安全重试尚未交给 Agent 的建连失败或 HTTP 429/500/502/503/504。成功流已经开始后不能从头重放，否则 Agent 可能收到重复文本或重复工具调用。
+- 为避免重试倍增，新 Run 显式关闭 mini-swe-agent/LiteLLM 和 Codex 的可配置请求/流重试；Pier 的 `infrastructure_max_retries` 仍保留为完整 Trial 级兜底，两者不是同一层。Claude Code 等第三方 CLI 若有不可配置的内部行为，代理仍是应用侧唯一公开设置入口，但文档不能声称能消除第三方工具内部的全部重试。
+- 生产前端是构建后的哈希资源，不会对已打开的标签页热更新。服务端已切换到新 bundle 时，旧标签页仍可能显示旧设置表单；先用 `Ctrl+F5` 或重新打开页面确认，再判断是否构建/部署失败。

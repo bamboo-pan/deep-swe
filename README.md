@@ -70,18 +70,33 @@ or later trials do not try to pull that image from a registry. Pier may still
 build the per-agent installation layer on the first run; BuildKit reuses that
 layer on later runs while the agent fingerprint and task base image are unchanged.
 
-### Provider RPM and request queue
+### Provider request limits and retries
 
-The UI can enforce a global Provider RPM limit. Every model HTTP request from
-Codex, Claude Code, and mini-swe-agent is routed through the local DeepSWE
-provider proxy. A shared rolling 60-second window allows requests immediately
-while capacity remains and queues excess requests until the oldest request
-leaves the window. Automatic retries use the same quota.
+Every model HTTP request from Codex, Claude Code, and mini-swe-agent is routed
+through the local DeepSWE provider proxy. Settings provide two independent
+limits:
 
-The Live page shows the configured RPM, requests sent during the last 60
-seconds, queued requests, immediately available capacity, and the next release
-countdown. Provider `429` and `model_cooldown` responses also appear as automatic
-UI notifications.
+- **Provider RPM**: a shared rolling 60-second request window. Requests are sent
+  immediately while the window has capacity and are queued after it fills.
+- **Provider max active requests**: a cap on simultaneous upstream Provider
+  connections. `0` disables either limit.
+
+The proxy also owns the application-configured retry policy. The retry count
+does not include the initial request; retryable connection failures and HTTP
+`429`, `500`, `502`, `503`, and `504` responses wait for the configured fixed
+interval and then make a new request. Each retry consumes RPM quota. A request
+releases its concurrency slot before entering the retry wait, so sleeping
+retries do not occupy active Provider connections.
+
+For new runs, the configurable mini-swe-agent/LiteLLM and Codex request retries
+are disabled to avoid multiplying the proxy retry count. Pier's whole-trial
+infrastructure retry remains a separate recovery layer. Responses are retried
+only before a successful stream is handed to the agent; an interrupted stream
+is not replayed because doing so could duplicate model output.
+
+The Live page shows RPM usage and queueing together with active Provider
+requests, concurrency waiters, and the configured retry policy. Provider `429`
+and `model_cooldown` responses also appear as automatic UI notifications.
 
 For network-isolated Pier trials, the agent reaches the host-side proxy through
 Pier's authenticated Squid service. `host.docker.internal` and port `8765` are

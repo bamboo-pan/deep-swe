@@ -8,7 +8,7 @@ from .schemas import MAX_PARALLEL_AGENT_COUNT, MAX_PARALLEL_TASKS, SettingsUpdat
 from .security import read_credential
 
 CURRENT_KEYS = (
-    "credential_file", "jobs_dir", "default_agent", "default_model", "default_effort", "max_parallel_tasks", "provider_rpm",
+    "credential_file", "jobs_dir", "default_agent", "default_model", "default_effort", "max_parallel_tasks", "provider_rpm", "provider_max_concurrency", "provider_max_retries", "provider_retry_interval_seconds", "squid_read_timeout_seconds", "docker_memory_pause_percent",
     "agent_timeout_seconds", "verifier_timeout_seconds", "infrastructure_max_retries", "agent_max_steps",
     "docker_cleanup_after_run", "docker_cleanup_on_delete", "docker_cache_retention_hours", "docker_cache_warning_gb",
     "run_budget_usd", "trial_budget_usd",
@@ -25,6 +25,11 @@ def _defaults() -> dict:
         "default_effort": settings.default_effort,
         "max_parallel_tasks": settings.max_parallel_tasks,
         "provider_rpm": settings.provider_rpm,
+        "provider_max_concurrency": settings.provider_max_concurrency,
+        "provider_max_retries": settings.provider_max_retries,
+        "provider_retry_interval_seconds": settings.provider_retry_interval_seconds,
+        "squid_read_timeout_seconds": settings.squid_read_timeout_seconds,
+        "docker_memory_pause_percent": settings.docker_memory_pause_percent,
         "agent_timeout_seconds": settings.agent_timeout_seconds,
         "verifier_timeout_seconds": settings.verifier_timeout_seconds,
         "infrastructure_max_retries": settings.infrastructure_max_retries,

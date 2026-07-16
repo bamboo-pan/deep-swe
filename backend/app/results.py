@@ -10,14 +10,26 @@ from .config import settings
 from .models import Baseline, Run
 from .official_stats import configuration_stats, load_official_stats, normalize_model_name
 from .preferences import current_secrets, jobs_path
-from .pier_retry_patch.transient import is_transient_agent_failure
+from .pier_retry_patch.infrastructure_retry import read_retry_status
+from .pier_retry_patch.transient import (
+    CONTEXT_LIMIT_EXCEPTION_TYPE,
+    is_context_limit_failure,
+    is_transient_agent_failure,
+)
 from .pricing import DEFAULT_PRICING, pricing_for_model
+from .provider_proxy import provider_trial_status
 from .scheduler import queue_status
 from .security import redact
 from .task_suite import CONTROL_TASK
 
 TIER_MULTIPLIER = {"standard": 1.0, "batch": 0.5, "priority": 2.0}
 TRIAL_TERMINAL_STATES = {"completed", "failed", "cancelled", "interrupted"}
+LIVE_TELEMETRY_FIELDS = (
+    "provider_response_code", "provider_request_count", "provider_retries_used",
+    "provider_max_retries", "infrastructure_retries_used",
+    "infrastructure_retries_max", "infrastructure_retries_remaining",
+    "infrastructure_retry_state",
+)
 
 def run_code(run_id: int) -> str:
     return f"RUN-{run_id:06d}"
@@ -118,6 +130,8 @@ def _trial_stage(folder: Path, result: dict) -> str:
     retry_status = _json(folder / "retry-state.json").get("status")
     if isinstance(retry_status, str) and retry_status:
         return retry_status
+    if read_retry_status(folder).get("infrastructure_retry_state") == "waiting":
+        return "retry_wait"
     verifier = folder / "verifier"
     if (verifier / "reward.json").exists() or (verifier / "reward.txt").exists():
         return "finalizing"
@@ -184,7 +198,14 @@ def _trial(folder: Path, include_patch: bool = True, expected_tasks: list[str] |
     agent_log_tail = ""
     if failure_type or (reward is not None and reward < 1 and patch_bytes == 0):
         agent_log_tail = _agent_log_tail(folder)
-    if is_transient_agent_failure(
+    if is_context_limit_failure(
+        failure_type,
+        failure_message,
+        agent_log_tail=agent_log_tail,
+    ):
+        failure_type = CONTEXT_LIMIT_EXCEPTION_TYPE
+        failure_message = "模型输入超过上下文窗口"
+    elif is_transient_agent_failure(
         failure_type,
         failure_message,
         agent_log_tail=agent_log_tail,
@@ -280,6 +301,7 @@ def _trial(folder: Path, include_patch: bool = True, expected_tasks: list[str] |
         "retry_resource_id": retry_resource_id,
         "patch": patch[-100000:],
         "patch_bytes": patch_bytes,
+        **read_retry_status(folder),
     }
 
 def _enrich_trials(run: Run, trials: list[dict]) -> list[dict]:
@@ -293,7 +315,9 @@ def _enrich_trials(run: Run, trials: list[dict]) -> list[dict]:
         attempts[task] = max(attempts.get(task, 0), attempt)
         trial["run_code"] = run_code(run.id)
         trial["trial_code"] = f"{run_code(run.id)} / {trial['task_code']} / A{attempt:02d}"
-        trial["resource_name"] = trial["id"] if "#" not in trial["id"] else None
+        trial["resource_name"] = trial.get("resource_name") or (
+            trial["id"] if "#" not in trial["id"] else None
+        )
     return trials
 
 def deleted_trial_entries(run: Run) -> list[dict]:
@@ -449,6 +473,7 @@ def trial_detail(run: Run, trial_id: str) -> dict | None:
             "id", "task", "task_slug", "task_number", "task_code", "task_title",
             "attempt", "run_code", "trial_code", "retrying", "replaced",
             "retry_batch", "retry_job_name", "retry_resource_id",
+            *LIVE_TELEMETRY_FIELDS,
         ):
             detailed[key] = summary.get(key)
         detailed["resource_name"] = live["folder"].name
@@ -457,7 +482,10 @@ def trial_detail(run: Run, trial_id: str) -> dict | None:
     if not folder:
         return summary
     detailed = _trial(folder, include_patch=True, expected_tasks=json.loads(run.tasks_json))
-    for key in ("attempt", "run_code", "trial_code", "resource_name"):
+    for key in (
+        "attempt", "run_code", "trial_code", "resource_name",
+        *LIVE_TELEMETRY_FIELDS,
+    ):
         detailed[key] = summary.get(key)
     return detailed
 
@@ -539,6 +567,7 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
         }
         marker.update(entry["trial"])
         marker.update(preserved)
+        marker["resource_name"] = entry["folder"].name
     if run.status in terminal_defaults:
         status, failure_type, default_message = terminal_defaults[run.status]
         for trial in trials:
@@ -605,6 +634,33 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
     task_order = {task: index for index, task in enumerate(expected_tasks)}
     trials.sort(key=lambda trial: (task_order.get(trial["task"], len(task_order)), trial.get("attempt", 0), trial["id"]))
     _enrich_trials(run, trials)
+    configured_infrastructure_retries = (
+        max(int(run.infrastructure_max_retries), 0)
+        if run.retry_infrastructure_errors else 0
+    )
+    for trial in trials:
+        trial_infrastructure_retries = (
+            max(int(trial.get("infrastructure_retries_max") or 0), 0)
+            if trial.get("infrastructure_retry_state") else configured_infrastructure_retries
+        )
+        used = min(
+            max(int(trial.get("infrastructure_retries_used") or 0), 0),
+            trial_infrastructure_retries,
+        )
+        trial["infrastructure_retries_used"] = used
+        trial["infrastructure_retries_max"] = trial_infrastructure_retries
+        trial["infrastructure_retries_remaining"] = max(
+            trial_infrastructure_retries - used, 0
+        )
+        resource_name = trial.get("resource_name")
+        provider = (
+            provider_trial_status(run.id, resource_name)
+            if isinstance(resource_name, str) and resource_name else {}
+        )
+        trial["provider_response_code"] = provider.get("provider_response_code")
+        trial["provider_request_count"] = int(provider.get("provider_request_count") or 0)
+        trial["provider_retries_used"] = int(provider.get("provider_retries_used") or 0)
+        trial["provider_max_retries"] = int(provider.get("provider_max_retries") or 0)
     completed = sum(t["status"] in TRIAL_TERMINAL_STATES for t in trials)
     passed = sum(t.get("reward") == 1 for t in trials)
     remaining_tasks = {trial["task"] for trial in trials}

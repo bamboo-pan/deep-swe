@@ -3,18 +3,108 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import sqlite3
+import subprocess
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 
 ACTIVE_RUN_STATES = ("queued", "preflight", "running")
 MAX_PARALLEL_TASKS = 72
+_MEMORY_CACHE_TTL_SECONDS = 5.0
+_memory_cache_lock = threading.Lock()
+_memory_cache: tuple[float, float | None] = (0.0, None)
 
 
 class GlobalQueueCancelled(RuntimeError):
     pass
+
+
+def _memory_bytes(value: str) -> int | None:
+    match = re.match(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([kmgtpe]?i?b)?", value, re.IGNORECASE)
+    if not match:
+        return None
+    number = float(match.group(1))
+    unit = (match.group(2) or "b").lower()
+    multipliers = {
+        "b": 1,
+        "kb": 1000,
+        "mb": 1000**2,
+        "gb": 1000**3,
+        "tb": 1000**4,
+        "kib": 1024,
+        "mib": 1024**2,
+        "gib": 1024**3,
+        "tib": 1024**4,
+        "pib": 1024**5,
+        "eib": 1024**6,
+    }
+    multiplier = multipliers.get(unit)
+    return int(number * multiplier) if multiplier else None
+
+
+def docker_memory_usage_percent() -> float | None:
+    """Return aggregate running-container memory as a percentage of Docker VM memory.
+
+    Docker Desktop exposes the VM memory through ``docker info``.  If Docker is
+    unavailable, return ``None`` so queue admission fails open rather than
+    blocking all work because diagnostics are unavailable.
+    """
+    global _memory_cache
+    now = time.monotonic()
+    with _memory_cache_lock:
+        cached_at, cached_value = _memory_cache
+        if now - cached_at < _MEMORY_CACHE_TTL_SECONDS:
+            return cached_value
+        # Keep one Docker probe in flight. Without this, every waiting Trial can
+        # launch its own pair of Docker CLI processes when the cache expires.
+        try:
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            info = subprocess.run(
+                ["docker", "info", "--format", "{{.MemTotal}}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=creationflags,
+                check=True,
+            )
+            total = int(info.stdout.strip())
+            stats = subprocess.run(
+                ["docker", "stats", "--no-stream", "--format", "{{.MemUsage}}"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                creationflags=creationflags,
+                check=True,
+            )
+            used = 0
+            for line in stats.stdout.splitlines():
+                raw = line.split("/", 1)[0].strip()
+                parsed = _memory_bytes(raw)
+                if parsed is not None:
+                    used += parsed
+            value = max(0.0, min(100.0, used / total * 100)) if total > 0 else None
+        except (OSError, ValueError, subprocess.SubprocessError):
+            value = None
+        _memory_cache = (time.monotonic(), value)
+        return value
+
+
+def _memory_admission_allowed() -> bool:
+    try:
+        threshold = float(os.environ.get("DEEPSWE_DOCKER_MEMORY_PAUSE_PERCENT", "80"))
+    except ValueError:
+        threshold = 80.0
+    if not math.isfinite(threshold):
+        threshold = 80.0
+    if threshold <= 0:
+        return True
+    usage = docker_memory_usage_percent()
+    return usage is None or usage < threshold
 
 
 def _connect(database_path: str | Path) -> sqlite3.Connection:
@@ -141,6 +231,8 @@ def try_acquire_slot(
     trial_name: str,
     fallback_limit: int,
 ) -> int | None:
+    if not _memory_admission_allowed():
+        return None
     connection = _connect(database_path)
     try:
         connection.execute("BEGIN IMMEDIATE")

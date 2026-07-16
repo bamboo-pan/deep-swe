@@ -79,6 +79,16 @@ type ProviderQueueStatus = {
   queued_requests: number;
   available_now: number | null;
   next_release_seconds: number;
+  max_concurrency: number;
+  active_requests: number;
+  waiting_for_concurrency: number;
+  max_retries: number;
+  retry_interval_seconds: number;
+  actual_requests_last_60_seconds: number;
+  completed_requests_last_60_seconds: number;
+  failed_requests_last_60_seconds: number;
+  failure_rate_last_60_seconds: number | null;
+  response_code_counts_last_60_seconds: Record<string, number>;
 };
 type QueueAdmission = QueueStatus & {
   requested_trials: number;
@@ -129,6 +139,14 @@ type Trial = {
   retry_of?: string | null;
   retrying?: boolean;
   replaced?: boolean;
+  provider_response_code?: number | null;
+  provider_request_count?: number;
+  provider_retries_used?: number;
+  provider_max_retries?: number;
+  infrastructure_retries_used?: number;
+  infrastructure_retries_max?: number;
+  infrastructure_retries_remaining?: number;
+  infrastructure_retry_state?: string | null;
 };
 type Run = {
   id: number;
@@ -204,6 +222,11 @@ type Prefs = {
   default_effort: string;
   max_parallel_tasks: number;
   provider_rpm: number;
+  provider_max_concurrency: number;
+  provider_max_retries: number;
+  provider_retry_interval_seconds: number;
+  squid_read_timeout_seconds: number;
+  docker_memory_pause_percent: number;
   agent_timeout_seconds: number;
   verifier_timeout_seconds: number;
   infrastructure_max_retries: number;
@@ -472,8 +495,6 @@ function App() {
   // 自由数字输入以字符串保存，允许中途清空；提交时统一解析校验
   const [attempts, setAttempts] = useState("1");
   const [selectedTasks, setSelectedTasks] = useState<string[]>([]);
-  const [codexRequestMaxRetries, setCodexRequestMaxRetries] = useState("6");
-  const [codexStreamMaxRetries, setCodexStreamMaxRetries] = useState("6");
   const [codexStreamIdleTimeout, setCodexStreamIdleTimeout] = useState("600");
   const [verification, setVerification] = useState(true);
   const [tier, setTier] = useState("standard");
@@ -720,15 +741,9 @@ function App() {
   const start = async () => {
     if (starting) return;
     if (!selectedTasks.length) return setNotice("至少选择一个任务");
-    const codexRequestMaxRetriesNum = parseInt(codexRequestMaxRetries, 10);
-    const codexStreamMaxRetriesNum = parseInt(codexStreamMaxRetries, 10);
     const codexStreamIdleTimeoutNum = parseInt(codexStreamIdleTimeout, 10);
     if (!Number.isFinite(attemptsNum) || attemptsNum < 1 || attemptsNum > 10)
       return setNotice("每题次数需为 1-10 的整数");
-    if (!Number.isFinite(codexRequestMaxRetriesNum) || codexRequestMaxRetriesNum < 0 || codexRequestMaxRetriesNum > 10)
-      return setNotice("Codex HTTP 重试次数需为 0-10 的整数");
-    if (!Number.isFinite(codexStreamMaxRetriesNum) || codexStreamMaxRetriesNum < 0 || codexStreamMaxRetriesNum > 10)
-      return setNotice("Codex 流重试次数需为 0-10 的整数");
     if (!Number.isFinite(codexStreamIdleTimeoutNum) || codexStreamIdleTimeoutNum < 30 || codexStreamIdleTimeoutNum > 1800)
       return setNotice("Codex 流空闲超时需为 30-1800 秒");
     const agents = allAgents ? boot!.agents : [agent];
@@ -738,8 +753,6 @@ function App() {
       reasoning_effort: effort,
       tasks: selectedTasks,
       attempts_per_task: attemptsNum,
-      codex_request_max_retries: codexRequestMaxRetriesNum,
-      codex_stream_max_retries: codexStreamMaxRetriesNum,
       codex_stream_idle_timeout_seconds: codexStreamIdleTimeoutNum,
       verification,
       service_tier: tier,
@@ -847,6 +860,16 @@ function App() {
       return setNotice("最大并行 Task 数需为 1-72 的整数");
     if (!Number.isInteger(prefs.provider_rpm) || prefs.provider_rpm < 0 || prefs.provider_rpm > 100000)
       return setNotice("Provider RPM 需为 0-100000 的整数，0 表示禁用");
+    if (!Number.isInteger(prefs.provider_max_concurrency) || prefs.provider_max_concurrency < 0 || prefs.provider_max_concurrency > 1000)
+      return setNotice("Provider 最大活动请求数需为 0-1000 的整数，0 表示禁用");
+    if (!Number.isInteger(prefs.provider_max_retries) || prefs.provider_max_retries < 0 || prefs.provider_max_retries > 300)
+      return setNotice("Provider 请求重试次数需为 0-300 的整数");
+    if (!Number.isInteger(prefs.provider_retry_interval_seconds) || prefs.provider_retry_interval_seconds < 0 || prefs.provider_retry_interval_seconds > 3600)
+      return setNotice("Provider 重试等待间隔需为 0-3600 秒的整数");
+    if (!Number.isInteger(prefs.squid_read_timeout_seconds) || prefs.squid_read_timeout_seconds < 900 || prefs.squid_read_timeout_seconds > 7200)
+      return setNotice("Squid 长请求超时需为 900-7200 秒的整数");
+    if (typeof prefs.docker_memory_pause_percent !== "number" || !Number.isFinite(prefs.docker_memory_pause_percent) || prefs.docker_memory_pause_percent < 0 || prefs.docker_memory_pause_percent > 95)
+      return setNotice("Docker 内存暂停阈值需为 0-95%，0 表示禁用");
     if (!Number.isInteger(prefs.agent_timeout_seconds) || prefs.agent_timeout_seconds < 60 || prefs.agent_timeout_seconds > 21600)
       return setNotice("Agent 超时需为 60-21600 秒");
     if (!Number.isInteger(prefs.verifier_timeout_seconds) || prefs.verifier_timeout_seconds < 60 || prefs.verifier_timeout_seconds > 7200)
@@ -1225,26 +1248,6 @@ function App() {
               {(agent === "codex" || allAgents) && (
                 <>
                   <label>
-                    Codex HTTP 重试次数
-                    <input
-                      type="number"
-                      min="0"
-                      max="10"
-                      value={codexRequestMaxRetries}
-                      onChange={(e) => setCodexRequestMaxRetries(e.target.value)}
-                    />
-                  </label>
-                  <label>
-                    Codex 流重试次数
-                    <input
-                      type="number"
-                      min="0"
-                      max="10"
-                      value={codexStreamMaxRetries}
-                      onChange={(e) => setCodexStreamMaxRetries(e.target.value)}
-                    />
-                  </label>
-                  <label>
                     Codex 流空闲超时（秒）
                     <input
                       type="number"
@@ -1462,19 +1465,34 @@ function ProviderQueue({ status }: { status?: ProviderQueueStatus }) {
   if (!status) {
     return <section className="panel providerqueue loading">正在读取 Provider 请求队列…</section>;
   }
-  const saturated = status.enabled && status.available_now === 0;
-  const state = !status.enabled
+  const rpmSaturated = status.enabled && status.available_now === 0;
+  const concurrencySaturated = status.max_concurrency > 0 && status.active_requests >= status.max_concurrency;
+  const state = status.waiting_for_concurrency > 0
+    ? `并发已满 · ${status.waiting_for_concurrency} 个请求等待`
+    : concurrencySaturated
+      ? "Provider 并发已满"
+    : !status.enabled
     ? "未启用 RPM 限速"
     : status.queued_requests > 0
       ? `排队中 · 约 ${Math.ceil(status.next_release_seconds)} 秒后放行`
-      : saturated
+      : rpmSaturated
         ? `窗口已满 · 约 ${Math.ceil(status.next_release_seconds)} 秒后恢复额度`
         : "可立即发送";
   const percent = status.enabled && status.rpm > 0
     ? Math.min(status.sent_last_60_seconds / status.rpm * 100, 100)
     : 0;
+  const responseCodeCounts = Object.entries(status.response_code_counts_last_60_seconds ?? {})
+    .sort(([left], [right]) => Number(left) - Number(right));
+  const responseCodeSummary = responseCodeCounts.length
+    ? responseCodeCounts.map(([code, count]) => {
+        const percentage = status.completed_requests_last_60_seconds > 0
+          ? count / status.completed_requests_last_60_seconds * 100
+          : 0;
+        return `${code} ${percentage.toFixed(1)}% (${count})`;
+      }).join(" · ")
+    : "—";
   return (
-    <section className={`panel providerqueue ${status.queued_requests ? "waiting" : saturated ? "saturated" : "ready"}`}>
+    <section className={`panel providerqueue ${status.queued_requests || status.waiting_for_concurrency ? "waiting" : rpmSaturated || concurrencySaturated ? "saturated" : "ready"}`}>
       <div className="providerqueuehead">
         <div>
           <span className="providerqueuedot" />
@@ -1484,10 +1502,18 @@ function ProviderQueue({ status }: { status?: ProviderQueueStatus }) {
       </div>
       <div className="providerqueuemetrics">
         <span><small>RPM 上限</small><b>{status.enabled ? status.rpm : "∞"}</b></span>
-        <span><small>过去 60 秒</small><b>{status.sent_last_60_seconds}</b></span>
+        <span><small>活动请求</small><b>{status.active_requests}/{status.max_concurrency || "∞"}</b></span>
+        <span><small>并发等待</small><b>{status.waiting_for_concurrency}</b></span>
+        <span title={`过去 60 秒已完成 ${status.completed_requests_last_60_seconds ?? 0} 个上游请求，其中失败 ${status.failed_requests_last_60_seconds ?? 0} 个；HTTP 4xx、5xx 和连接失败均计为失败`}>
+          <small>失败占比</small>
+          <b>{status.failure_rate_last_60_seconds == null ? "—" : `${status.failure_rate_last_60_seconds}%`}</b>
+        </span>
+        <span title="过去 60 秒真实发起的上游 HTTP 请求次数，包含 Provider 重试"><small>实际 RPM</small><b>{status.actual_requests_last_60_seconds ?? 0}</b></span>
+        <span title={`过去 60 秒响应码计数与占比：${responseCodeSummary}`}><small>响应码统计</small><b className="providercoderates">{responseCodeSummary}</b></span>
         <span><small>等待请求</small><b>{status.queued_requests}</b></span>
         <span><small>当前可用</small><b>{status.available_now ?? "∞"}</b></span>
         <span><small>下次放行</small><b>{status.next_release_seconds > 0 ? `${Math.ceil(status.next_release_seconds)}s` : "NOW"}</b></span>
+        <span><small>失败重试</small><b>{status.max_retries} × {status.retry_interval_seconds}s</b></span>
       </div>
       {status.enabled && (
         <div className="providerqueuebar" aria-label={`过去 60 秒已使用 ${status.sent_last_60_seconds}/${status.rpm}`}>
@@ -1595,6 +1621,28 @@ function Live({
             <small className="identitycode">{t.trial_code}</small>
             <b>{t.task_title || t.task}</b>
             <code>{t.task_slug || t.task}</code>
+            <span className="trialtelemetry">
+              <span>
+                <small>响应码</small>
+                <b className={
+                  t.provider_response_code == null
+                    ? "idle"
+                    : t.provider_response_code >= 500
+                      ? "error"
+                      : t.provider_response_code >= 400
+                        ? "warning"
+                        : "success"
+                }>{t.provider_response_code ?? "—"}</b>
+              </span>
+              <span title={`实际上游请求 ${t.provider_request_count ?? 0} 次；这里累计 Provider Proxy 执行的请求级重试`}>
+                <small>请求重试</small>
+                <b>{t.provider_retries_used ?? 0} 次</b>
+              </span>
+              <span title="Pier 因已识别的基础设施错误重新执行整条 Trial 的次数">
+                <small>基础设施重试</small>
+                <b>{t.infrastructure_retries_used ?? 0}/{t.infrastructure_retries_max ?? detail.infrastructure_max_retries ?? 0} · 剩 {t.infrastructure_retries_remaining ?? detail.infrastructure_max_retries ?? 0}</b>
+              </span>
+            </span>
             <span>
               reward {t.reward ?? "—"} · {duration(t.duration_seconds)}
             </span>
@@ -2670,6 +2718,71 @@ function Settings({
               value={prefs.provider_rpm}
               onChange={(e) =>
                 setPrefs({ ...prefs, provider_rpm: +e.target.value })
+              }
+            />
+          </label>
+          <label title="限制同时连接到 Provider 的活动请求数量；请求完成或进入重试等待后释放名额。0 表示禁用。">
+            Provider 最大活动请求数（0 禁用）
+            <input
+              type="number"
+              min={0}
+              max={1000}
+              step={1}
+              value={prefs.provider_max_concurrency}
+              onChange={(e) =>
+                setPrefs({ ...prefs, provider_max_concurrency: +e.target.value })
+              }
+            />
+          </label>
+          <label title="由 Provider Proxy 统一执行；次数不包含首次请求。">
+            Provider 请求重试次数
+            <input
+              type="number"
+              min={0}
+              max={300}
+              step={1}
+              value={prefs.provider_max_retries}
+              onChange={(e) =>
+                setPrefs({ ...prefs, provider_max_retries: +e.target.value })
+              }
+            />
+          </label>
+          <label title="429、5xx 或建连失败后再次请求前的固定等待时间。">
+            Provider 重试等待间隔（秒）
+            <input
+              type="number"
+              min={0}
+              max={3600}
+              step={1}
+              value={prefs.provider_retry_interval_seconds}
+              onChange={(e) =>
+                setPrefs({ ...prefs, provider_retry_interval_seconds: +e.target.value })
+              }
+            />
+          </label>
+          <label title="Squid 等待 Provider 返回数据的最长空闲时间。长推理请求可能超过 15 分钟，默认延长到 30 分钟。">
+            Squid 长请求超时（秒）
+            <input
+              type="number"
+              min={900}
+              max={7200}
+              step={60}
+              value={prefs.squid_read_timeout_seconds}
+              onChange={(e) =>
+                setPrefs({ ...prefs, squid_read_timeout_seconds: +e.target.value })
+              }
+            />
+          </label>
+          <label title="运行中容器内存占 Docker 可用内存达到该比例时，暂停启动新 Trial；已运行 Trial 不受影响。0 表示禁用。">
+            Docker 内存暂停阈值（%）
+            <input
+              type="number"
+              min={0}
+              max={95}
+              step={1}
+              value={prefs.docker_memory_pause_percent}
+              onChange={(e) =>
+                setPrefs({ ...prefs, docker_memory_pause_percent: +e.target.value })
               }
             />
           </label>

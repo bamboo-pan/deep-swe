@@ -8,15 +8,23 @@ from app.database import SessionLocal, init_db
 from app.models import Run, Setting, TrialQueueEntry
 from app import runner
 from app import results
-from app.pier_retry_patch.global_queue import release_slot, try_acquire_slot
+from app.pier_retry_patch import global_queue
+from app.pier_retry_patch.global_queue import (
+    docker_memory_usage_percent, release_slot, try_acquire_slot,
+)
 from app.pier_retry_patch.transient import (
+    CONTEXT_LIMIT_EXCEPTION_TYPE,
+    is_context_limit_failure,
     TransientVerifierInfrastructureError,
     is_transient_agent_failure,
     retry_transient_verifier,
 )
 from app.pier_retry_patch.networking import (
-    DEFAULT_NETWORK_POOL, allow_provider_proxy_port, provider_proxy_domains,
-    trial_network_subnets,
+    DEFAULT_NETWORK_POOL, add_provider_telemetry_headers,
+    allow_provider_proxy_port, provider_proxy_domains, trial_network_subnets,
+)
+from app.pier_retry_patch.infrastructure_retry import (
+    read_retry_status, write_retry_status,
 )
 from app.pier_retry_patch.runtime import (
     install_retry_trial_names,
@@ -137,8 +145,8 @@ def test_codex_run_passes_reasoning_effort(tmp_path: Path):
     text=config.read_text(encoding="utf-8")
     assert 'model_reasoning_effort = "low"' in text and 'model = "gpt-5.6-sol"' in text
     assert "host.docker.internal" in text
-    assert "request_max_retries = 6" in text
-    assert "stream_max_retries = 6" in text
+    assert "request_max_retries = 0" in text
+    assert "stream_max_retries = 0" in text
     assert "stream_idle_timeout_ms = 600000" in text
 
 def test_mini_limits_config_sets_native_responses_reasoning(tmp_path: Path):
@@ -147,6 +155,7 @@ def test_mini_limits_config_sets_native_responses_reasoning(tmp_path: Path):
     text=path.read_text(encoding="utf-8")
     assert "step_limit: 180" in text and text.startswith("agent:")
     assert 'reasoning:\n      effort: "max"' in text
+    assert "num_retries: 0" in text
     assert "reasoning_effort:" not in text
     assert "prompt_cache_key: deepswe-" in text and "prompt_cache_retention: 24h" in text
 
@@ -270,6 +279,16 @@ def test_transient_agent_failure_classification_is_selective():
     assert is_transient_agent_failure(
         "NonZeroAgentExitCodeError", "API Error: The operation timed out."
     )
+    assert is_transient_agent_failure(
+        "NonZeroAgentExitCodeError",
+        "MaskedHTTPStatusError: Server error '522 Unassigned' for url "
+        "'http://host.docker.internal:8765/api/provider/responses'",
+    )
+    assert is_transient_agent_failure(
+        "NonZeroAgentExitCodeError",
+        'OpenAIException - {"error":{"message":"status 524",'
+        '"type":"server_error","code":"internal_server_error"}}',
+    )
     assert is_transient_agent_failure("ConnectionError", "socket closed")
     assert is_transient_agent_failure(
         "NonZeroAgentExitCodeError", "APIConnectionError: unexpected EOF"
@@ -365,24 +384,31 @@ def test_runtime_retry_and_agent_limits_live_in_settings():
     update=SettingsUpdate(
         max_parallel_tasks=18,
         provider_rpm=30,
+        provider_max_concurrency=5,
+        provider_max_retries=300,
+        provider_retry_interval_seconds=7,
         agent_timeout_seconds=7200, verifier_timeout_seconds=2400,
         infrastructure_max_retries=4, agent_max_steps=150,
     )
     draft=RunDraft(agent="claude-code", tasks=["actionlint-action-pinning-lint"],
-                   codex_request_max_retries=7, codex_stream_max_retries=8,
                    codex_stream_idle_timeout_seconds=900)
     assert update.agent_timeout_seconds == 7200
     assert update.max_parallel_tasks == 18
     assert update.provider_rpm == 30
+    assert update.provider_max_concurrency == 5
+    assert update.provider_max_retries == 300
+    assert update.provider_retry_interval_seconds == 7
     assert update.verifier_timeout_seconds == 2400
     assert update.infrastructure_max_retries == 4
     assert update.agent_max_steps == 150
     assert "infrastructure_max_retries" not in RunDraft.model_fields
     assert "agent_max_steps" not in RunDraft.model_fields
     assert "concurrency" not in RunDraft.model_fields
-    assert draft.codex_request_max_retries == 7
-    assert draft.codex_stream_max_retries == 8
+    assert "codex_request_max_retries" not in RunDraft.model_fields
+    assert "codex_stream_max_retries" not in RunDraft.model_fields
     assert draft.codex_stream_idle_timeout_seconds == 900
+    with pytest.raises(ValueError):
+        SettingsUpdate(provider_max_retries=301)
 
 def test_requested_trial_count_and_concurrency_risk_are_separate():
     assert requested_trial_count(["task-a", "task-b", "task-c"], 2, 3) == 18
@@ -401,6 +427,121 @@ def test_provider_proxy_is_allowed_through_pier_squid():
     )
     assert "SSL_ports port 443 8765 9887" in config
     assert "Safe_ports port 80 443 8765 9887" in config
+    config = allow_provider_proxy_port(config, read_timeout_seconds=2400)
+    assert "read_timeout 2400 seconds" in config
+    config = add_provider_telemetry_headers(
+        config, run_id=12, trial_id="task-a__abc"
+    )
+    assert "acl deepswe_provider dstdomain host.docker.internal" in config
+    assert "acl deepswe_provider_port port 8765" in config
+    assert "request_header_add X-DeepSWE-Run-ID 12 deepswe_provider deepswe_provider_port" in config
+    assert "request_header_add X-DeepSWE-Trial-ID task-a__abc deepswe_provider deepswe_provider_port" in config
+
+
+def test_infrastructure_retry_status_tracks_used_and_remaining(tmp_path: Path):
+    trial_dir = tmp_path / "task-a__abc"
+    write_retry_status(
+        trial_dir, used=2, max_retries=4, state="waiting",
+        failure_type="InfrastructureNetworkError",
+    )
+    assert read_retry_status(trial_dir, max_retries=4) == {
+        "infrastructure_retries_used": 2,
+        "infrastructure_retries_max": 4,
+        "infrastructure_retries_remaining": 2,
+        "infrastructure_retry_state": "waiting",
+    }
+    assert results._trial(trial_dir)["status"] == "retry_wait"
+
+
+def test_infrastructure_retry_telemetry_write_failure_is_non_fatal(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(Path, "write_text", lambda *args, **kwargs: (
+        (_ for _ in ()).throw(OSError("disk unavailable"))
+    ))
+    assert write_retry_status(
+        tmp_path / "task-a__abc", used=1, max_retries=4, state="waiting"
+    )["remaining"] == 3
+
+
+def test_run_detail_exposes_live_provider_and_infrastructure_telemetry(
+    tmp_path: Path, monkeypatch,
+):
+    job = "telemetry-" + uuid.uuid4().hex
+    run_id = make_run(
+        job,
+        jobs_dir=str(tmp_path),
+        retry_infrastructure_errors=True,
+        infrastructure_max_retries=3,
+    )
+    trial_id = "actionlint-action-pinning-lint__abc"
+    trial_dir = tmp_path / job / trial_id
+    trial_dir.mkdir(parents=True)
+    (trial_dir / "config.json").write_text(json.dumps({
+        "task": {"path": str(Path("tasks") / "actionlint-action-pinning-lint")},
+    }), encoding="utf-8")
+    write_retry_status(trial_dir, used=1, max_retries=3, state="running")
+    monkeypatch.setattr(results, "provider_trial_status", lambda current_run, resource: {
+        "provider_response_code": 503,
+        "provider_request_count": 4,
+        "provider_retries_used": 1,
+        "provider_max_retries": 6,
+    } if (current_run, resource) == (run_id, trial_id) else {})
+    with SessionLocal() as db:
+        detail = results.run_detail(db.get(Run, run_id), include_patches=False)
+    trial = detail["trials"][0]
+    assert trial["provider_response_code"] == 503
+    assert trial["provider_request_count"] == 4
+    assert trial["provider_retries_used"] == 1
+    assert trial["infrastructure_retries_used"] == 1
+    assert trial["infrastructure_retries_remaining"] == 2
+
+
+def test_context_limit_is_non_transient_and_distinct():
+    message = '400 Bad Request: code=context_too_large'
+    assert is_context_limit_failure("NonZeroAgentExitCodeError", message)
+    assert not is_transient_agent_failure("NonZeroAgentExitCodeError", message)
+
+
+def test_docker_memory_usage_is_read_from_running_containers(monkeypatch):
+    class Completed:
+        def __init__(self, stdout):
+            self.stdout = stdout
+
+    calls = []
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[1] == "info":
+                return Completed("1073741824\n")
+        return Completed("100MiB / 1GiB\n200MiB / 1GiB\n")
+
+    monkeypatch.setattr("app.pier_retry_patch.global_queue.subprocess.run", fake_run)
+    monkeypatch.setattr("app.pier_retry_patch.global_queue._memory_cache", (0.0, None))
+    assert docker_memory_usage_percent() == pytest.approx(300 / 1024 * 100)
+    assert len(calls) == 2
+
+
+def test_docker_memory_threshold_pauses_new_trial_admission(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("DEEPSWE_DOCKER_MEMORY_PAUSE_PERCENT", "80")
+    monkeypatch.setattr(global_queue, "docker_memory_usage_percent", lambda: 80.0)
+    assert try_acquire_slot(tmp_path / "queue.db", 1, "task-a", "trial-a", 4) is None
+
+
+def test_docker_memory_probe_failure_fails_open(monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise FileNotFoundError("docker unavailable")
+
+    monkeypatch.setattr(global_queue.subprocess, "run", unavailable)
+    monkeypatch.setattr(global_queue, "_memory_cache", (0.0, None))
+    monkeypatch.setenv("DEEPSWE_DOCKER_MEMORY_PAUSE_PERCENT", "80")
+    assert global_queue.docker_memory_usage_percent() is None
+    assert global_queue._memory_admission_allowed()
+
+
+def test_invalid_docker_memory_threshold_uses_safe_default(monkeypatch):
+    monkeypatch.setenv("DEEPSWE_DOCKER_MEMORY_PAUSE_PERCENT", "nan")
+    monkeypatch.setattr(global_queue, "docker_memory_usage_percent", lambda: 90.0)
+    assert not global_queue._memory_admission_allowed()
 
 def test_create_runs_queues_agent_group_larger_than_global_limit(monkeypatch):
     class NoopThread:
@@ -559,6 +700,28 @@ def test_verifier_failure_is_not_reclassified_from_stale_agent_log(tmp_path: Pat
 
     assert results._trial(folder)["failure_type"] == "RuntimeError"
     assert runner._run_failure_summary(tmp_path).startswith("RuntimeError:")
+
+
+def test_failure_summary_prefers_final_context_limit_over_job_network_log(tmp_path: Path):
+    folder = tmp_path / "task-a__x"
+    (folder / "agent").mkdir(parents=True)
+    write_result(folder, {
+        "task_name": "task-a",
+        "exception_info": {
+            "exception_type": "NonZeroAgentExitCodeError",
+            "exception_message": "Command failed (exit 1)",
+        },
+    })
+    (folder / "agent" / "mini-swe-agent.txt").write_text(
+        'code=context_too_large: input exceeds the context window',
+        encoding="utf-8",
+    )
+    (tmp_path / "job.log").write_text(
+        "Docker/registry unexpected EOF after a recovered retry",
+        encoding="utf-8",
+    )
+    summary = runner._run_failure_summary(tmp_path)
+    assert summary == f"{CONTEXT_LIMIT_EXCEPTION_TYPE}: 模型输入超过上下文窗口"
 
 def test_official_regression_contains_baseline_values(monkeypatch):
     current={"trials":[{"task":"task-a","reward":1,"duration_seconds":80.0}]}
@@ -947,7 +1110,6 @@ def test_new_pier_job_name_uses_public_run_identity(monkeypatch):
     })
     row = runner.create_run(RunDraft(
         agent="codex", tasks=["actionlint-action-pinning-lint"],
-        codex_request_max_retries=7, codex_stream_max_retries=8,
         codex_stream_idle_timeout_seconds=900,
     ))
     try:
@@ -958,8 +1120,8 @@ def test_new_pier_job_name_uses_public_run_identity(monkeypatch):
         assert row.verifier_timeout_seconds == 2400
         assert row.infrastructure_max_retries == 3
         assert row.agent_max_steps == 140
-        assert row.codex_request_max_retries == 7
-        assert row.codex_stream_max_retries == 8
+        assert row.codex_request_max_retries == 0
+        assert row.codex_stream_max_retries == 0
         assert row.codex_stream_idle_timeout_seconds == 900
     finally:
         with SessionLocal() as db:
@@ -1229,6 +1391,7 @@ def test_retry_config_uses_latest_runtime_settings_and_expands_duplicate_tasks(t
     ]
     assert retry["agents"][0]["kwargs"]["cost_limit"] == 3.25
     assert retry["agents"][0]["kwargs"]["config_file"].endswith("mini-limits.yaml")
+    assert retry["agents"][0]["env"]["MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT"] == "1"
     assert "step_limit: 155" in (secret_dir / "mini-limits.yaml").read_text(encoding="utf-8")
     assert env["OPENAI_API_KEY"] == "secret"
     assert env["DEEPSWE_VERIFIER_INFRA_MAX_RETRIES"] == "1"
@@ -1298,6 +1461,14 @@ def test_retry_merge_replaces_markers_and_rewrites_identity(tmp_path: Path):
         (marker / "config.json").write_text(
             json.dumps(runner._retry_marker_config(original_dir, spec)), encoding="utf-8"
         )
+        (marker / "agent").mkdir()
+        (marker / "agent" / "mini-swe-agent.txt").write_text(
+            "original attempt log", encoding="utf-8"
+        )
+        (marker / "result.json").write_text(
+            json.dumps({"exception_info": {"exception_type": "AgentTimeoutError"}}),
+            encoding="utf-8",
+        )
         (marker / "retry-state.json").write_text(json.dumps({"status": "running"}), encoding="utf-8")
         specs.append(spec)
     (retry_dir / "job.log").write_text("pier retry", encoding="utf-8")
@@ -1322,6 +1493,8 @@ def test_retry_merge_replaces_markers_and_rewrites_identity(tmp_path: Path):
     assert [item["verifier_result"]["rewards"]["reward"] for item in merged] == [0, 1]
     assert [item["deepswe_retry_resource_id"] for item in merged] == list(runtime_names)
     assert list((original_dir / ".retry-logs").glob("*/retry.json"))
+    archive_trials = list((original_dir / ".retry-logs").glob("*/trials/*/agent/mini-swe-agent.txt"))
+    assert archive_trials and archive_trials[0].read_text(encoding="utf-8") == "original attempt log"
 
 def test_retry_results_keep_progress_size_and_replace_visible_usage_totals(tmp_path: Path):
     init_db()
@@ -1434,6 +1607,10 @@ def test_retry_submission_deletes_selected_result_and_creates_marker(tmp_path: P
             "agent_result": {"cost_usd": float(index)},
             "verifier_result": {"rewards": {"reward": index - 1}},
         })
+    (original_dir / first_id / "agent").mkdir()
+    (original_dir / first_id / "agent" / "mini-swe-agent.txt").write_text(
+        "raw log before retry", encoding="utf-8"
+    )
     with SessionLocal() as db:
         run = Run(
             status="completed", job_name=job, jobs_dir=str(tmp_path),
@@ -1464,6 +1641,18 @@ def test_retry_submission_deletes_selected_result_and_creates_marker(tmp_path: P
         assert marker_state["status"] == "queued"
         assert marker_state["batch_id"] == response["batch_id"]
         assert (original_dir / second_id / "result.json").exists()
+        archive_trial = next(
+            (original_dir / ".retry-logs").glob(
+                f"*-{response['batch_id']}/trials/{first_id}"
+            )
+        )
+        archived_result = json.loads(
+            (archive_trial / "result.json").read_text(encoding="utf-8")
+        )
+        assert archived_result["agent_result"]["cost_usd"] == 1.0
+        assert (archive_trial / "agent" / "mini-swe-agent.txt").read_text(
+            encoding="utf-8"
+        ) == "raw log before retry"
         metadata = json.loads(
             (tmp_path / response["retry_job_name"] / ".deepswe-retry.json").read_text(encoding="utf-8")
         )

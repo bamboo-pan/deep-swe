@@ -25,6 +25,10 @@ from .local_images import ensure_local_task_images
 from .models import ACTIVE_STATES, TERMINAL_STATES, Run
 from .preferences import credential_path, current_secrets, get_preferences
 from .pier_retry_patch.networking import trial_network_subnets
+from .pier_retry_patch.transient import (
+    CONTEXT_LIMIT_EXCEPTION_TYPE,
+    is_context_limit_failure,
+)
 from .results import (
     _json as read_json, aggregate_trial_results, estimate_cost, jobs_root_for,
     pier_trial_prefix, run_code, run_detail as parsed_run_detail,
@@ -162,8 +166,8 @@ def _codex_config(
     folder: Path,
     model: str,
     effort: str,
-    request_max_retries: int = 6,
-    stream_max_retries: int = 6,
+    request_max_retries: int = 0,
+    stream_max_retries: int = 0,
     stream_idle_timeout_seconds: int = 600,
 ) -> Path:
     path = folder / "codex-provider.toml"
@@ -192,6 +196,7 @@ def _mini_limits_config(folder: Path, step_limit: int, reasoning_effort: str) ->
     path.write_text(
         f"agent:\n  step_limit: {step_limit}\n"
         "model:\n  model_kwargs:\n"
+        "    num_retries: 0\n"
         f"    reasoning:\n      effort: {json.dumps(reasoning_effort)}\n"
         f"    prompt_cache_key: {cache_key}\n"
         "    prompt_cache_retention: 24h\n",
@@ -263,8 +268,8 @@ def create_runs_with_admission(draft: RunBatchDraft) -> tuple[list[Run], dict]:
                     retry_infrastructure_errors=infrastructure_max_retries > 0,
                     infrastructure_max_retries=infrastructure_max_retries,
                     agent_max_steps=int(preferences["agent_max_steps"]),
-                    codex_request_max_retries=draft.codex_request_max_retries,
-                    codex_stream_max_retries=draft.codex_stream_max_retries,
+                    codex_request_max_retries=0,
+                    codex_stream_max_retries=0,
                     codex_stream_idle_timeout_seconds=draft.codex_stream_idle_timeout_seconds,
                     verification=draft.verification, service_tier=draft.service_tier,
                 )
@@ -396,32 +401,63 @@ def _network_failure_summary(text: str) -> str | None:
 def _run_failure_summary(job_dir: Path, supervisor_log: Path | None = None) -> str | None:
     """Extract an actionable failure instead of exposing only Pier's exit code."""
     if job_dir.is_dir():
+        final_failures = []
         for folder in sorted(path for path in job_dir.iterdir() if path.is_dir()):
             data = read_json(folder / "result.json")
             exception = data.get("exception_info") or {}
-            message = exception.get("exception_message")
-            summary = _network_failure_summary(str(message or ""))
-            if summary:
-                return summary
+            failure_type = exception.get("exception_type")
+            message = str(exception.get("exception_message") or "")
+            if not failure_type and not message:
+                continue
+            agent_tail = ""
             if exception.get("exception_type") in {
                 None,
                 "NonZeroAgentExitCodeError",
                 "TransientAgentInfrastructureError",
+                CONTEXT_LIMIT_EXCEPTION_TYPE,
             }:
                 for path in sorted((folder / "agent").glob("*.txt")):
-                    summary = _network_failure_summary(_tail_text(path))
-                    if summary:
-                        return summary
+                    agent_tail += _tail_text(path)
+            if is_context_limit_failure(
+                failure_type,
+                message,
+                agent_log_tail=agent_tail,
+            ):
+                return (
+                    f"{CONTEXT_LIMIT_EXCEPTION_TYPE}: "
+                    "模型输入超过上下文窗口"
+                )
+            final_failures.append((failure_type or "TrialError", message, agent_tail))
+
+        # A recovered network error elsewhere in the job must not hide the
+        # exception that is still present in a final Trial result.
+        for failure_type, message, agent_tail in final_failures:
+            summary = _network_failure_summary(message)
+            if not summary and failure_type in {
+                "NonZeroAgentExitCodeError",
+                "TransientAgentInfrastructureError",
+            }:
+                summary = _network_failure_summary(agent_tail)
+            if summary:
+                return summary
+            if message:
+                return f"{failure_type}: {message.strip()[:3500]}"
+            return failure_type
+
         for path in (job_dir / "job.log",):
             summary = _network_failure_summary(_tail_text(path))
             if summary:
                 return summary
+        # A command can fail before Pier writes a Trial result.  In that case
+        # the agent log is the only available terminal diagnostic; do not scan
+        # logs from completed Trial results here.
         for folder in sorted(path for path in job_dir.iterdir() if path.is_dir()):
-            exception = (read_json(folder / "result.json").get("exception_info") or {})
-            message = exception.get("exception_message")
-            if message:
-                failure_type = exception.get("exception_type") or "TrialError"
-                return f"{failure_type}: {str(message).strip()[:3500]}"
+            if (folder / "result.json").exists():
+                continue
+            for path in sorted((folder / "agent").glob("*.txt")):
+                summary = _network_failure_summary(_tail_text(path))
+                if summary:
+                    return summary
     if supervisor_log:
         text = _tail_text(supervisor_log)
         summary = _network_failure_summary(text)
@@ -612,6 +648,13 @@ def _pier_process_env(
             1,
         )
     )
+    preferences = get_preferences()
+    process_env["DEEPSWE_DOCKER_MEMORY_PAUSE_PERCENT"] = str(
+        preferences.get("docker_memory_pause_percent", 80)
+    )
+    process_env["DEEPSWE_SQUID_READ_TIMEOUT_SECONDS"] = str(
+        preferences.get("squid_read_timeout_seconds", 1800)
+    )
     return process_env
 
 def _verify_global_queue_patch(run_id: int) -> None:
@@ -675,8 +718,8 @@ def _execute(run_id: int):
         if agent == "codex":
             config = _codex_config(
                 _provider_proxy_url(), secret_dir, model, effort,
-                request_max_retries=run.codex_request_max_retries,
-                stream_max_retries=run.codex_stream_max_retries,
+                request_max_retries=0,
+                stream_max_retries=0,
                 stream_idle_timeout_seconds=run.codex_stream_idle_timeout_seconds,
             )
             args += ["--agent-env", f"CODEX_AUTH_JSON_PATH={auth}", "--agent-kwarg", f"config_toml_file={config}", "--agent-kwarg", f"reasoning_effort={effort}"]
@@ -686,7 +729,8 @@ def _execute(run_id: int):
             # litellm_response（Responses API 桥）顶层 import litellm.proxy，
             # 需要完整 proxy extras（fastapi/orjson/pyjwt 等），agent 容器默认没装
             args += ["--agent-kwarg", f"config_file={limits}",
-                     "--agent-kwarg", 'extra_python_packages=["litellm[proxy]"]']
+                     "--agent-kwarg", 'extra_python_packages=["litellm[proxy]"]',
+                     "--agent-env", "MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT=1"]
             if trial_budget > 0:
                 # mini 原生单 Trial 费用限额（agent.cost_limit，0 = 禁用），到限优雅停止
                 args += ["--agent-kwarg", f"cost_limit={trial_budget}"]
@@ -979,6 +1023,7 @@ def _prepare_retry_config(
             kwargs["config_file"] = str(
                 _mini_limits_config(secret_dir, run.agent_max_steps, run.reasoning_effort)
             )
+            agent_env["MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT"] = "1"
             if trial_budget > 0:
                 kwargs["cost_limit"] = trial_budget
             else:
@@ -989,8 +1034,8 @@ def _prepare_retry_config(
                 secret_dir,
                 run.model,
                 run.reasoning_effort,
-                request_max_retries=run.codex_request_max_retries,
-                stream_max_retries=run.codex_stream_max_retries,
+                request_max_retries=0,
+                stream_max_retries=0,
                 stream_idle_timeout_seconds=run.codex_stream_idle_timeout_seconds,
             ))
             agent_env["CODEX_AUTH_JSON_PATH"] = str(auth_path)
@@ -1120,6 +1165,51 @@ def _copy_retry_diagnostics(source: Path, marker: Path) -> None:
         if source_path.is_file():
             shutil.copy2(source_path, marker / name)
 
+
+def _retry_archive_dir(original_dir: Path, batch_id: str) -> Path:
+    suffix = f"-{batch_id}"
+    existing = sorted(
+        path for path in (original_dir / ".retry-logs").glob(f"*{suffix}")
+        if path.is_dir()
+    )
+    if existing:
+        return existing[-1]
+    archive = original_dir / ".retry-logs" / (
+        datetime.now(UTC).strftime("%Y%m%d-%H%M%S") + suffix
+    )
+    archive.mkdir(parents=True, exist_ok=True)
+    return archive
+
+
+def _archive_original_trial(folder: Path, archive: Path, trial_id: str) -> None:
+    """Preserve pre-retry diagnostics before the visible Trial is replaced."""
+    destination = archive / "trials" / trial_id
+    destination.mkdir(parents=True, exist_ok=True)
+    root_files = (
+        "config.json", "result.json", "exception.txt", "trial.log",
+        "guard.json", "retry-state.json",
+    )
+    for name in root_files:
+        source = folder / name
+        target = destination / name
+        if source.is_file() and not target.exists():
+            shutil.copy2(source, target)
+    for dirname, patterns in {
+        "agent": ("*.txt", "*.json"),
+        "verifier": ("run.log", "reward.json", "ctrf.json", "test-*.txt"),
+        "artifacts": ("manifest.json", "model.patch"),
+    }.items():
+        source_dir = folder / dirname
+        if not source_dir.is_dir():
+            continue
+        target_dir = destination / dirname
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for pattern in patterns:
+            for source in source_dir.glob(pattern):
+                target = target_dir / source.name
+                if source.is_file() and not target.exists():
+                    shutil.copy2(source, target)
+
 def _retry_request_metadata(retry_dir: Path) -> dict:
     payload = read_json(retry_dir / ".deepswe-retry.json")
     if not payload:
@@ -1201,6 +1291,7 @@ def _merge_retry_trials(
     if len(batch_ids) > 1:
         raise RuntimeError("重试批次包含冲突的 batch id")
     batch_id = next(iter(batch_ids), uuid.uuid4().hex)
+    archive = _retry_archive_dir(original_dir, batch_id)
     declared_retry_names = {
         spec.get("retry_job_name")
         for spec in specs
@@ -1286,6 +1377,7 @@ def _merge_retry_trials(
         trial_result.pop("deepswe_retrying", None)
         trial_result.pop("deepswe_retry_of", None)
         _write_json_atomic(source / "result.json", trial_result)
+        _archive_original_trial(target, archive, spec["target_id"])
         shutil.rmtree(target)
         shutil.move(str(source), str(target))
         moved.append(spec["target_id"])
@@ -1299,10 +1391,7 @@ def _merge_retry_trials(
         missing_message,
     )
 
-    archive = original_dir / ".retry-logs" / (
-        datetime.now(UTC).strftime("%Y%m%d-%H%M%S") + f"-{batch_id[:8]}"
-    )
-    archive.mkdir(parents=True, exist_ok=True)
+    archive = _retry_archive_dir(original_dir, batch_id)
     for source, name in (
         (supervisor_log, "supervisor.log"),
         (retry_dir / "job.log", "job.log"),
@@ -1655,6 +1744,14 @@ def retry_trials(run_id: int, trial_ids: list[str]) -> dict:
                 (jobs_root / f"{stale_dir.name}.supervisor.log").unlink(missing_ok=True)
                 (jobs_root / f"{stale_dir.name}.docker-cleanup.json").unlink(missing_ok=True)
             retry_dir.mkdir(parents=True)
+            archive = _retry_archive_dir(original_dir, batch_id)
+            _write_json_atomic(archive / "retry.json", {
+                "batch_id": batch_id,
+                "run_id": run_id,
+                "retry_job_name": retry_name,
+                "requested_trial_ids": [spec["trial_id"] for spec in specs],
+                "created_at": datetime.now(UTC).isoformat(),
+            })
             _write_json_atomic(retry_dir / ".deepswe-retry.json", {
                 "run_id": run_id,
                 "batch_id": batch_id,
@@ -1665,6 +1762,7 @@ def retry_trials(run_id: int, trial_ids: list[str]) -> dict:
             for spec in specs:
                 target = _retry_target_path(original_dir, spec["target_id"])
                 if target.exists():
+                    _archive_original_trial(target, archive, spec["target_id"])
                     shutil.rmtree(target)
                 target.mkdir(parents=True)
                 _write_json_atomic(

@@ -14,6 +14,11 @@ class AppSettings(BaseSettings):
     default_effort: str = "high"
     max_parallel_tasks: int = 6
     provider_rpm: int = 0
+    provider_max_concurrency: int = 0
+    provider_max_retries: int = 6
+    provider_retry_interval_seconds: int = 4
+    squid_read_timeout_seconds: int = 1800
+    docker_memory_pause_percent: float = 80.0
     agent_timeout_seconds: int = 5400
     verifier_timeout_seconds: int = 1800
     infrastructure_max_retries: int = 4
