@@ -374,6 +374,102 @@ def test_compare_analysis_is_unavailable_without_selected_results():
         assert response.status_code == 422
         assert "没有可分析" in response.json()["detail"]
 
+def test_compare_analysis_config_can_be_read_saved_and_cleared(monkeypatch):
+    from app import main
+
+    current = {
+        "prompt": "当前提示词",
+        "model": "model-a",
+        "reasoning_effort": "high",
+        "timeout_seconds": 600,
+    }
+    monkeypatch.setattr(main, "get_compare_analysis_config", lambda: dict(current))
+    monkeypatch.setattr(main, "_provider_model_effort_error", lambda *_args: None)
+
+    def save(**values):
+        current.update(values)
+        return dict(current)
+
+    monkeypatch.setattr(main, "save_compare_analysis_config", save)
+    monkeypatch.setattr(main, "DEFAULT_ANALYSIS_PROMPT", "默认提示词")
+
+    with TestClient(app) as client:
+        original = client.get("/api/compare/analysis-config")
+        assert original.status_code == 200
+        assert original.json() == {
+            "prompt": "当前提示词",
+            "model": "model-a",
+            "reasoning_effort": "high",
+            "timeout_seconds": 600,
+            "default_prompt": "默认提示词",
+            "is_default": False,
+        }
+
+        cleared = client.put("/api/compare/analysis-config", json={
+            "prompt": "",
+            "model": "model-b",
+            "reasoning_effort": "xhigh",
+            "timeout_seconds": 1200,
+        })
+        assert cleared.status_code == 200
+        assert cleared.json()["prompt"] == ""
+        assert current["prompt"] == ""
+        assert current["model"] == "model-b"
+        assert current["timeout_seconds"] == 1200
+
+        restored = client.put("/api/compare/analysis-config", json={
+            "prompt": "默认提示词",
+            "model": "default-model",
+            "reasoning_effort": "max",
+            "timeout_seconds": 900,
+        })
+        assert restored.status_code == 200
+        assert restored.json()["is_default"] is True
+
+def test_compare_analysis_streams_saved_config(monkeypatch):
+    from app import main
+    from app.security import Credential
+
+    captured = {}
+    config = {
+        "prompt": "自定义分析指令",
+        "model": "model-a",
+        "reasoning_effort": "xhigh",
+        "timeout_seconds": 1200,
+    }
+    facts = [{"verdict": "consistent", "comparison_scope": "strict"}]
+    credential = Credential("http://provider.test/v1", "token", "fingerprint")
+    monkeypatch.setattr(main, "get_compare_analysis_config", lambda: config)
+    monkeypatch.setattr(main, "_provider_model_effort_error", lambda *_args: None)
+
+    def prepare(items):
+        captured["items"] = items
+        return facts, credential
+
+    def stream(prepared_facts, prepared_credential, prepared_config):
+        captured["facts"] = prepared_facts
+        captured["credential"] = prepared_credential
+        captured["config"] = prepared_config
+        yield "start", {"analysis": ""}
+        yield "delta", {"delta": "分析"}
+        yield "complete", {"analysis": "分析结果"}
+
+    monkeypatch.setattr(main, "prepare_compare_analysis", prepare)
+    monkeypatch.setattr(main, "stream_compare_analysis_events", stream)
+
+    with TestClient(app) as client:
+        response = client.post("/api/compare/analyze", json={"items": ["12:trial-a"]})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert "event: start" in response.text
+    assert "event: delta" in response.text
+    assert "event: complete" in response.text
+    assert captured["items"] == [(12, "trial-a")]
+    assert captured["facts"] == facts
+    assert captured["credential"] == credential
+    assert captured["config"] == config
+
 def test_delete_terminal_run_and_reject_active_run():
     with TestClient(app) as client:
         with SessionLocal() as db:

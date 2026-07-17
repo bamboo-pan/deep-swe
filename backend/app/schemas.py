@@ -69,6 +69,12 @@ class CompareRequest(BaseModel):
 class CompareAnalysisRequest(BaseModel):
     items: list[str] = Field(default_factory=list)
 
+class CompareAnalysisConfigUpdate(BaseModel):
+    prompt: str = Field(max_length=20_000)
+    model: str = Field(min_length=1, max_length=100)
+    reasoning_effort: Effort
+    timeout_seconds: int = Field(ge=30, le=7200)
+
 class RetryTrialsDraft(BaseModel):
     trial_ids: list[str] = Field(min_length=1, max_length=1000)
 

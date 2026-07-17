@@ -14,7 +14,13 @@ CURRENT_KEYS = (
     "run_budget_usd", "trial_budget_usd",
 )
 LEGACY_KEYS = ("default_concurrency",)
-KEYS = CURRENT_KEYS + LEGACY_KEYS
+AUXILIARY_KEYS = (
+    "compare_analysis_prompt",
+    "compare_analysis_model",
+    "compare_analysis_reasoning_effort",
+    "compare_analysis_timeout_seconds",
+)
+KEYS = CURRENT_KEYS + LEGACY_KEYS + AUXILIARY_KEYS
 
 def _defaults() -> dict:
     return {
@@ -89,6 +95,34 @@ def update_preferences(payload: SettingsUpdate) -> dict:
                     db.delete(limiter_state)
         db.commit()
     return get_preferences()
+
+def get_auxiliary_preferences(defaults: dict) -> dict:
+    unsupported = set(defaults) - set(AUXILIARY_KEYS)
+    if unsupported:
+        raise KeyError(f"Unsupported auxiliary preferences: {sorted(unsupported)}")
+    values = dict(defaults)
+    with SessionLocal() as db:
+        rows = db.scalars(select(Setting).where(Setting.key.in_(defaults))).all()
+        for row in rows:
+            try:
+                values[row.key] = json.loads(row.value)
+            except (json.JSONDecodeError, TypeError):
+                continue
+    return values
+
+def set_auxiliary_preferences(values: dict) -> None:
+    unsupported = set(values) - set(AUXILIARY_KEYS)
+    if unsupported:
+        raise KeyError(f"Unsupported auxiliary preferences: {sorted(unsupported)}")
+    with SessionLocal() as db:
+        for key, value in values.items():
+            row = db.get(Setting, key)
+            encoded = json.dumps(value, ensure_ascii=False)
+            if row:
+                row.value = encoded
+            else:
+                db.add(Setting(key=key, value=encoded))
+        db.commit()
 
 def credential_path() -> Path:
     return Path(get_preferences()["credential_file"])

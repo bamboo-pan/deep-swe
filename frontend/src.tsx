@@ -1,5 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   Activity,
   BarChart3,
@@ -13,6 +15,7 @@ import {
   Download,
   FileCode2,
   Gauge,
+  Pencil,
   Play,
   RefreshCw,
   RotateCcw,
@@ -26,6 +29,7 @@ import {
   Upload,
   Volume2,
   Wifi,
+  X,
 } from "lucide-react";
 import "./style.css";
 
@@ -269,6 +273,7 @@ type DockerStorage = {
 type CompareAnalysis = {
   model: string;
   reasoning_effort: string;
+  timeout_seconds: number;
   analysis: string;
   summary: {
     total: number;
@@ -304,26 +309,83 @@ type CompareAnalysis = {
     };
   }>;
 };
+type CompareAnalysisConfig = {
+  prompt: string;
+  default_prompt: string;
+  is_default: boolean;
+  model: string;
+  reasoning_effort: string;
+  timeout_seconds: number;
+};
 // 生产构建由后端或反向代理同源服务；Vite 开发模式默认连接本地后端。
 const apiBase = import.meta.env.VITE_API_BASE ||
   (import.meta.env.DEV ? "http://127.0.0.1:8765" : "");
+const responseError = async (response: Response) => {
+  const text = await response.text();
+  let message = text;
+  try {
+    const data = JSON.parse(text);
+    message =
+      typeof data.detail === "string"
+        ? data.detail
+        : JSON.stringify(data.detail ?? data);
+  } catch {
+    // 非 JSON 错误体（如代理 502 页面）原样展示
+  }
+  return new Error(`HTTP ${response.status}: ${message}`);
+};
 const request = async <T,>(path: string, options?: RequestInit): Promise<T> => {
   const response = await fetch(apiBase + path, options);
-  if (!response.ok) {
-    const text = await response.text();
-    let message = text;
-    try {
-      const data = JSON.parse(text);
-      message =
-        typeof data.detail === "string"
-          ? data.detail
-          : JSON.stringify(data.detail ?? data);
-    } catch {
-      // 非 JSON 错误体（如代理 502 页面）原样展示
-    }
-    throw new Error(`HTTP ${response.status}: ${message}`);
-  }
+  if (!response.ok) throw await responseError(response);
   return response.json();
+};
+const streamSse = async (
+  path: string,
+  options: RequestInit,
+  onEvent: (event: string, data: any) => void,
+) => {
+  const response = await fetch(apiBase + path, options);
+  if (!response.ok) throw await responseError(response);
+  if (!response.body) throw new Error("浏览器未提供流式响应内容");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const dispatch = (block: string) => {
+    const lines = block.split(/\r?\n/);
+    const event = lines.find((line) => line.startsWith("event:"))?.slice(6).trim() || "message";
+    const dataText = lines
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n");
+    if (!dataText) return;
+    try {
+      onEvent(event, JSON.parse(dataText));
+    } catch (error) {
+      if (error instanceof SyntaxError) throw new Error("AI 分析流返回了无效数据");
+      throw error;
+    }
+  };
+  let finished = false;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+      let separator = /\r?\n\r?\n/.exec(buffer);
+      while (separator?.index != null) {
+        dispatch(buffer.slice(0, separator.index));
+        buffer = buffer.slice(separator.index + separator[0].length);
+        separator = /\r?\n\r?\n/.exec(buffer);
+      }
+      if (done) {
+        finished = true;
+        break;
+      }
+    }
+    if (buffer.trim()) dispatch(buffer);
+  } finally {
+    if (!finished) await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
 };
 const money = (value: number | null | undefined) =>
   value == null ? "—" : `$${value.toFixed(4)}`;
@@ -1449,6 +1511,7 @@ function App() {
         )}
         {tab === "compare" && (
           <Compare
+            boot={boot}
             runs={compareRuns}
             selected={compareIds}
             setSelected={setCompareIds}
@@ -2108,11 +2171,13 @@ const analysisVerdictLabel = (verdict: string) => ({
 }[verdict] || verdict);
 
 function Compare({
+  boot,
   runs,
   selected,
   setSelected,
   comparison,
 }: {
+  boot: Boot;
   runs: Run[];
   selected: string[];
   setSelected: (x: string[]) => void;
@@ -2125,8 +2190,20 @@ function Compare({
   const [statusFilter, setStatusFilter] = useState("all");
   const [analysis, setAnalysis] = useState<CompareAnalysis>();
   const [analysisError, setAnalysisError] = useState("");
+  const [analysisStatus, setAnalysisStatus] = useState("");
   const [analyzing, setAnalyzing] = useState(false);
+  const [promptEditorOpen, setPromptEditorOpen] = useState(false);
+  const [analysisConfig, setAnalysisConfig] = useState<CompareAnalysisConfig>();
+  const [promptDraft, setPromptDraft] = useState("");
+  const [analysisModelDraft, setAnalysisModelDraft] = useState("");
+  const [analysisEffortDraft, setAnalysisEffortDraft] = useState("");
+  const [analysisTimeoutDraft, setAnalysisTimeoutDraft] = useState("900");
+  const [promptLoading, setPromptLoading] = useState(false);
+  const [promptSaving, setPromptSaving] = useState(false);
+  const [promptError, setPromptError] = useState("");
   const analysisRef = useRef<HTMLElement>(null);
+  const analysisAbortRef = useRef<AbortController | undefined>(undefined);
+  const promptTextareaRef = useRef<HTMLTextAreaElement>(null);
   const taskNames = [...new Set(runs.flatMap((run) => (run.trials || []).map((trial) => trial.task)))].sort();
   const trialStatuses = [...new Set(runs.flatMap((run) =>
     (run.trials || []).map((trial) => trial.status),
@@ -2169,32 +2246,182 @@ function Compare({
   );
   const analysisSelectionKeys = visibleSelectedEntries.map(({ key }) => key);
   const analysisScopeKey = [...analysisSelectionKeys].sort().join("|");
+  const hasAnalysisPanel = Boolean(analysis || analysisError);
+  const analysisModels = [...new Set([
+    ...boot.models,
+    ...(analysisModelDraft ? [analysisModelDraft] : []),
+  ])];
+  const supportedAnalysisEfforts = boot.model_efforts[analysisModelDraft] || boot.efforts;
+  const analysisEfforts = [...new Set([
+    ...supportedAnalysisEfforts,
+    ...(analysisEffortDraft ? [analysisEffortDraft] : []),
+  ])];
   useEffect(() => {
+    analysisAbortRef.current?.abort("scope");
+    analysisAbortRef.current = undefined;
     setAnalysis(undefined);
     setAnalysisError("");
+    setAnalysisStatus("");
+    setAnalyzing(false);
   }, [analysisScopeKey]);
   useEffect(() => {
-    if (!analysis && !analysisError) return;
+    if (!hasAnalysisPanel) return;
     const frame = requestAnimationFrame(() => {
       analysisRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     });
     return () => cancelAnimationFrame(frame);
-  }, [analysis, analysisError]);
+  }, [hasAnalysisPanel]);
+  useEffect(() => {
+    let active = true;
+    request<CompareAnalysisConfig>("/api/compare/analysis-config")
+      .then((config) => {
+        if (!active) return;
+        setAnalysisConfig(config);
+        setPromptDraft(config.prompt);
+        setAnalysisModelDraft(config.model);
+        setAnalysisEffortDraft(config.reasoning_effort);
+        setAnalysisTimeoutDraft(String(config.timeout_seconds));
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+      const controller = analysisAbortRef.current;
+      analysisAbortRef.current = undefined;
+      controller?.abort("unmount");
+    };
+  }, []);
+  useEffect(() => {
+    if (!promptEditorOpen) return;
+    const previousOverflow = document.body.style.overflow;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !promptSaving) setPromptEditorOpen(false);
+    };
+    document.body.style.overflow = "hidden";
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [promptEditorOpen, promptSaving]);
+  useEffect(() => {
+    if (!promptEditorOpen || promptLoading) return;
+    const frame = requestAnimationFrame(() => promptTextareaRef.current?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [promptEditorOpen, promptLoading]);
+  const openPromptEditor = async () => {
+    setPromptEditorOpen(true);
+    if (analysisConfig) {
+      setPromptDraft(analysisConfig.prompt);
+      setAnalysisModelDraft(analysisConfig.model);
+      setAnalysisEffortDraft(analysisConfig.reasoning_effort);
+      setAnalysisTimeoutDraft(String(analysisConfig.timeout_seconds));
+    }
+    setPromptError("");
+    setPromptLoading(true);
+    try {
+      const config = await request<CompareAnalysisConfig>("/api/compare/analysis-config");
+      setAnalysisConfig(config);
+      setPromptDraft(config.prompt);
+      setAnalysisModelDraft(config.model);
+      setAnalysisEffortDraft(config.reasoning_effort);
+      setAnalysisTimeoutDraft(String(config.timeout_seconds));
+    } catch (error) {
+      setPromptError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPromptLoading(false);
+    }
+  };
+  const savePrompt = async () => {
+    if (!analysisConfig || promptSaving) return;
+    const timeoutSeconds = Number(analysisTimeoutDraft);
+    if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 30 || timeoutSeconds > 7200) {
+      setPromptError("AI 分析超时需为 30-7200 秒的整数");
+      return;
+    }
+    setPromptSaving(true);
+    setPromptError("");
+    try {
+      const saved = await request<CompareAnalysisConfig>("/api/compare/analysis-config", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          prompt: promptDraft,
+          model: analysisModelDraft,
+          reasoning_effort: analysisEffortDraft,
+          timeout_seconds: timeoutSeconds,
+        }),
+      });
+      setAnalysisConfig(saved);
+      setPromptDraft(saved.prompt);
+      setAnalysisModelDraft(saved.model);
+      setAnalysisEffortDraft(saved.reasoning_effort);
+      setAnalysisTimeoutDraft(String(saved.timeout_seconds));
+      setAnalysis(undefined);
+      setAnalysisError("");
+      setPromptEditorOpen(false);
+    } catch (error) {
+      setPromptError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPromptSaving(false);
+    }
+  };
+  const stopAnalysis = () => analysisAbortRef.current?.abort("user");
   const analyzeSelection = async () => {
     if (!analysisSelectionKeys.length || analyzing) return;
+    const controller = new AbortController();
+    analysisAbortRef.current = controller;
+    let completed = false;
     setAnalyzing(true);
+    setAnalysis(undefined);
     setAnalysisError("");
+    setAnalysisStatus("正在准备分析数据");
     try {
-      setAnalysis(await request<CompareAnalysis>("/api/compare/analyze", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ items: analysisSelectionKeys }),
-      }));
+      await streamSse(
+        "/api/compare/analyze",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ items: analysisSelectionKeys }),
+          signal: controller.signal,
+        },
+        (event, data) => {
+          if (event === "start") {
+            setAnalysis(data as CompareAnalysis);
+            setAnalysisStatus("正在等待模型输出");
+          } else if (event === "status") {
+            setAnalysisStatus(String(data.message || "模型正在处理"));
+          } else if (event === "delta") {
+            const delta = typeof data.delta === "string" ? data.delta : "";
+            if (!delta) return;
+            setAnalysisStatus("正在生成分析");
+            setAnalysis((current) => current
+              ? { ...current, analysis: current.analysis + delta }
+              : current);
+          } else if (event === "complete") {
+            completed = true;
+            setAnalysis(data as CompareAnalysis);
+            setAnalysisStatus("");
+          } else if (event === "error") {
+            throw new Error(String(data.message || "AI 分析流失败"));
+          }
+        },
+      );
+      if (!completed) throw new Error("AI 分析流未返回完成事件");
     } catch (error) {
-      setAnalysis(undefined);
-      setAnalysisError(error instanceof Error ? error.message : String(error));
+      if (controller.signal.aborted) {
+        if (controller.signal.reason === "unmount") return;
+        if (controller.signal.reason === "user") {
+          setAnalysisError("分析已停止，已保留当前输出");
+        }
+      } else {
+        setAnalysisError(error instanceof Error ? error.message : String(error));
+      }
+      setAnalysisStatus("");
     } finally {
-      setAnalyzing(false);
+      if (analysisAbortRef.current === controller) {
+        analysisAbortRef.current = undefined;
+        setAnalyzing(false);
+      }
     }
   };
   const visibleRunIds = new Set(visibleSelectedEntries.map(({ run }) => run.id));
@@ -2248,15 +2475,33 @@ function Compare({
           </div>
           <div className="compareselectiontools">
             <b>已选 {selected.length}</b>
-            <small className="compareanalysismodel">分析模型 gpt-5.6-sol · max</small>
+            <small className="compareanalysismodel">
+              {analysisConfig
+                ? `分析模型 ${analysisConfig.model} · ${analysisConfig.reasoning_effort} · ${analysisConfig.timeout_seconds}s`
+                : "正在读取分析配置"}
+            </small>
             <button
-              className="secondary compareanalysisbutton"
-              disabled={!analysisSelectionKeys.length || analyzing}
-              onClick={analyzeSelection}
-              title={analysisSelectionKeys.length ? "分析当前筛选中已选择的 Trial" : "当前筛选中没有已选择的 Trial"}
+              className={`secondary compareanalysisbutton ${analyzing ? "stop" : ""}`}
+              disabled={!analysisSelectionKeys.length && !analyzing}
+              onClick={analyzing ? stopAnalysis : analyzeSelection}
+              title={analyzing
+                ? "停止当前 AI 分析"
+                : analysisSelectionKeys.length
+                  ? "分析当前筛选中已选择的 Trial"
+                  : "当前筛选中没有已选择的 Trial"}
             >
-              <Sparkles />
-              {analyzing ? "分析中" : "AI 分析"}
+              {analyzing ? <Square /> : <Sparkles />}
+              {analyzing ? "停止分析" : "AI 分析"}
+            </button>
+            <button
+              type="button"
+              className="secondary comparepromptedit"
+              disabled={analyzing}
+              onClick={openPromptEditor}
+              title="编辑 AI 分析设置"
+              aria-label="编辑 AI 分析设置"
+            >
+              <Pencil />
             </button>
             <button
               className="secondary"
@@ -2314,15 +2559,179 @@ function Compare({
           <div className="comparefilterempty">没有符合当前筛选条件的 Trial 结果。</div>
         )}
       </section>
+      {promptEditorOpen && (
+        <div
+          className="promptmodalbackdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !promptSaving) {
+              setPromptEditorOpen(false);
+            }
+          }}
+        >
+          <section
+            className="promptmodal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="promptmodal-title"
+          >
+            <header className="promptmodalhead">
+              <div>
+                <Sparkles />
+                <h2 id="promptmodal-title">AI 分析设置</h2>
+              </div>
+              <button
+                type="button"
+                className="promptmodalclose"
+                onClick={() => setPromptEditorOpen(false)}
+                disabled={promptSaving}
+                title="关闭"
+                aria-label="关闭 AI 分析设置"
+              >
+                <X />
+              </button>
+            </header>
+            <div className="promptmodalbody">
+              {promptLoading ? (
+                <div className="promptmodalloading">正在读取分析设置…</div>
+              ) : analysisConfig && (
+                <>
+                  <div className="promptconfiggrid">
+                    <label>
+                      分析模型
+                      <select
+                        value={analysisModelDraft}
+                        onChange={(event) => {
+                          const nextModel = event.target.value;
+                          const supported = boot.model_efforts[nextModel] || boot.efforts;
+                          setAnalysisModelDraft(nextModel);
+                          setAnalysisEffortDraft((current) => supported.includes(current)
+                            ? current
+                            : boot.model_defaults[nextModel] || supported[0] || current);
+                          setPromptError("");
+                        }}
+                      >
+                        {analysisModels.map((model) => <option key={model}>{model}</option>)}
+                      </select>
+                    </label>
+                    <label>
+                      思考强度
+                      <select
+                        value={analysisEffortDraft}
+                        onChange={(event) => {
+                          setAnalysisEffortDraft(event.target.value);
+                          setPromptError("");
+                        }}
+                      >
+                        {analysisEfforts.map((effort) => <option key={effort}>{effort}</option>)}
+                      </select>
+                    </label>
+                    <label>
+                      超时（秒）
+                      <input
+                        type="number"
+                        min={30}
+                        max={7200}
+                        step={30}
+                        value={analysisTimeoutDraft}
+                        onChange={(event) => {
+                          setAnalysisTimeoutDraft(event.target.value);
+                          setPromptError("");
+                        }}
+                      />
+                    </label>
+                  </div>
+                  <div className="promptmodalmeta">
+                    <label htmlFor="compare-analysis-prompt">分析指令</label>
+                    <span className={promptDraft === analysisConfig.default_prompt ? "default" : "custom"}>
+                      {promptDraft === analysisConfig.default_prompt
+                        ? "默认提示词"
+                        : promptDraft ? "自定义提示词" : "空提示词"}
+                    </span>
+                    <small>{promptDraft.length.toLocaleString()} / 20,000</small>
+                  </div>
+                  <textarea
+                    id="compare-analysis-prompt"
+                    ref={promptTextareaRef}
+                    value={promptDraft}
+                    maxLength={20000}
+                    onChange={(event) => {
+                      setPromptDraft(event.target.value);
+                      setPromptError("");
+                    }}
+                    spellCheck={false}
+                  />
+                </>
+              )}
+              {promptError && <div className="promptmodalerror">{promptError}</div>}
+            </div>
+            <footer className="promptmodalfooter">
+              <div>
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={!analysisConfig || promptLoading || promptSaving || !promptDraft}
+                  onClick={() => {
+                    setPromptDraft("");
+                    setPromptError("");
+                  }}
+                >
+                  <Trash2 />
+                  清空
+                </button>
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={!analysisConfig || promptLoading || promptSaving || promptDraft === analysisConfig.default_prompt}
+                  onClick={() => {
+                    setPromptDraft(analysisConfig?.default_prompt || "");
+                    setPromptError("");
+                  }}
+                >
+                  <RotateCcw />
+                  恢复默认提示词
+                </button>
+              </div>
+              <div>
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={promptSaving}
+                  onClick={() => setPromptEditorOpen(false)}
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={
+                    !analysisConfig || promptLoading || promptSaving ||
+                    !analysisModelDraft || !analysisEffortDraft || !analysisTimeoutDraft
+                  }
+                  onClick={savePrompt}
+                >
+                  <Save />
+                  {promptSaving ? "保存中" : "保存"}
+                </button>
+              </div>
+            </footer>
+          </section>
+        </div>
+      )}
       {(analysis || analysisError) && (
         <section className="panel compareanalysis" ref={analysisRef}>
           <div className="comparetitle">
             <h2>AI 对比分析</h2>
-            {analysis && <span className="compareanalysismeta">分析模型 {analysis.model} · {analysis.reasoning_effort}</span>}
+            {analysis && (
+              <div className="compareanalysistitlemeta">
+                {analyzing && <b>{analysisStatus || "正在分析"}</b>}
+                <span className="compareanalysismeta">
+                  分析模型 {analysis.model} · {analysis.reasoning_effort} · 超时 {analysis.timeout_seconds}s
+                </span>
+              </div>
+            )}
           </div>
-          {analysisError ? (
-            <div className="compareanalysiserror">{analysisError}</div>
-          ) : analysis && (
+          {analysisError && <div className="compareanalysiserror">{analysisError}</div>}
+          {analysis && (
             <>
               <div className="compareanalysissummary">
                 <span>共 {analysis.summary.total}</span>
@@ -2332,7 +2741,26 @@ function Compare({
                 <span>无法判断 {analysis.summary.unavailable}</span>
                 <span>严格 {analysis.summary.strict} · 参考 {analysis.summary.reference}</span>
               </div>
-              <div className="compareanalysistext">{analysis.analysis}</div>
+              <div className={`compareanalysistext ${analyzing ? "streaming" : ""}`}>
+                {analysis.analysis ? (
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    components={{
+                      table: ({ node: _node, ...props }) => (
+                        <div className="compareanalysistablewrap">
+                          <table {...props} />
+                        </div>
+                      ),
+                    }}
+                  >
+                    {analysis.analysis}
+                  </ReactMarkdown>
+                ) : (
+                  <span className="compareanalysiswaiting">
+                    {analysisStatus || "正在等待模型输出"}
+                  </span>
+                )}
+              </div>
               <div className="compareanalysisfacts">
                 <b>Task / Run</b><b>结论</b><b>通过率</b><b>平均用时</b><b>平均成本</b><b>平均步骤</b>
                 {analysis.comparisons.map((item) => {

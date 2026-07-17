@@ -17,7 +17,9 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete, select
 from .config import settings
 from .compare_analysis import (
-    CompareAnalysisInputError, CompareAnalysisProviderError, analyze_compare_items,
+    DEFAULT_ANALYSIS_PROMPT, CompareAnalysisInputError, CompareAnalysisProviderError,
+    get_compare_analysis_config, prepare_compare_analysis,
+    save_compare_analysis_config, stream_compare_analysis_events,
 )
 from .database import SessionLocal, init_db
 from .diagnostics import run_checks
@@ -48,8 +50,8 @@ from .scheduler import (
     requested_trial_count,
 )
 from .schemas import (
-    BaselineDraft, CompareAnalysisRequest, CompareRequest, DockerCleanupRequest,
-    ProviderPreviewRequest, RestorePayload, RetryTrialsDraft, RunBatchDraft,
+    BaselineDraft, CompareAnalysisConfigUpdate, CompareAnalysisRequest, CompareRequest,
+    DockerCleanupRequest, ProviderPreviewRequest, RestorePayload, RetryTrialsDraft, RunBatchDraft,
     RunDraft, SettingsUpdate,
     concurrency_advice,
 )
@@ -119,18 +121,21 @@ def _provider_bootstrap(
         },
     }
 
-def _provider_selection_error(draft: RunDraft | RunBatchDraft) -> str | None:
+def _provider_model_effort_error(model: str, reasoning_effort: str) -> str | None:
     preferences = get_preferences()
     catalog = get_provider_catalog(preferences["default_model"], preferences["default_effort"])
     if not catalog["models_authoritative"]:
         return None
-    selected = next((entry for entry in catalog["models"] if entry["id"] == draft.model), None)
+    selected = next((entry for entry in catalog["models"] if entry["id"] == model), None)
     if not selected:
-        return f"模型 {draft.model} 当前不在 provider 的可用模型列表中"
-    if selected["reasoning_efforts_known"] and draft.reasoning_effort not in selected["reasoning_efforts"]:
+        return f"模型 {model} 当前不在 provider 的可用模型列表中"
+    if selected["reasoning_efforts_known"] and reasoning_effort not in selected["reasoning_efforts"]:
         supported = ", ".join(selected["reasoning_efforts"])
-        return f"模型 {draft.model} 不支持 reasoning effort {draft.reasoning_effort}；支持：{supported}"
+        return f"模型 {model} 不支持 reasoning effort {reasoning_effort}；支持：{supported}"
     return None
+
+def _provider_selection_error(draft: RunDraft | RunBatchDraft) -> str | None:
+    return _provider_model_effort_error(draft.model, draft.reasoning_effort)
 
 @app.get("/api/bootstrap")
 def bootstrap():
@@ -576,11 +581,49 @@ def compare_selected(payload: CompareRequest):
 def analyze_selected_comparison(payload: CompareAnalysisRequest):
     selections = _parse_compare_items(payload.items)
     try:
-        return analyze_compare_items(selections)
+        facts, credential = prepare_compare_analysis(selections)
     except CompareAnalysisInputError as exc:
         raise HTTPException(422, str(exc)) from exc
     except CompareAnalysisProviderError as exc:
         raise HTTPException(502, str(exc)) from exc
+    config = get_compare_analysis_config()
+    if selection_error := _provider_model_effort_error(
+        config["model"], config["reasoning_effort"]
+    ):
+        raise HTTPException(422, selection_error)
+    events = stream_compare_analysis_events(facts, credential, config)
+    stream = (
+        f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+        for event, data in events
+    )
+    return StreamingResponse(
+        stream,
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+def _compare_analysis_config_response(config: dict) -> dict:
+    return {
+        **config,
+        "default_prompt": DEFAULT_ANALYSIS_PROMPT,
+        "is_default": config["prompt"] == DEFAULT_ANALYSIS_PROMPT,
+    }
+
+@app.get("/api/compare/analysis-config")
+def read_compare_analysis_config():
+    return _compare_analysis_config_response(get_compare_analysis_config())
+
+@app.put("/api/compare/analysis-config")
+def update_compare_analysis_config(payload: CompareAnalysisConfigUpdate):
+    if selection_error := _provider_model_effort_error(
+        payload.model, payload.reasoning_effort
+    ):
+        raise HTTPException(422, selection_error)
+    try:
+        config = save_compare_analysis_config(**payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return _compare_analysis_config_response(config)
 
 def _parse_compare_items(items: list[str]) -> list[tuple[int, str]]:
     selections=[]
