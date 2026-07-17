@@ -8,6 +8,9 @@ import shutil
 from global_queue import release_slot, trial_task_name, try_acquire_slot
 from infrastructure_retry import write_retry_status
 from local_image_retention import preserve_local_prebuilt_image
+from docker_build_lock import (
+    acquire_docker_build_lock, is_compose_build, release_docker_build_lock,
+)
 from networking import (
     add_provider_telemetry_headers, allow_provider_proxy_port,
     provider_proxy_domains, trial_network_subnets,
@@ -54,6 +57,17 @@ def _install_mini_context_limit_patch() -> None:
                     apt_install,
                     reliable_apt_install,
                     1,
+                )
+            if step.user == "root" and "DEEPSWE_UV_RETRY_PATCH" not in step.run:
+                step.run = (
+                    "# DEEPSWE_UV_RETRY_PATCH\n"
+                    "export UV_HTTP_RETRIES=10\n"
+                    "export UV_HTTP_TIMEOUT=120\n"
+                    + step.run.replace(
+                        "curl -LsSf ",
+                        "curl --retry 8 --retry-all-errors --retry-delay 2 "
+                        "--connect-timeout 30 -LsSf ",
+                    )
                 )
             if step.user == "agent" and marker not in step.run:
                 step.run = step.run.replace(
@@ -152,13 +166,20 @@ def _install_local_prebuilt_image_retention() -> None:
             image=getattr(task_env_config, "docker_image", None),
             use_prebuilt=bool(getattr(self, "_use_prebuilt", False)),
         )
-        return await original_run_compose(
-            self,
-            command,
-            check=check,
-            timeout_sec=timeout_sec,
-            process_env_overrides=process_env_overrides,
-        )
+        build_lock = None
+        try:
+            if is_compose_build(command):
+                build_lock = await asyncio.to_thread(acquire_docker_build_lock)
+            return await original_run_compose(
+                self,
+                command,
+                check=check,
+                timeout_sec=timeout_sec,
+                process_env_overrides=process_env_overrides,
+            )
+        finally:
+            if build_lock is not None:
+                await asyncio.to_thread(release_docker_build_lock, build_lock)
 
     run_compose_preserving_local_image._deepswe_local_image_retention = True
     DockerEnvironment._run_docker_compose_command = (

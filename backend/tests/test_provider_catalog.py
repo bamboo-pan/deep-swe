@@ -77,3 +77,40 @@ def test_provider_catalog_falls_back_without_credentials(monkeypatch, tmp_path: 
     assert catalog["models_authoritative"] is False
     assert catalog["models"][0]["id"] == "saved-model"
     assert catalog["models"][0]["reasoning_efforts"] == ["xhigh"]
+
+
+def test_provider_catalog_preview_reads_explicit_credential_file(monkeypatch, tmp_path: Path):
+    selected = tmp_path / "selected.txt"
+    selected.write_text("https://provider-b.test/v1\ntoken-b\n", encoding="utf-8")
+    monkeypatch.setattr(
+        provider_catalog,
+        "credential_path",
+        lambda: (_ for _ in ()).throw(AssertionError("global credential was read")),
+    )
+    captured = {}
+
+    def fake_cached(credential, *, force_refresh: bool):
+        captured["credential"] = credential
+        captured["force_refresh"] = force_refresh
+        return {
+            "source": "provider",
+            "models_authoritative": True,
+            "models": [{
+                "id": "model-b",
+                "owned_by": None,
+                "reasoning_efforts": ["low", "high"],
+                "default_reasoning_effort": "high",
+                "reasoning_efforts_known": True,
+            }],
+            "error": None,
+        }
+
+    monkeypatch.setattr(provider_catalog, "_cached_provider_catalog", fake_cached)
+    catalog = provider_catalog.get_provider_catalog(
+        "model-a", "low", force_refresh=True, credential_file=selected
+    )
+
+    assert catalog["models"][0]["id"] == "model-b"
+    assert captured["credential"].url == "https://provider-b.test/v1"
+    assert captured["credential"].token == "token-b"
+    assert captured["force_refresh"] is True

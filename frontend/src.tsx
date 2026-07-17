@@ -50,6 +50,7 @@ type Boot = {
   agents: string[];
   models: string[];
   model_efforts: Record<string, string[]>;
+  model_efforts_known: Record<string, boolean>;
   model_defaults: Record<string, string>;
   efforts: string[];
   provider_catalog: {
@@ -63,6 +64,16 @@ type Boot = {
     jobs_dirs: string[];
   };
   task_suite: { name: string; tasks: TaskChoice[] };
+};
+type ProviderPreview = {
+  models: string[];
+  model_efforts: Record<string, string[]>;
+  model_efforts_known: Record<string, boolean>;
+  model_defaults: Record<string, string>;
+  efforts: string[];
+  default_model: string;
+  default_effort: string;
+  provider_catalog: Boot["provider_catalog"];
 };
 type Check = { name: string; status: string; message: string };
 type QueueStatus = {
@@ -476,6 +487,7 @@ function App() {
   const [tasks, setTasks] = useState<TaskInfo[]>([]);
   const [prefs, setPrefs] = useState<Prefs>();
   const [notice, setNotice] = useState("");
+  const credentialPreviewSequence = useRef(0);
   const providerAlertKey = useRef("");
   const [voiceEnabled, setVoiceEnabled] = useState(
     () =>
@@ -853,6 +865,69 @@ function App() {
     setTrialLog(
       log.status === "fulfilled" ? log.value.log : "该 Trial 暂无日志",
     );
+  };
+  const previewCredential = async (credentialFile: string) => {
+    if (!prefs || !boot) return;
+    const sequence = ++credentialPreviewSequence.current;
+    const previous = prefs;
+    setPrefs({ ...prefs, credential_file: credentialFile });
+    setNotice("正在读取新 Provider 的模型与思考强度…");
+    try {
+      const preview = await request<ProviderPreview>(
+        "/api/settings/provider-preview",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            credential_file: credentialFile,
+            default_model: prefs.default_model,
+            default_effort: prefs.default_effort,
+          }),
+        },
+      );
+      if (sequence !== credentialPreviewSequence.current) return;
+      if (preview.provider_catalog.source !== "provider") {
+        throw new Error(preview.provider_catalog.error || "Provider 模型列表不可用");
+      }
+      setBoot({
+        ...boot,
+        models: preview.models,
+        model_efforts: preview.model_efforts,
+        model_efforts_known: preview.model_efforts_known,
+        model_defaults: preview.model_defaults,
+        efforts: preview.efforts,
+        provider_catalog: preview.provider_catalog,
+        defaults: {
+          ...boot.defaults,
+          model: preview.default_model,
+          reasoning_effort: preview.default_effort,
+        },
+      });
+      setPrefs({
+        ...prefs,
+        credential_file: credentialFile,
+        default_model: preview.default_model,
+        default_effort: preview.default_effort,
+      });
+      if (!preview.models.includes(model)) {
+        setModel(preview.default_model);
+        setEffort(preview.default_effort);
+      } else {
+        const supported = preview.model_efforts[model] || preview.efforts;
+        if (!supported.includes(effort)) {
+          setEffort(preview.model_defaults[model] || supported[0]);
+        }
+      }
+      setNotice(
+        preview.model_efforts_known[preview.default_model]
+          ? "已刷新新 Provider 的模型与思考强度；点击保存后用于新 Run"
+          : `已刷新模型列表；Provider 未提供思考强度元数据，暂沿用 ${preview.default_effort}；点击保存后用于新 Run`,
+      );
+    } catch (error) {
+      if (sequence !== credentialPreviewSequence.current) return;
+      setPrefs(previous);
+      setNotice(`凭据切换失败：${String(error)}`);
+    }
   };
   const savePrefs = async () => {
     if (!prefs) return;
@@ -1394,6 +1469,7 @@ function App() {
           <Settings
             prefs={prefs}
             setPrefs={setPrefs}
+            selectCredential={previewCredential}
             save={savePrefs}
             restore={restore}
             boot={boot}
@@ -2576,6 +2652,7 @@ function Tasks({
 function Settings({
   prefs,
   setPrefs,
+  selectCredential,
   save,
   restore,
   boot,
@@ -2586,6 +2663,7 @@ function Settings({
 }: {
   prefs?: Prefs;
   setPrefs: (p: Prefs) => void;
+  selectCredential: (path: string) => void;
   save: () => void;
   restore: (f: File) => void;
   boot: Boot;
@@ -2631,242 +2709,299 @@ function Settings({
           {voiceSupported ? (voiceEnabled ? "已开启" : "已关闭") : "浏览器不支持"}
         </button>
       </section>
-      <section className="panel form">
-        <h2>本机设置</h2>
-        <div className="formgrid">
-          <label>
-            凭据文件
-            <select
-              value={prefs.credential_file}
-              onChange={(e) =>
-                setPrefs({ ...prefs, credential_file: e.target.value })
-              }
-            >
-              {boot.setting_options.credential_files.map((x) => (
-                <option key={x}>{x}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Jobs 目录
-            <select
-              value={prefs.jobs_dir}
-              onChange={(e) => setPrefs({ ...prefs, jobs_dir: e.target.value })}
-            >
-              {boot.setting_options.jobs_dirs.map((x) => (
-                <option key={x}>{x}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            默认 Agent
-            <select
-              value={prefs.default_agent}
-              onChange={(e) =>
-                setPrefs({ ...prefs, default_agent: e.target.value })
-              }
-            >
-              {boot.agents.map((x) => (
-                <option key={x}>{x}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            默认模型
-            <select
-              value={prefs.default_model}
-              onChange={(e) => selectDefaultModel(e.target.value)}
-            >
-              {boot.models.map((x) => (
-                <option key={x}>{x}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            默认 Effort
-            <select
-              value={prefs.default_effort}
-              onChange={(e) =>
-                setPrefs({ ...prefs, default_effort: e.target.value })
-              }
-            >
-              {defaultEfforts.map((x) => (
-                <option key={x}>{x}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            最大并行 Task 数
-            <input
-              type="number"
-              min="1"
-              max="72"
-              step="1"
-              value={prefs.max_parallel_tasks}
-              onChange={(e) =>
-                setPrefs({ ...prefs, max_parallel_tasks: +e.target.value })
-              }
-            />
-          </label>
-          <label title="所有 Agent 模型请求共用滚动 60 秒窗口；窗口未满时立即放行，达到 RPM 后等待最早请求移出窗口。0 表示禁用限速。">
-            Provider RPM（0 禁用）
-            <input
-              type="number"
-              min={0}
-              max={100000}
-              step={1}
-              value={prefs.provider_rpm}
-              onChange={(e) =>
-                setPrefs({ ...prefs, provider_rpm: +e.target.value })
-              }
-            />
-          </label>
-          <label title="限制同时连接到 Provider 的活动请求数量；请求完成或进入重试等待后释放名额。0 表示禁用。">
-            Provider 最大活动请求数（0 禁用）
-            <input
-              type="number"
-              min={0}
-              max={1000}
-              step={1}
-              value={prefs.provider_max_concurrency}
-              onChange={(e) =>
-                setPrefs({ ...prefs, provider_max_concurrency: +e.target.value })
-              }
-            />
-          </label>
-          <label title="由 Provider Proxy 统一执行；次数不包含首次请求。">
-            Provider 请求重试次数
-            <input
-              type="number"
-              min={0}
-              max={300}
-              step={1}
-              value={prefs.provider_max_retries}
-              onChange={(e) =>
-                setPrefs({ ...prefs, provider_max_retries: +e.target.value })
-              }
-            />
-          </label>
-          <label title="429、5xx 或建连失败后再次请求前的固定等待时间。">
-            Provider 重试等待间隔（秒）
-            <input
-              type="number"
-              min={0}
-              max={3600}
-              step={1}
-              value={prefs.provider_retry_interval_seconds}
-              onChange={(e) =>
-                setPrefs({ ...prefs, provider_retry_interval_seconds: +e.target.value })
-              }
-            />
-          </label>
-          <label title="Squid 等待 Provider 返回数据的最长空闲时间。长推理请求可能超过 15 分钟，默认延长到 30 分钟。">
-            Squid 长请求超时（秒）
-            <input
-              type="number"
-              min={900}
-              max={7200}
-              step={60}
-              value={prefs.squid_read_timeout_seconds}
-              onChange={(e) =>
-                setPrefs({ ...prefs, squid_read_timeout_seconds: +e.target.value })
-              }
-            />
-          </label>
-          <label title="运行中容器内存占 Docker 可用内存达到该比例时，暂停启动新 Trial；已运行 Trial 不受影响。0 表示禁用。">
-            Docker 内存暂停阈值（%）
-            <input
-              type="number"
-              min={0}
-              max={95}
-              step={1}
-              value={prefs.docker_memory_pause_percent}
-              onChange={(e) =>
-                setPrefs({ ...prefs, docker_memory_pause_percent: +e.target.value })
-              }
-            />
-          </label>
-          <label>
-            Agent 超时（秒）
-            <input
-              type="number"
-              min={60}
-              max={21600}
-              step={1}
-              value={prefs.agent_timeout_seconds}
-              onChange={(e) =>
-                setPrefs({ ...prefs, agent_timeout_seconds: +e.target.value })
-              }
-            />
-          </label>
-          <label>
-            Verifier 超时（秒）
-            <input
-              type="number"
-              min={60}
-              max={7200}
-              step={1}
-              value={prefs.verifier_timeout_seconds}
-              onChange={(e) =>
-                setPrefs({ ...prefs, verifier_timeout_seconds: +e.target.value })
-              }
-            />
-          </label>
-          <label>
-            基础设施重试次数（0 禁用）
-            <input
-              type="number"
-              min={0}
-              max={6}
-              step={1}
-              value={prefs.infrastructure_max_retries}
-              onChange={(e) =>
-                setPrefs({ ...prefs, infrastructure_max_retries: +e.target.value })
-              }
-            />
-          </label>
-          <label>
-            最大步数（全部 Agent）
-            <input
-              type="number"
-              min={10}
-              max={500}
-              step={1}
-              value={prefs.agent_max_steps}
-              onChange={(e) =>
-                setPrefs({ ...prefs, agent_max_steps: +e.target.value })
-              }
-            />
-          </label>
-          <label>
-            单个 Trial 费用熔断 (USD，0 禁用)
-            <input
-              type="number"
-              min={0}
-              step={0.5}
-              value={prefs.trial_budget_usd}
-              onChange={(e) =>
-                setPrefs({ ...prefs, trial_budget_usd: +e.target.value })
-              }
-            />
-          </label>
-          <label>
-            整个 Run 累计费用熔断 (USD，0 禁用)
-            <input
-              type="number"
-              min={0}
-              step={0.5}
-              value={prefs.run_budget_usd}
-              onChange={(e) =>
-                setPrefs({ ...prefs, run_budget_usd: +e.target.value })
-              }
-            />
-          </label>
+      <section className="panel form settingspanel">
+        <div className="settingspanelhead">
+          <div>
+            <h2>运行设置</h2>
+            <p className="muted">
+              修改后需点击底部“保存设置”。不同分组按标注的时机生效。
+            </p>
+          </div>
+          <div className="settingslegend" aria-label="设置生效时机">
+            <span><i className="live" />进行中生效</span>
+            <span><i className="newrun" />仅后续 Run</span>
+            <span><i className="locked" />启动后固定</span>
+          </div>
         </div>
-        <button className="primary" onClick={save}>
-          <Save />
-          保存设置
-        </button>
+
+        <section className="settingsgroup">
+          <div className="settingsgrouphead">
+            <div>
+              <span className="settingsscope live">进行中生效</span>
+              <h3>全局调度与 Provider 请求</h3>
+            </div>
+            <p>
+              并行上限从下一个排队 Trial 申请名额时采用，已运行 Trial 不会被停止；Provider RPM
+              从下一次请求尝试采用，其余 Provider 策略从下一次新请求采用。
+            </p>
+          </div>
+          <div className="formgrid">
+            <label>
+              最大并行 Task 数
+              <input
+                type="number"
+                min="1"
+                max="72"
+                step="1"
+                value={prefs.max_parallel_tasks}
+                onChange={(e) =>
+                  setPrefs({ ...prefs, max_parallel_tasks: +e.target.value })
+                }
+              />
+            </label>
+            <label title="所有 Agent 模型请求共用滚动 60 秒窗口；窗口未满时立即放行，达到 RPM 后等待最早请求移出窗口。0 表示禁用限速。">
+              Provider RPM（0 禁用）
+              <input
+                type="number"
+                min={0}
+                max={100000}
+                step={1}
+                value={prefs.provider_rpm}
+                onChange={(e) =>
+                  setPrefs({ ...prefs, provider_rpm: +e.target.value })
+                }
+              />
+            </label>
+            <label title="限制同时连接到 Provider 的活动请求数量；请求完成或进入重试等待后释放名额。0 表示禁用。">
+              Provider 最大活动请求数（0 禁用）
+              <input
+                type="number"
+                min={0}
+                max={1000}
+                step={1}
+                value={prefs.provider_max_concurrency}
+                onChange={(e) =>
+                  setPrefs({ ...prefs, provider_max_concurrency: +e.target.value })
+                }
+              />
+            </label>
+            <label title="由 Provider Proxy 统一执行；次数不包含首次请求。">
+              Provider 请求重试次数
+              <input
+                type="number"
+                min={0}
+                max={300}
+                step={1}
+                value={prefs.provider_max_retries}
+                onChange={(e) =>
+                  setPrefs({ ...prefs, provider_max_retries: +e.target.value })
+                }
+              />
+            </label>
+            <label title="429、5xx 或建连失败后再次请求前的固定等待时间。">
+              Provider 重试等待间隔（秒）
+              <input
+                type="number"
+                min={0}
+                max={3600}
+                step={1}
+                value={prefs.provider_retry_interval_seconds}
+                onChange={(e) =>
+                  setPrefs({ ...prefs, provider_retry_interval_seconds: +e.target.value })
+                }
+              />
+            </label>
+          </div>
+        </section>
+
+        <section className="settingsgroup">
+          <div className="settingsgrouphead">
+            <div>
+              <span className="settingsscope newrun">仅后续 Run</span>
+              <h3>Run 身份与创建页默认值</h3>
+            </div>
+            <p>
+              凭据和 Jobs 目录在创建 Run 时锁定；默认 Agent、模型和 Effort 只作为创建页初始选择，
+              不会修改已创建 Run 或当前已选参数。
+            </p>
+          </div>
+          <div className="formgrid">
+            <label>
+              凭据文件
+              <select
+                value={prefs.credential_file}
+                onChange={(e) => selectCredential(e.target.value)}
+              >
+                {boot.setting_options.credential_files.map((x) => (
+                  <option key={x}>{x}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Jobs 目录
+              <select
+                value={prefs.jobs_dir}
+                onChange={(e) => setPrefs({ ...prefs, jobs_dir: e.target.value })}
+              >
+                {boot.setting_options.jobs_dirs.map((x) => (
+                  <option key={x}>{x}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              默认 Agent
+              <select
+                value={prefs.default_agent}
+                onChange={(e) =>
+                  setPrefs({ ...prefs, default_agent: e.target.value })
+                }
+              >
+                {boot.agents.map((x) => (
+                  <option key={x}>{x}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              默认模型
+              <select
+                value={prefs.default_model}
+                onChange={(e) => selectDefaultModel(e.target.value)}
+              >
+                {boot.models.map((x) => (
+                  <option key={x}>{x}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              默认 Effort
+              <select
+                value={prefs.default_effort}
+                onChange={(e) =>
+                  setPrefs({ ...prefs, default_effort: e.target.value })
+                }
+              >
+                {defaultEfforts.map((x) => (
+                  <option key={x}>{x}</option>
+                ))}
+              </select>
+            </label>
+          </div>
+        </section>
+
+        <section className="settingsgroup">
+          <div className="settingsgrouphead">
+            <div>
+              <span className="settingsscope locked">启动后固定</span>
+              <h3>执行进程与用量限制</h3>
+            </div>
+            <p>
+              超时、重试和步数在创建 Run 时写入；Squid、内存阈值和费用熔断在执行进程启动时读取。
+              Run 开始后保存不会改变本次执行，后续新 Run 或手动 Trial 重试会使用新值。
+            </p>
+          </div>
+          <div className="formgrid">
+            <label title="Squid 等待 Provider 返回数据的最长空闲时间。长推理请求可能超过 15 分钟，默认延长到 30 分钟。">
+              Squid 长请求超时（秒）
+              <input
+                type="number"
+                min={900}
+                max={7200}
+                step={60}
+                value={prefs.squid_read_timeout_seconds}
+                onChange={(e) =>
+                  setPrefs({ ...prefs, squid_read_timeout_seconds: +e.target.value })
+                }
+              />
+            </label>
+            <label title="运行中容器内存占 Docker 可用内存达到该比例时，暂停启动新 Trial；已运行 Trial 不受影响。0 表示禁用。">
+              Docker 内存暂停阈值（%）
+              <input
+                type="number"
+                min={0}
+                max={95}
+                step={1}
+                value={prefs.docker_memory_pause_percent}
+                onChange={(e) =>
+                  setPrefs({ ...prefs, docker_memory_pause_percent: +e.target.value })
+                }
+              />
+            </label>
+            <label>
+              Agent 超时（秒）
+              <input
+                type="number"
+                min={60}
+                max={21600}
+                step={1}
+                value={prefs.agent_timeout_seconds}
+                onChange={(e) =>
+                  setPrefs({ ...prefs, agent_timeout_seconds: +e.target.value })
+                }
+              />
+            </label>
+            <label>
+              Verifier 超时（秒）
+              <input
+                type="number"
+                min={60}
+                max={7200}
+                step={1}
+                value={prefs.verifier_timeout_seconds}
+                onChange={(e) =>
+                  setPrefs({ ...prefs, verifier_timeout_seconds: +e.target.value })
+                }
+              />
+            </label>
+            <label>
+              基础设施重试次数（0 禁用）
+              <input
+                type="number"
+                min={0}
+                max={6}
+                step={1}
+                value={prefs.infrastructure_max_retries}
+                onChange={(e) =>
+                  setPrefs({ ...prefs, infrastructure_max_retries: +e.target.value })
+                }
+              />
+            </label>
+            <label>
+              最大步数（全部 Agent）
+              <input
+                type="number"
+                min={10}
+                max={500}
+                step={1}
+                value={prefs.agent_max_steps}
+                onChange={(e) =>
+                  setPrefs({ ...prefs, agent_max_steps: +e.target.value })
+                }
+              />
+            </label>
+            <label>
+              单个 Trial 费用熔断 (USD，0 禁用)
+              <input
+                type="number"
+                min={0}
+                step={0.5}
+                value={prefs.trial_budget_usd}
+                onChange={(e) =>
+                  setPrefs({ ...prefs, trial_budget_usd: +e.target.value })
+                }
+              />
+            </label>
+            <label>
+              整个 Run 累计费用熔断 (USD，0 禁用)
+              <input
+                type="number"
+                min={0}
+                step={0.5}
+                value={prefs.run_budget_usd}
+                onChange={(e) =>
+                  setPrefs({ ...prefs, run_budget_usd: +e.target.value })
+                }
+              />
+            </label>
+          </div>
+        </section>
+
+        <div className="settingssavebar">
+          <p>上方三组设置统一在保存后生效。</p>
+          <button className="primary" onClick={save}>
+            <Save />
+            保存设置
+          </button>
+        </div>
       </section>
       <section className="panel">
         <h2>导出、备份与恢复</h2>
@@ -3070,7 +3205,16 @@ function DockerCard({
   const activeRuns = storage?.active_runs ?? 0;
   return (
     <section className="panel">
-      <h2>Docker 存储与清理</h2>
+      <div className="dockerpanelhead">
+        <div>
+          <h2>Docker 存储与清理</h2>
+          <p className="muted">
+            本区域的选项修改后会单独保存。普通 Run 的自动清理在收尾时读取，手动 Trial
+            重试则在重试批次启动时读取。
+          </p>
+        </div>
+        <span className="settingsscope operation">按操作读取</span>
+      </div>
       {!storage ? (
         <p className="muted">正在读取 Docker 存储信息…</p>
       ) : !storage.available ? (
@@ -3109,7 +3253,7 @@ function DockerCard({
             </p>
           )}
           <div className="actions">
-            <label className="retentionselect">构建缓存保留
+            <label className="retentionselect">构建缓存保留 <em className="settingsinlinebadge">清理时读取</em>
               <select value={prefs.docker_cache_retention_hours} onChange={(e)=>saveDockerPrefs({...prefs,docker_cache_retention_hours:+e.target.value})}>
                 <option value={24}>1 天</option><option value={72}>3 天</option><option value={168}>7 天</option><option value={336}>14 天</option><option value={720}>30 天</option><option value={2160}>90 天</option>
               </select>
@@ -3149,7 +3293,7 @@ function DockerCard({
             </p>
           )}
           <div className="toggles">
-            <label>
+            <label title="普通 Run 在收尾时读取；手动 Trial 重试在重试批次启动时读取。">
               <input
                 type="checkbox"
                 checked={prefs.docker_cleanup_after_run}
@@ -3160,7 +3304,10 @@ function DockerCard({
                   })
                 }
               />
-              运行结束后自动清理该运行的 Trial 镜像
+              <span className="settingtogglecopy">
+                运行结束后自动清理该运行的 Trial 镜像
+                <em className="settingsinlinebadge live">结束时读取</em>
+              </span>
             </label>
             <label>
               <input
@@ -3173,7 +3320,10 @@ function DockerCard({
                   })
                 }
               />
-              删除历史运行时执行 Docker 兜底清理
+              <span className="settingtogglecopy">
+                删除历史运行时执行 Docker 兜底清理
+                <em className="settingsinlinebadge">删除时读取</em>
+              </span>
             </label>
           </div>
           <p className="muted">

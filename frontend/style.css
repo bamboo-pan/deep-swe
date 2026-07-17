@@ -487,6 +487,143 @@ h2 {
 .form {
   max-width: 1000px;
 }
+.settingspanel {
+  max-width: 1120px;
+}
+.settingspanelhead,
+.settingsgrouphead,
+.dockerpanelhead,
+.settingssavebar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+}
+.settingspanelhead h2,
+.dockerpanelhead h2 {
+  margin-bottom: 7px;
+}
+.settingspanelhead p,
+.dockerpanelhead p {
+  margin: 0;
+  line-height: 1.6;
+}
+.settingslegend {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px 14px;
+  padding-top: 3px;
+  color: #789389;
+  font: 10px "IBM Plex Mono";
+  white-space: nowrap;
+}
+.settingslegend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.settingslegend i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #789389;
+}
+.settingslegend i.live {
+  background: #45dda5;
+  box-shadow: 0 0 7px rgba(69, 221, 165, 0.6);
+}
+.settingslegend i.newrun {
+  background: #68b8ff;
+}
+.settingslegend i.locked {
+  background: #efb344;
+}
+.settingsgroup {
+  padding-top: 24px;
+  margin-top: 24px;
+  border-top: 1px solid #1c382f;
+}
+.settingsgrouphead {
+  margin-bottom: 17px;
+}
+.settingsgrouphead > div {
+  display: grid;
+  gap: 9px;
+  min-width: 230px;
+}
+.settingsgrouphead h3 {
+  margin: 0;
+  color: #d7ebe3;
+  font-size: 15px;
+}
+.settingsgrouphead p {
+  max-width: 650px;
+  margin: 2px 0 0;
+  color: #789389;
+  font-size: 12px;
+  line-height: 1.65;
+}
+.settingsscope,
+.settingsinlinebadge {
+  width: fit-content;
+  border: 1px solid #315448;
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: #0a1914;
+  color: #91aaa1;
+  font: 600 9px "IBM Plex Mono";
+  font-style: normal;
+  white-space: nowrap;
+}
+.settingsscope.live,
+.settingsinlinebadge.live {
+  border-color: #2c765b;
+  background: #0b2119;
+  color: #58e8af;
+}
+.settingsscope.newrun {
+  border-color: #315f82;
+  background: #0b1b27;
+  color: #78c4ff;
+}
+.settingsscope.locked {
+  border-color: #70552d;
+  background: #21190c;
+  color: #efb95a;
+}
+.settingsscope.operation {
+  flex: 0 0 auto;
+}
+.settingssavebar {
+  align-items: center;
+  padding-top: 24px;
+  margin-top: 24px;
+  border-top: 1px solid #1c382f;
+}
+.settingssavebar p {
+  margin: 0;
+  color: #789389;
+  font-size: 12px;
+}
+.settingssavebar button {
+  width: auto;
+  min-width: 132px;
+}
+.dockerpanelhead {
+  margin-bottom: 20px;
+}
+.settingtogglecopy {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+.settingsinlinebadge {
+  display: inline-block;
+  padding: 3px 6px;
+  font-size: 8px;
+}
 .voicesettings {
   display: flex;
   align-items: center;
@@ -586,6 +723,11 @@ select {
   margin: 22px 0;
   color: #91aaa1;
   font-size: 12px;
+}
+.toggles label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 .toggles input,
 .tasks input,
@@ -1346,6 +1488,21 @@ select {
   .voicesettings {
     align-items: flex-start;
     flex-direction: column;
+  }
+  .settingspanelhead,
+  .settingsgrouphead,
+  .dockerpanelhead,
+  .settingssavebar {
+    flex-direction: column;
+  }
+  .settingslegend {
+    justify-content: flex-start;
+  }
+  .settingsgrouphead > div {
+    min-width: 0;
+  }
+  .settingssavebar button {
+    width: 100%;
   }
   .panelhead {
     flex-wrap: wrap;

@@ -55,6 +55,11 @@ class SettingsUpdate(BaseModel):
     run_budget_usd: float | None = Field(None, ge=0, le=10000)
     trial_budget_usd: float | None = Field(None, ge=0, le=1000)
 
+class ProviderPreviewRequest(BaseModel):
+    credential_file: str = Field(min_length=1, max_length=1000)
+    default_model: str = Field(min_length=1, max_length=100)
+    default_effort: Effort
+
 class BaselineDraft(BaseModel):
     name: str | None = Field(None, max_length=160)
 

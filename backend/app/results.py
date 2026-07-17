@@ -30,6 +30,26 @@ LIVE_TELEMETRY_FIELDS = (
     "infrastructure_retries_max", "infrastructure_retries_remaining",
     "infrastructure_retry_state",
 )
+SUCCESSFUL_PIER_HINT_ERROR = re.compile(
+    r"^重试失败：Pier:\s+(?:[A-Za-z]:\\|/).+`$"
+)
+
+def retry_incomplete_error(aggregate: dict) -> str | None:
+    parts = []
+    if aggregate.get("effective_errored"):
+        parts.append(f"{aggregate['effective_errored']} 个 Trial 仍为执行错误")
+    if aggregate.get("missing_configured"):
+        parts.append(f"{aggregate['missing_configured']} 个配置 Trial 尚无结果")
+    if not parts:
+        return None
+    return "重试已完成，但 Run 仍未完整：" + "，".join(parts)
+
+def effective_run_error(run: Run, aggregate: dict | None = None) -> str | None:
+    """Replace the historical successful-Pier-log error with the real Run state."""
+    error = run.error
+    if not isinstance(error, str) or not SUCCESSFUL_PIER_HINT_ERROR.match(error):
+        return error
+    return retry_incomplete_error(aggregate or aggregate_trial_results(run)) or error
 
 def run_code(run_id: int) -> str:
     return f"RUN-{run_id:06d}"
@@ -719,7 +739,7 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
         "output_tokens": output_tokens, "reported_cost_usd": reported_cost,
         "estimated_cost_usd": estimate_cost(input_tokens, cached_tokens, output_tokens, run.service_tier, run.model),
         "pricing": _pricing_details(run.model),
-        "error": run.error, "progress": {"completed": completed, "total": total, "passed": passed, "percent": round(completed / total * 100) if total else 0},
+        "error": effective_run_error(run), "progress": {"completed": completed, "total": total, "passed": passed, "percent": round(completed / total * 100) if total else 0},
         "task_progress": {"passed": passed_tasks, "total": len(remaining_tasks)},
         "deleted_trials": len(deleted_entries),
         "job_stats": {key: stats.get(key) for key in ("n_completed_trials", "n_errored_trials", "n_running_trials", "n_pending_trials", "n_cancelled_trials", "n_retries")},

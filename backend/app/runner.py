@@ -30,9 +30,10 @@ from .pier_retry_patch.transient import (
     is_context_limit_failure,
 )
 from .results import (
-    _json as read_json, aggregate_trial_results, estimate_cost, jobs_root_for,
-    pier_trial_prefix, run_code, run_detail as parsed_run_detail,
-    run_task_progress, run_trial_progress, trial_folder,
+    _json as read_json, aggregate_trial_results, effective_run_error,
+    estimate_cost, jobs_root_for, pier_trial_prefix, retry_incomplete_error,
+    run_code, run_detail as parsed_run_detail, run_task_progress,
+    run_trial_progress, trial_folder,
 )
 from .scheduler import (
     clear_run_queue, enqueue_retry_trials, enqueue_runs, queue_admission,
@@ -48,6 +49,7 @@ _lock = threading.Lock()
 _creation_lock = threading.Lock()
 _queue_patch_verify_lock = threading.Lock()
 _queue_patch_verified = False
+_task_image_pull_lock = threading.Lock()
 # 取消与结果落库都要做「读状态→写状态」，用同一把锁避免最后写者赢
 _state_lock = threading.Lock()
 
@@ -66,6 +68,8 @@ RUNAWAY_SUBAGENT_FILES = 60     # 禁用 Task/Agent 工具后应恒为 0；事�
 INFRASTRUCTURE_RETRY_DELAYS_SEC = (5, 30, 120, 300, 600, 900)
 DOCKER_CONNECTIVITY_IMAGE = "alpine:3.20"
 DOCKER_CONNECTIVITY_TIMEOUT_SEC = 8
+TASK_IMAGE_PULL_DELAYS_SEC = (5, 15, 30, 60)
+TASK_IMAGE_PULL_TIMEOUT_SEC = 900
 ATOMIC_REPLACE_RETRY_DELAYS_SEC = (0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.8, 1.0)
 
 def _pier_retry_args(enabled: bool, max_retries: int) -> list[str]:
@@ -76,6 +80,26 @@ def _pier_retry_args(enabled: bool, max_retries: int) -> list[str]:
         "--max-retries", str(max_retries),
         "--retry-include", "TransientAgentInfrastructureError",
     ]
+
+def _bind_run_credential(run: Run):
+    """Load and freeze the Provider identity assigned when the Run was created."""
+    path = Path(run.credential_file) if run.credential_file else credential_path()
+    credential = read_credential(path)
+    if run.provider_url and run.provider_url != credential.url:
+        raise RuntimeError(
+            f"Run 凭据文件中的 Provider URL 已变化：{path}；为避免切换 Provider，拒绝继续"
+        )
+    if (
+        run.credential_fingerprint
+        and run.credential_fingerprint != credential.fingerprint
+    ):
+        raise RuntimeError(
+            f"Run 凭据文件中的 Token 已变化：{path}；为避免切换账号，拒绝继续"
+        )
+    run.credential_file = str(path)
+    run.provider_url = credential.url
+    run.credential_fingerprint = credential.fingerprint
+    return credential
 
 def _docker_url(url: str) -> str:
     parsed = urlparse(url)
@@ -258,7 +282,9 @@ def create_runs_with_admission(draft: RunBatchDraft) -> tuple[list[Run], dict]:
                 mapping = _reasoning_effort_adapter(agent, draft.reasoning_effort)
                 run = Run(
                     status="queued", job_name=f"pending-{uuid.uuid4().hex}",
-                    jobs_dir=str(preferences["jobs_dir"]), agent=agent, model=draft.model,
+                    jobs_dir=str(preferences["jobs_dir"]),
+                    credential_file=str(preferences["credential_file"]),
+                    agent=agent, model=draft.model,
                     reasoning_effort=draft.reasoning_effort, reasoning_effort_adapter=mapping,
                     reasoning_effort_effective=None,  # 有效值只能来自运行后的观测，创建时未知
                     tasks_json=json.dumps(draft.tasks), attempts_per_task=draft.attempts_per_task,
@@ -319,6 +345,83 @@ def _crlf_scripts(tasks: list[str]) -> list[str]:
                 continue
     return bad
 
+
+def _declared_task_images(tasks: list[str]) -> list[str]:
+    """Return registry-backed base images needed before Pier starts trials."""
+    images = []
+    for task in tasks:
+        path = settings.tasks_dir / task / "task.toml"
+        try:
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            raise RuntimeError(f"无法读取任务配置 {task}: {exc}") from exc
+        image = (data.get("environment") or {}).get("docker_image")
+        if (
+            isinstance(image, str)
+            and image.strip()
+            and not image.strip().endswith(":local")
+        ):
+            images.append(image.strip())
+    return list(dict.fromkeys(images))
+
+
+def _docker_image_is_local(docker: str, image: str) -> bool:
+    try:
+        result = subprocess.run(
+            [docker, "image", "inspect", image],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def _ensure_task_base_images(tasks: list[str]) -> None:
+    """Hydrate missing task images once, without spending Pier trial retries.
+
+    Pier builds several trial images concurrently.  When a shared base image is
+    absent, that fans one registry outage into one failed environment setup per
+    trial.  Pull missing bases serially here so a transient registry EOF is
+    retried before any trial directory or retry budget is consumed.
+    """
+    images = _declared_task_images(tasks)
+    if not images:
+        return
+    docker = shutil.which("docker") or "docker"
+    with _task_image_pull_lock:
+        for image in images:
+            if _docker_image_is_local(docker, image):
+                continue
+            last_error = "Docker pull failed"
+            for attempt in range(len(TASK_IMAGE_PULL_DELAYS_SEC) + 1):
+                try:
+                    result = subprocess.run(
+                        [docker, "pull", image],
+                        capture_output=True,
+                        text=True,
+                        timeout=TASK_IMAGE_PULL_TIMEOUT_SEC,
+                    )
+                    if result.returncode == 0 and _docker_image_is_local(docker, image):
+                        break
+                    output = (result.stderr or result.stdout or "").strip()
+                    last_error = output.splitlines()[-1][:1000] if output else (
+                        f"docker pull exited with code {result.returncode}"
+                    )
+                except subprocess.TimeoutExpired:
+                    last_error = (
+                        f"docker pull 超过 {TASK_IMAGE_PULL_TIMEOUT_SEC} 秒"
+                    )
+                except OSError as exc:
+                    last_error = f"无法启动 Docker pull: {exc}"
+
+                if attempt == len(TASK_IMAGE_PULL_DELAYS_SEC):
+                    raise RuntimeError(
+                        f"任务基础镜像拉取失败 {image}: {last_error}"
+                    )
+                time.sleep(TASK_IMAGE_PULL_DELAYS_SEC[attempt])
+
 def _preflight(tasks: list[str], proxy_url: str | None = None) -> None:
     missing = [task for task in tasks if not (settings.tasks_dir / task).is_dir()]
     if missing:
@@ -333,6 +436,7 @@ def _preflight(tasks: list[str], proxy_url: str | None = None) -> None:
         raise RuntimeError(f"Docker 不可用: {message}")
     if proxy_url:
         _docker_proxy_connectivity(proxy_url)
+    _ensure_task_base_images(tasks)
     ensure_local_task_images(
         settings.tasks_dir,
         tasks,
@@ -398,7 +502,12 @@ def _network_failure_summary(text: str) -> str | None:
                 return message
     return None
 
-def _run_failure_summary(job_dir: Path, supervisor_log: Path | None = None) -> str | None:
+def _run_failure_summary(
+    job_dir: Path,
+    supervisor_log: Path | None = None,
+    *,
+    include_pier_fallback: bool = True,
+) -> str | None:
     """Extract an actionable failure instead of exposing only Pier's exit code."""
     if job_dir.is_dir():
         final_failures = []
@@ -464,7 +573,7 @@ def _run_failure_summary(job_dir: Path, supervisor_log: Path | None = None) -> s
         if summary:
             return summary
         lines = [line.strip() for line in text.splitlines() if line.strip()]
-        if lines:
+        if lines and include_pier_fallback:
             return f"Pier: {lines[-1][:3500]}"
     return None
 
@@ -688,12 +797,13 @@ def _execute(run_id: int):
     jobs_root = None
     try:
         with SessionLocal() as db:
-            run = db.get(Run, run_id); run.status = "preflight"; run.pier_version = _pier_version(); db.commit()
+            run = db.get(Run, run_id); run.status = "preflight"; run.pier_version = _pier_version()
+            cred = _bind_run_credential(run)
+            db.commit()
             tasks, agent, model, effort, attempts, concurrency, job_name = json.loads(run.tasks_json), run.agent, run.model, run.reasoning_effort, run.attempts_per_task, run.concurrency, run.job_name
             service_tier = run.service_tier
             jobs_root = jobs_root_for(run)
         _verify_global_queue_patch(run_id)
-        cred = read_credential(credential_path())
         _preflight(tasks, _provider_proxy_url())
         secret_dir, auth = _write_secret_auth(cred.token)
         command_model = f"openai/{model}" if agent == "mini-swe-agent" and "/" not in model else model
@@ -1471,23 +1581,21 @@ def _sync_retry_result(
             and not aggregate["effective_errored"]
             and not aggregate["missing_configured"]
         )
+        incomplete_error = retry_incomplete_error(aggregate)
         if run.status not in TERMINAL_STATES:
             run.status = "completed" if success else "failed"
             if success:
                 run.error = None
+            elif batch_succeeded and incomplete_error:
+                run.error = incomplete_error
             elif failure_summary:
                 run.error = redact(f"重试失败：{failure_summary}", current_secrets())[:4000]
             elif returncode != 0:
                 run.error = f"重试 Pier 进程退出码 {returncode}"
             elif stats.get("n_errored_trials"):
                 run.error = f"重试中有 {stats.get('n_errored_trials')} 个 Trial 执行失败"
-            elif aggregate["effective_errored"] or aggregate["missing_configured"]:
-                parts = []
-                if aggregate["effective_errored"]:
-                    parts.append(f"{aggregate['effective_errored']} 个 Trial 仍为执行错误")
-                if aggregate["missing_configured"]:
-                    parts.append(f"{aggregate['missing_configured']} 个配置 Trial 尚无结果")
-                run.error = "重试已完成，但 Run 仍未完整：" + "，".join(parts)
+            elif incomplete_error:
+                run.error = incomplete_error
             else:
                 run.error = "重试未产生可合并的 Trial 结果"
         run.pid = None
@@ -1516,6 +1624,7 @@ def _execute_retry(run_id: int, specs: list[dict], batch_id: str) -> None:
             run.agent_max_steps = int(preferences["agent_max_steps"])
             run.status = "preflight"
             run.pid = None
+            credential = _bind_run_credential(run)
             db.commit()
             db.refresh(run)
             jobs_root = jobs_root_for(run)
@@ -1559,7 +1668,6 @@ def _execute_retry(run_id: int, specs: list[dict], batch_id: str) -> None:
                 f"保留 Trial 的累计费用 ${base_cost_usd:.2f} 已达到 Run 预算上限 ${run_budget:.2f}"
             )
 
-        credential = read_credential(credential_path())
         _preflight(list(dict.fromkeys(spec["task"] for spec in specs)), _provider_proxy_url())
         secret_dir, auth_path = _write_secret_auth(credential.token)
         config_path, process_env = _prepare_retry_config(
@@ -1615,7 +1723,11 @@ def _execute_retry(run_id: int, specs: list[dict], batch_id: str) -> None:
                     db.commit()
 
         retry_result = read_json(retry_dir / "result.json")
-        failure_summary = _run_failure_summary(retry_dir, supervisor_log)
+        failure_summary = _run_failure_summary(
+            retry_dir,
+            supervisor_log,
+            include_pier_fallback=proc.returncode != 0,
+        )
         if preferences.get("docker_cleanup_after_run", True):
             try:
                 cleanup_job_resources(
@@ -2035,7 +2147,7 @@ def shutdown_processes() -> None:
 def serialize(run: Run) -> dict:
     progress = run_trial_progress(run)
     queue = queue_status(run.id)
-    return {"id":run.id,"run_code":run_code(run.id),"job_name":run.job_name,"status":run.status,"agent":run.agent,"model":run.model,"reasoning_effort":run.reasoning_effort,"reasoning_effort_adapter":run.reasoning_effort_adapter,"reasoning_effort_effective":run.reasoning_effort_effective,"pier_version":run.pier_version,"tasks":json.loads(run.tasks_json),"attempts_per_task":run.attempts_per_task,"concurrency":run.concurrency,"queue":queue,"agent_timeout_seconds":run.agent_timeout_seconds,"verifier_timeout_seconds":run.verifier_timeout_seconds,"retry_infrastructure_errors":run.retry_infrastructure_errors,"infrastructure_max_retries":run.infrastructure_max_retries,"agent_max_steps":run.agent_max_steps,"codex_request_max_retries":run.codex_request_max_retries,"codex_stream_max_retries":run.codex_stream_max_retries,"codex_stream_idle_timeout_seconds":run.codex_stream_idle_timeout_seconds,"created_at":run.created_at,"finished_at":run.finished_at,"passed":run.passed,"reward":run.reward,"progress":progress,"task_progress":run_task_progress(run),"input_tokens":run.input_tokens,"cached_tokens":run.cached_tokens,"uncached_input_tokens":max((run.input_tokens or 0)-(run.cached_tokens or 0),0),"output_tokens":run.output_tokens,"cost_usd":run.cost_usd,"reported_cost_usd":run.cost_usd,"estimated_cost_usd":estimate_cost(run.input_tokens,run.cached_tokens,run.output_tokens,run.service_tier,run.model),"service_tier":run.service_tier,"error":run.error}
+    return {"id":run.id,"run_code":run_code(run.id),"job_name":run.job_name,"status":run.status,"agent":run.agent,"model":run.model,"reasoning_effort":run.reasoning_effort,"reasoning_effort_adapter":run.reasoning_effort_adapter,"reasoning_effort_effective":run.reasoning_effort_effective,"pier_version":run.pier_version,"tasks":json.loads(run.tasks_json),"attempts_per_task":run.attempts_per_task,"concurrency":run.concurrency,"queue":queue,"agent_timeout_seconds":run.agent_timeout_seconds,"verifier_timeout_seconds":run.verifier_timeout_seconds,"retry_infrastructure_errors":run.retry_infrastructure_errors,"infrastructure_max_retries":run.infrastructure_max_retries,"agent_max_steps":run.agent_max_steps,"codex_request_max_retries":run.codex_request_max_retries,"codex_stream_max_retries":run.codex_stream_max_retries,"codex_stream_idle_timeout_seconds":run.codex_stream_idle_timeout_seconds,"created_at":run.created_at,"finished_at":run.finished_at,"passed":run.passed,"reward":run.reward,"progress":progress,"task_progress":run_task_progress(run),"input_tokens":run.input_tokens,"cached_tokens":run.cached_tokens,"uncached_input_tokens":max((run.input_tokens or 0)-(run.cached_tokens or 0),0),"output_tokens":run.output_tokens,"cost_usd":run.cost_usd,"reported_cost_usd":run.cost_usd,"estimated_cost_usd":estimate_cost(run.input_tokens,run.cached_tokens,run.output_tokens,run.service_tier,run.model),"service_tier":run.service_tier,"error":effective_run_error(run)}
 
 def list_runs() -> list[dict]:
     with SessionLocal() as db: return [serialize(r) for r in db.scalars(select(Run).order_by(Run.id.desc())).all()]

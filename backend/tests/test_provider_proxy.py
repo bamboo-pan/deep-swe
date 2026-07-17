@@ -1,5 +1,6 @@
 import asyncio
 import json
+import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -7,7 +8,8 @@ from starlette.requests import Request
 
 from app import provider_proxy
 from app.database import SessionLocal, init_db
-from app.models import Setting
+from app.models import Run, Setting
+from app.security import token_fingerprint
 from app.provider_proxy import (
     REQUEST_SCHEDULE_KEY, RUN_ID_HEADER, TRIAL_ID_HEADER,
     _ProviderConcurrencyLimiter, _reset_provider_telemetry, _target_url,
@@ -24,6 +26,62 @@ def test_target_url_handles_openai_and_anthropic_paths():
     assert _target_url("http://provider.example/v1", "v1/messages", "beta=1") == (
         "http://provider.example/v1/messages?beta=1"
     )
+
+
+def test_provider_proxy_keeps_run_provider_after_global_credential_switch(monkeypatch):
+    init_db()
+    with SessionLocal() as db:
+        run = Run(
+            status="running",
+            job_name=f"provider-snapshot-{uuid.uuid4().hex}",
+            agent="codex",
+            model="model-a",
+            reasoning_effort="high",
+            tasks_json='["task-a"]',
+            provider_url="https://provider-a.example/v1",
+            credential_fingerprint=token_fingerprint("token-a"),
+        )
+        db.add(run)
+        db.commit()
+        db.refresh(run)
+        run_id = run.id
+
+    monkeypatch.setattr(
+        provider_proxy,
+        "read_credential",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("Run-scoped request must not read global credentials")
+        ),
+    )
+    request = Request({
+        "type": "http",
+        "headers": [
+            (b"authorization", b"Bearer token-a"),
+            (RUN_ID_HEADER.encode(), str(run_id).encode()),
+            (TRIAL_ID_HEADER.encode(), b"task-a__one"),
+        ],
+    })
+    try:
+        credential = provider_proxy._provider_credential(request)
+        assert credential.url == "https://provider-a.example/v1"
+        assert credential.token == "token-a"
+
+        switched_request = Request({
+            "type": "http",
+            "headers": [
+                (b"authorization", b"Bearer token-b"),
+                (RUN_ID_HEADER.encode(), str(run_id).encode()),
+            ],
+        })
+        with pytest.raises(provider_proxy.HTTPException) as exc:
+            provider_proxy._provider_credential(switched_request)
+        assert exc.value.status_code == 401
+    finally:
+        with SessionLocal() as db:
+            saved = db.get(Run, run_id)
+            if saved:
+                db.delete(saved)
+                db.commit()
 
 
 def test_provider_rpm_reserves_every_http_request():

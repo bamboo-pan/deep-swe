@@ -26,6 +26,9 @@ RUN_COLUMNS = {
     "verification": "BOOLEAN NOT NULL DEFAULT 1",
     "service_tier": "VARCHAR(20) NOT NULL DEFAULT 'standard'",
     "jobs_dir": "VARCHAR(500)",
+    "credential_file": "VARCHAR(500)",
+    "provider_url": "VARCHAR(1000)",
+    "credential_fingerprint": "VARCHAR(20)",
     "pier_version": "VARCHAR(60)",
     "deleted_trials_json": "TEXT NOT NULL DEFAULT '[]'",
 }

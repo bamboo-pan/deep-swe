@@ -4,6 +4,7 @@ import copy
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -194,10 +195,12 @@ def get_provider_catalog(
     default_effort: str,
     *,
     force_refresh: bool = False,
+    credential_file: str | Path | None = None,
 ) -> dict[str, Any]:
     fallback_effort = default_effort if default_effort in _EFFORT_SET else "medium"
     try:
-        credential = read_credential(credential_path())
+        path = Path(credential_file) if credential_file is not None else credential_path()
+        credential = read_credential(path)
         catalog = _cached_provider_catalog(credential, force_refresh=force_refresh)
     except Exception as exc:
         return {

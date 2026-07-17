@@ -3,7 +3,7 @@ from pathlib import Path
 from sqlalchemy import select
 from .config import settings
 from .database import SessionLocal
-from .models import Setting
+from .models import ACTIVE_STATES, Run, Setting
 from .schemas import MAX_PARALLEL_AGENT_COUNT, MAX_PARALLEL_TASKS, SettingsUpdate
 from .security import read_credential
 
@@ -97,8 +97,26 @@ def jobs_path() -> Path:
     return Path(get_preferences()["jobs_dir"])
 
 def current_secrets() -> list[str]:
-    """当前凭据 Token，供 redact() 做精确脱敏；读取失败时退回仅正则兜底。"""
+    """当前与活跃 Run 的 Token，仅用于日志精确脱敏。"""
+    paths = set()
     try:
-        return [read_credential(credential_path()).token]
+        paths.add(credential_path())
     except Exception:
-        return []
+        pass
+    try:
+        with SessionLocal() as db:
+            active_paths = db.scalars(
+                select(Run.credential_file).where(Run.status.in_(ACTIVE_STATES))
+            ).all()
+        paths.update(Path(path) for path in active_paths if path)
+    except Exception:
+        pass
+    secrets = []
+    for path in paths:
+        try:
+            token = read_credential(path).token
+        except Exception:
+            continue
+        if token not in secrets:
+            secrets.append(token)
+    return secrets

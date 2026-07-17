@@ -49,7 +49,8 @@ from .scheduler import (
 )
 from .schemas import (
     BaselineDraft, CompareAnalysisRequest, CompareRequest, DockerCleanupRequest,
-    RestorePayload, RetryTrialsDraft, RunBatchDraft, RunDraft, SettingsUpdate,
+    ProviderPreviewRequest, RestorePayload, RetryTrialsDraft, RunBatchDraft,
+    RunDraft, SettingsUpdate,
     concurrency_advice,
 )
 from .security import is_safe_job_name, read_credential
@@ -70,16 +71,27 @@ app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http
 @app.get("/api/health")
 def health(): return {"status": "ok", "version": app.version}
 
-def _provider_bootstrap(preferences: dict, *, force_refresh: bool = False) -> dict:
+def _provider_bootstrap(
+    preferences: dict,
+    *,
+    force_refresh: bool = False,
+    credential_file: str | Path | None = None,
+) -> dict:
+    catalog_kwargs = {"force_refresh": force_refresh}
+    if credential_file is not None:
+        catalog_kwargs["credential_file"] = credential_file
     catalog = get_provider_catalog(
         preferences["default_model"],
         preferences["default_effort"],
-        force_refresh=force_refresh,
+        **catalog_kwargs,
     )
     model_entries = catalog["models"]
     model_ids = [entry["id"] for entry in model_entries]
     default_model = preferences["default_model"] if preferences["default_model"] in model_ids else model_ids[0]
     model_efforts = {entry["id"]: entry["reasoning_efforts"] for entry in model_entries}
+    model_efforts_known = {
+        entry["id"]: entry["reasoning_efforts_known"] for entry in model_entries
+    }
     model_defaults = {
         entry["id"]: entry["default_reasoning_effort"] or entry["reasoning_efforts"][0]
         for entry in model_entries
@@ -95,6 +107,7 @@ def _provider_bootstrap(preferences: dict, *, force_refresh: bool = False) -> di
     return {
         "models": model_ids,
         "model_efforts": model_efforts,
+        "model_efforts_known": model_efforts_known,
         "model_defaults": model_defaults,
         "efforts": [effort for effort in EFFORT_ORDER if effort in available_efforts],
         "default_model": default_model,
@@ -156,6 +169,7 @@ def bootstrap():
         "agents": ["mini-swe-agent", "codex", "claude-code"],
         "models": provider["models"],
         "model_efforts": provider["model_efforts"],
+        "model_efforts_known": provider["model_efforts_known"],
         "model_defaults": provider["model_defaults"],
         "efforts": provider["efforts"],
         "provider_catalog": provider["provider_catalog"],
@@ -629,6 +643,20 @@ def refresh_pricing():
 
 @app.get("/api/settings")
 def read_settings(): return get_preferences()
+
+@app.post("/api/settings/provider-preview")
+def preview_provider(payload: ProviderPreviewRequest):
+    preferences = {
+        **get_preferences(),
+        "credential_file": payload.credential_file,
+        "default_model": payload.default_model,
+        "default_effort": payload.default_effort,
+    }
+    return _provider_bootstrap(
+        preferences,
+        force_refresh=True,
+        credential_file=payload.credential_file,
+    )
 
 @app.put("/api/settings")
 def save_settings(payload: SettingsUpdate):

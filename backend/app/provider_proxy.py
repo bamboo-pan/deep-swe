@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import re
@@ -17,9 +18,11 @@ import httpx
 from fastapi import HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
+from .database import SessionLocal
+from .models import Run
 from .preferences import credential_path, get_preferences
 from .scheduler import queue_database_path
-from .security import read_credential
+from .security import Credential, read_credential, token_fingerprint
 
 logger = logging.getLogger(__name__)
 REQUEST_SCHEDULE_KEY = "_provider_rpm_request_schedule"
@@ -302,6 +305,39 @@ def _authorized(request: Request, token: str) -> bool:
     return bearer == f"Bearer {token}" or api_key == token
 
 
+def _request_token(request: Request) -> str:
+    bearer = request.headers.get("authorization", "")
+    if bearer.startswith("Bearer "):
+        return bearer.removeprefix("Bearer ")
+    return request.headers.get("x-api-key", "")
+
+
+def _provider_credential(request: Request) -> Credential:
+    """Resolve a Run's immutable Provider before falling back to current settings."""
+    raw_run_id = request.headers.get(RUN_ID_HEADER)
+    if raw_run_id:
+        try:
+            run_id = int(raw_run_id)
+        except ValueError:
+            run_id = 0
+        if run_id > 0:
+            with SessionLocal() as db:
+                run = db.get(Run, run_id)
+                if run and run.provider_url and run.credential_fingerprint:
+                    token = _request_token(request)
+                    if not token or not hmac.compare_digest(
+                        token_fingerprint(token), run.credential_fingerprint
+                    ):
+                        raise HTTPException(401, "Invalid provider proxy credential")
+                    return Credential(
+                        run.provider_url, token, run.credential_fingerprint
+                    )
+    credential = read_credential(credential_path())
+    if not _authorized(request, credential.token):
+        raise HTTPException(401, "Invalid provider proxy credential")
+    return credential
+
+
 def record_limit_event(status_code: int, body: bytes) -> None:
     text = body.decode("utf-8", errors="replace")
     match = COOLDOWN_RE.search(text)
@@ -414,9 +450,7 @@ def provider_queue_status(now: float | None = None) -> dict:
 
 
 async def forward_provider_request(request: Request, path: str):
-    credential = read_credential(credential_path())
-    if not _authorized(request, credential.token):
-        raise HTTPException(401, "Invalid provider proxy credential")
+    credential = _provider_credential(request)
     body = await request.body()
     headers = {
         key: value for key, value in request.headers.items()

@@ -146,6 +146,47 @@ def test_bootstrap_uses_provider_model_efforts_and_validates_selection(monkeypat
     assert invalid.status_code == 422
     assert "支持：low, medium, high" in invalid.json()["detail"]
 
+
+def test_provider_preview_forces_catalog_refresh_for_selected_file(monkeypatch):
+    from app import main
+
+    captured = {}
+
+    def fake_bootstrap(preferences, *, force_refresh=False, credential_file=None):
+        captured.update({
+            "preferences": preferences,
+            "force_refresh": force_refresh,
+            "credential_file": credential_file,
+        })
+        return {
+            "models": ["model-b"],
+            "model_efforts": {"model-b": ["low", "high"]},
+            "model_efforts_known": {"model-b": True},
+            "model_defaults": {"model-b": "high"},
+            "efforts": ["low", "high"],
+            "default_model": "model-b",
+            "default_effort": "high",
+            "provider_catalog": {
+                "source": "provider",
+                "models_authoritative": True,
+                "error": None,
+            },
+        }
+
+    monkeypatch.setattr(main, "_provider_bootstrap", fake_bootstrap)
+    with TestClient(app) as client:
+        response = client.post("/api/settings/provider-preview", json={
+            "credential_file": r"C:\credentials\provider-b.txt",
+            "default_model": "model-a",
+            "default_effort": "low",
+        })
+
+    assert response.status_code == 200
+    assert response.json()["models"] == ["model-b"]
+    assert captured["force_refresh"] is True
+    assert captured["credential_file"] == r"C:\credentials\provider-b.txt"
+    assert captured["preferences"]["default_model"] == "model-a"
+
 def test_task_catalog_has_stable_management_numbers():
     with TestClient(app) as client:
         tasks = client.get("/api/tasks").json()

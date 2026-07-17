@@ -93,6 +93,39 @@ def test_sync_does_not_override_cancelled(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(runner.settings,"jobs_dir",tmp_path); runner._sync_result(run_id,0)
     assert runner.get_run(run_id)["status"]=="cancelled"
 
+def test_sync_retry_success_reports_remaining_run_error(tmp_path: Path):
+    task = "actionlint-action-pinning-lint"
+    job = "retry-sync-" + uuid.uuid4().hex
+    run_id = make_run(job, attempts_per_task=2)
+    write_result(tmp_path / job / f"{task}__failed", {
+        "task_name": task,
+        "exception_info": {"exception_type": "ContextLimitExceededError"},
+        "verifier_result": {"rewards": {"reward": 0}},
+    })
+    write_result(tmp_path / job / f"{task}__passed", {
+        "task_name": task,
+        "verifier_result": {"rewards": {"reward": 1}},
+    })
+    with SessionLocal() as db:
+        run = db.get(Run, run_id)
+        run.jobs_dir = str(tmp_path)
+        db.commit()
+
+    runner._sync_retry_result(
+        run_id,
+        returncode=0,
+        retry_result={"stats": {"n_errored_trials": 0}},
+        moved_count=1,
+        requested_count=1,
+        failure_summary="Pier: C:\\jobs`",
+    )
+
+    result = runner.get_run(run_id)
+    assert result["status"] == "failed"
+    assert result["error"] == (
+        "重试已完成，但 Run 仍未完整：1 个 Trial 仍为执行错误"
+    )
+
 def test_cancel_run_removes_queue_before_pier_process_starts(monkeypatch):
     init_db()
     monkeypatch.setattr(runner, "cleanup_job_resources", lambda *args, **kwargs: {})
@@ -292,6 +325,17 @@ def test_transient_agent_failure_classification_is_selective():
     assert is_transient_agent_failure("ConnectionError", "socket closed")
     assert is_transient_agent_failure(
         "NonZeroAgentExitCodeError", "APIConnectionError: unexpected EOF"
+    )
+    assert is_transient_agent_failure(
+        "NonZeroAgentExitCodeError",
+        'OpenAIException - {"error":{"message":"stream error: stream '
+        'disconnected before completion: stream closed before '
+        'response.completed","type":"invalid_request_error"}}',
+    )
+    assert is_transient_agent_failure(
+        "NonZeroAgentExitCodeError",
+        'OpenAIException - {"error":{"message":"upstream quota unavailable",'
+        '"type":"permission_error","code":"insufficient_quota"}}',
     )
     assert not is_transient_agent_failure(
         "NonZeroAgentExitCodeError", 'return nil, fmt.Errorf("unexpected EOF")'
@@ -567,6 +611,10 @@ def test_create_runs_queues_agent_group_larger_than_global_limit(monkeypatch):
         assert admission["immediate_trials"] == 2
         assert admission["queued_trials"] == 1
         assert [run.concurrency for run in runs] == [2, 2, 2]
+        assert all(
+            run.credential_file == current_preferences["credential_file"]
+            for run in runs
+        )
         with SessionLocal() as db:
             entries = db.scalars(select(TrialQueueEntry)).all()
             assert len(entries) == 3
@@ -578,6 +626,25 @@ def test_create_runs_queues_agent_group_larger_than_global_limit(monkeypatch):
                 if saved:
                     db.delete(saved)
             db.commit()
+
+
+def test_run_credential_binding_rejects_file_changes(tmp_path: Path):
+    path = tmp_path / "credential.txt"
+    path.write_text("https://provider-a.example/v1\ntoken-a\n", encoding="utf-8")
+    run = SimpleNamespace(
+        credential_file=str(path),
+        provider_url=None,
+        credential_fingerprint=None,
+    )
+
+    credential = runner._bind_run_credential(run)
+    assert credential.url == "https://provider-a.example/v1"
+    assert run.provider_url == credential.url
+    assert run.credential_fingerprint == credential.fingerprint
+
+    path.write_text("https://provider-a.example/v1\ntoken-b\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="Token 已变化"):
+        runner._bind_run_credential(run)
 
 def test_global_queue_releases_next_run_when_slot_opens():
     init_db()
@@ -723,6 +790,35 @@ def test_failure_summary_prefers_final_context_limit_over_job_network_log(tmp_pa
     summary = runner._run_failure_summary(tmp_path)
     assert summary == f"{CONTEXT_LIMIT_EXCEPTION_TYPE}: 模型输入超过上下文窗口"
 
+def test_failure_summary_ignores_successful_pier_hint_without_fallback(tmp_path: Path):
+    supervisor = tmp_path / "retry.supervisor.log"
+    supervisor.write_text(
+        "Job Info\nResults written to C:\\jobs\\retry\\result.json\n"
+        "Inspect results by running `pier view C:\\jobs`\n",
+        encoding="utf-8",
+    )
+
+    assert runner._run_failure_summary(
+        tmp_path,
+        supervisor,
+        include_pier_fallback=False,
+    ) is None
+    assert runner._run_failure_summary(tmp_path, supervisor) == "Pier: Inspect results by running `pier view C:\\jobs`"
+
+def test_effective_run_error_repairs_historical_successful_pier_hint():
+    run = SimpleNamespace(error="重试失败：Pier: C:\\jobs`")
+
+    assert results.effective_run_error(run, {
+        "effective_errored": 1,
+        "missing_configured": 0,
+    }) == "重试已完成，但 Run 仍未完整：1 个 Trial 仍为执行错误"
+
+    real_failure = SimpleNamespace(error="重试失败：Pier: worker process crashed")
+    assert results.effective_run_error(real_failure, {
+        "effective_errored": 1,
+        "missing_configured": 0,
+    }) == real_failure.error
+
 def test_official_regression_contains_baseline_values(monkeypatch):
     current={"trials":[{"task":"task-a","reward":1,"duration_seconds":80.0}]}
     monkeypatch.setattr(results, "load_official_stats", lambda:{"task-a":{
@@ -845,6 +941,7 @@ def test_preflight_rejects_crlf_scripts(tmp_path: Path, monkeypatch):
         assert "CRLF" in str(exc) and "t1/tests/test.sh" in str(exc)
     (scripts/"test.sh").write_bytes(b"#!/bin/bash\necho ok\n")
     monkeypatch.setattr(runner, "docker_available", lambda: (True, "ok"))
+    monkeypatch.setattr(runner, "_ensure_task_base_images", lambda tasks: None)
     runner._preflight(["t1"])
 
 def test_preflight_prepares_local_images_after_connectivity(tmp_path: Path, monkeypatch):
@@ -856,6 +953,9 @@ def test_preflight_prepares_local_images_after_connectivity(tmp_path: Path, monk
         runner, "_docker_proxy_connectivity", lambda url: calls.append(("proxy", url))
     )
     monkeypatch.setattr(
+        runner, "_ensure_task_base_images", lambda tasks: calls.append(("bases", tasks))
+    )
+    monkeypatch.setattr(
         runner,
         "ensure_local_task_images",
         lambda tasks_dir, tasks, **kwargs: calls.append(
@@ -864,12 +964,85 @@ def test_preflight_prepares_local_images_after_connectivity(tmp_path: Path, monk
     )
     runner._preflight(["t1"], "http://127.0.0.1:9887/v1")
     assert calls[0] == ("proxy", "http://127.0.0.1:9887/v1")
-    assert calls[1] == (
+    assert calls[1] == ("bases", ["t1"])
+    assert calls[2] == (
         "images",
         tmp_path,
         ["t1"],
         tmp_path.parent / "data" / "local-image-builds",
     )
+
+def test_declared_task_images_deduplicates_registry_images(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(runner.settings, "tasks_dir", tmp_path)
+    for task, image in (
+        ("t1", "registry.example/base:v1"),
+        ("t2", "registry.example/base:v1"),
+        ("t3", "deepswe-local:local"),
+    ):
+        folder = tmp_path / task
+        folder.mkdir()
+        (folder / "task.toml").write_text(
+            f'[environment]\ndocker_image = "{image}"\n', encoding="utf-8"
+        )
+
+    assert runner._declared_task_images(["t1", "t2", "t3"]) == [
+        "registry.example/base:v1"
+    ]
+
+def test_task_base_image_pull_retries_before_trials_start(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(runner.settings, "tasks_dir", tmp_path)
+    task = tmp_path / "t1"
+    task.mkdir()
+    image = "public.ecr.aws/example/task:v1"
+    (task / "task.toml").write_text(
+        f'[environment]\ndocker_image = "{image}"\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(runner.shutil, "which", lambda name: "docker.exe")
+    monkeypatch.setattr(runner, "TASK_IMAGE_PULL_DELAYS_SEC", (0,))
+    calls = []
+    inspect_count = 0
+    pull_count = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal inspect_count, pull_count
+        calls.append(command)
+        if command[1:3] == ["image", "inspect"]:
+            inspect_count += 1
+            return subprocess.CompletedProcess(
+                command, 0 if inspect_count >= 2 else 1, "", "missing"
+            )
+        if command[1] == "pull":
+            pull_count += 1
+            if pull_count == 1:
+                return subprocess.CompletedProcess(command, 1, "", "unexpected EOF")
+            return subprocess.CompletedProcess(command, 0, "pulled", "")
+        raise AssertionError(command)
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    runner._ensure_task_base_images(["t1"])
+
+    assert [command[1] for command in calls].count("pull") == 2
+    assert calls[-1][1:3] == ["image", "inspect"]
+
+def test_task_base_image_pull_reuses_local_image(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(runner.settings, "tasks_dir", tmp_path)
+    task = tmp_path / "t1"
+    task.mkdir()
+    image = "registry.example/base:v1"
+    (task / "task.toml").write_text(
+        f'[environment]\ndocker_image = "{image}"\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(runner.shutil, "which", lambda name: "docker.exe")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "[]", "")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    runner._ensure_task_base_images(["t1"])
+
+    assert calls == [["docker.exe", "image", "inspect", image]]
 
 def test_completed_trials_cost_prefers_reported_then_estimates(tmp_path: Path):
     t1=tmp_path/"task-a__x1"; t1.mkdir(parents=True)
