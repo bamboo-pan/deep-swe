@@ -61,6 +61,7 @@ _TRANSIENT_MARKERS = (
     "upstream connect error",
     "service unavailable",
     "server overloaded",
+    "selected model is at capacity",
     "ssl_error_syscall",
     "curl: (35)",
 )

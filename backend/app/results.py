@@ -91,6 +91,144 @@ def _agent_log_tail(folder: Path, max_bytes: int = 200_000) -> str:
             continue
     return "\n".join(chunks)
 
+
+CLAUDE_LOG_DISPLAY_LIMIT = 120_000
+CLAUDE_TOOL_OUTPUT_LIMIT = 8_000
+CLAUDE_HIDDEN_FIELDS = {
+    "context_management",
+    "encrypted_content",
+    "signature",
+    "thinking",
+    "thinking_tokens",
+    "usage",
+}
+
+
+def _hide_claude_fields(value):
+    if isinstance(value, dict):
+        return {
+            key: _hide_claude_fields(nested)
+            for key, nested in value.items()
+            if key not in CLAUDE_HIDDEN_FIELDS
+        }
+    if isinstance(value, list):
+        return [_hide_claude_fields(item) for item in value]
+    return value
+
+
+def _display_log_value(value, limit: int) -> str:
+    """Turn a stream value into bounded, human-readable text."""
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                nested = item.get("text")
+                if isinstance(nested, str):
+                    parts.append(nested)
+                else:
+                    nested = item.get("content")
+                    if nested is not None:
+                        parts.append(_display_log_value(nested, limit))
+        text = "\n".join(part for part in parts if part)
+    elif isinstance(value, dict):
+        safe_value = _hide_claude_fields(value)
+        try:
+            text = json.dumps(safe_value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = str(safe_value)
+    elif value is None:
+        text = ""
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = str(value)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n...[log output truncated]"
+
+
+def _format_claude_stream_log(raw: str) -> str | None:
+    """Hide Claude stream metadata while retaining useful agent activity."""
+    rendered = []
+    recognized = 0
+
+    def add(label: str, value, limit: int = CLAUDE_TOOL_OUTPUT_LIMIT) -> None:
+        text = _display_log_value(value, limit).strip()
+        if text:
+            rendered.append(f"{label}: {text}")
+
+    for line in raw.splitlines():
+        try:
+            event = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_type = event.get("type")
+        if event_type not in {"assistant", "user", "result", "system", "tool_result"}:
+            continue
+        recognized += 1
+
+        if event_type == "result":
+            add("[agent result]", event.get("result"), 4_000)
+            if event.get("is_error") and event.get("error"):
+                add("[agent error]", event.get("error"), 4_000)
+            continue
+
+        if event_type == "tool_result":
+            label = "[tool error]" if event.get("is_error") else "[tool result]"
+            add(label, event.get("content") or event.get("result"), CLAUDE_TOOL_OUTPUT_LIMIT)
+            continue
+
+        if event_type == "system":
+            # thinking_tokens and signatures are internal protocol metadata.
+            if event.get("subtype") not in {"thinking_tokens", "heartbeat"}:
+                add("[system]", event.get("message") or event.get("subtype"), 1_000)
+            continue
+
+        message = event.get("message") if isinstance(event.get("message"), dict) else event
+        content = message.get("content")
+        blocks = content if isinstance(content, list) else [content]
+        for block in blocks:
+            if isinstance(block, str):
+                if event_type == "assistant":
+                    add("[assistant]", block, 4_000)
+                continue
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "thinking":
+                continue
+            if block_type == "text":
+                if event_type == "assistant":
+                    add("[assistant]", block.get("text"), 4_000)
+                elif event_type == "user":
+                    add("[user]", block.get("text"), 2_000)
+                continue
+            if block_type == "tool_use":
+                payload = block.get("input")
+                command = payload.get("command") if isinstance(payload, dict) else None
+                if not command and isinstance(payload, dict):
+                    command = payload.get("cmd") or payload.get("description")
+                if not command:
+                    command = payload
+                add(f"[tool {block.get('name') or 'unknown'}]", command, 2_000)
+                continue
+            if block_type == "tool_result" or event_type == "tool_result":
+                label = "[tool error]" if block.get("is_error") else "[tool result]"
+                add(label, block.get("content"), CLAUDE_TOOL_OUTPUT_LIMIT)
+
+    if not recognized:
+        return None
+    if not rendered:
+        return "[internal model events hidden]"
+    return _display_log_value("\n".join(rendered), CLAUDE_LOG_DISPLAY_LIMIT)
+
 def _agent_hit_execution_limit(log_tail: str) -> bool:
     lines = [line.strip() for line in log_tail.splitlines()]
     return any(
@@ -532,7 +670,10 @@ def trial_log(run: Run, trial_id: str) -> str:
         if not path.exists():
             continue
         try:
-            chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+            content = path.read_text(encoding="utf-8", errors="replace")
+            if path.name == "claude-code.txt":
+                content = _format_claude_stream_log(content) or content
+            chunks.append(content)
         except OSError:
             continue
     return redact("\n\n".join(chunks), current_secrets())[-300000:]

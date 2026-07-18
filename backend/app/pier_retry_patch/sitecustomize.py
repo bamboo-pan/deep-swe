@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 
+from agent_install_reliability import patch_agent_install_spec
 from global_queue import release_slot, trial_task_name, try_acquire_slot
 from infrastructure_retry import write_retry_status
 from local_image_retention import preserve_local_prebuilt_image
@@ -24,6 +25,21 @@ from transient import (
     is_transient_agent_failure,
     retry_transient_verifier,
 )
+
+
+def _install_agent_install_reliability() -> None:
+    """Retry transient package-repository failures for CLI agents."""
+    try:
+        from pier.agents.installed.claude_code import ClaudeCode
+        from pier.agents.installed.codex import Codex
+    except ImportError:
+        return
+
+    for agent_class in (Codex, ClaudeCode):
+        patch_agent_install_spec(agent_class)
+
+
+_install_agent_install_reliability()
 
 
 def _install_mini_context_limit_patch() -> None:

@@ -314,6 +314,14 @@ def test_transient_agent_failure_classification_is_selective():
     )
     assert is_transient_agent_failure(
         "NonZeroAgentExitCodeError",
+        "Command failed (exit 1)",
+        agent_log_tail=(
+            '{"type":"turn.failed","error":{"message":'
+            '"Selected model is at capacity. Please try a different model."}}'
+        ),
+    )
+    assert is_transient_agent_failure(
+        "NonZeroAgentExitCodeError",
         "MaskedHTTPStatusError: Server error '522 Unassigned' for url "
         "'http://host.docker.internal:8765/api/provider/responses'",
     )
@@ -750,6 +758,19 @@ def test_trial_classifies_transient_error_from_agent_log_tail(tmp_path: Path):
     }})
     (folder/"agent"/"claude-code.txt").write_text(
         '{"type":"result","result":"API Error: The operation timed out."}',
+        encoding="utf-8",
+    )
+    assert results._trial(folder)["failure_type"] == "InfrastructureNetworkError"
+
+def test_trial_classifies_model_capacity_from_agent_log_tail(tmp_path: Path):
+    folder=tmp_path/"task-a__x"; (folder/"agent").mkdir(parents=True)
+    write_result(folder, {"task_name":"task-a","exception_info":{
+        "exception_type":"NonZeroAgentExitCodeError",
+        "exception_message":"Command failed (exit 1); stdout truncated",
+    }})
+    (folder/"agent"/"codex.txt").write_text(
+        '{"type":"turn.failed","error":{"message":'
+        '"Selected model is at capacity. Please try a different model."}}',
         encoding="utf-8",
     )
     assert results._trial(folder)["failure_type"] == "InfrastructureNetworkError"
@@ -1259,6 +1280,55 @@ def test_log_is_bounded_and_missing_run_is_safe(tmp_path: Path, monkeypatch):
     (tmp_path/f"{job}.supervisor.log").write_text("x"*210000,encoding="utf-8")
     assert len(runner.run_log(run_id))==200000
     assert runner.run_log(999999)==""
+
+def test_claude_stream_log_hides_internal_events_and_bounds_tool_output():
+    large_result = "x" * (results.CLAUDE_TOOL_OUTPUT_LIMIT + 100)
+    raw = "\n".join([
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "private reasoning", "signature": "gAAAA-secret", "encrypted_content": "hidden"},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "go test ./..."}},
+        ]}}),
+        json.dumps({"type": "user", "message": {"content": [
+            {"type": "tool_result", "content": large_result},
+        ]}}),
+        json.dumps({"type": "result", "subtype": "success", "result": "finished"}),
+        json.dumps({"type": "tool_result", "content": {"nested": {"signature": "also-hidden"}}}),
+    ])
+
+    rendered = results._format_claude_stream_log(raw)
+
+    assert rendered is not None
+    assert "go test ./..." in rendered
+    assert "finished" in rendered
+    assert "x" * results.CLAUDE_TOOL_OUTPUT_LIMIT in rendered
+    assert "x" * (results.CLAUDE_TOOL_OUTPUT_LIMIT + 1) not in rendered
+    assert "[log output truncated]" in rendered
+    assert "private reasoning" not in rendered
+    assert "gAAAA-secret" not in rendered
+    assert "signature" not in rendered and "encrypted_content" not in rendered
+    assert "also-hidden" not in rendered
+
+def test_claude_stream_log_falls_back_for_plain_text():
+    assert results._format_claude_stream_log("plain agent output\n") is None
+
+def test_trial_log_formats_claude_stream_file(tmp_path: Path):
+    job = "trial-log-" + uuid.uuid4().hex
+    run_id = make_run(job)
+    trial_id = "task-a__stream1"
+    folder = tmp_path / job / trial_id / "agent"
+    folder.mkdir(parents=True)
+    (folder / "claude-code.txt").write_text(json.dumps({
+        "type": "assistant",
+        "message": {"content": [{"type": "thinking", "thinking": "hidden"}, {
+            "type": "text", "text": "visible result",
+        }]},
+    }) + "\n", encoding="utf-8")
+    with SessionLocal() as db:
+        row = db.get(Run, run_id)
+        row.jobs_dir = str(tmp_path)
+        row.tasks_json = json.dumps(["task-a"])
+        db.commit()
+        assert results.trial_log(row, trial_id) == "[assistant]: visible result"
 
 def test_trial_detail_uses_full_task_name_from_config(tmp_path: Path):
     task = "ofetch-per-origin-circuit-breaker"

@@ -1076,9 +1076,12 @@ select {
   background: #06100d;
   border: 1px solid #183229;
   padding: 14px;
+  min-width: 0;
   max-height: 420px;
   overflow: auto;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   font: 11px/1.55 "IBM Plex Mono";
   color: #a7bdb5;
 }

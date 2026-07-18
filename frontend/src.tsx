@@ -409,6 +409,16 @@ const failureTypeLabels: Record<string, string> = {
 };
 const failureTypeLabel = (value: string | undefined) =>
   value ? failureTypeLabels[value] || value : undefined;
+const failureMessageBody = (type: string | undefined, message: string | undefined) => {
+  const label = failureTypeLabel(type);
+  if (!label || !message || message === label) return message;
+  for (const prefix of [`${label}：`, `${label}:`, `${label}（`, `${label}(`]) {
+    if (message.startsWith(prefix)) return message.slice(label.length);
+  }
+  return message;
+};
+const failureText = (type: string | undefined, message: string | undefined) =>
+  [failureTypeLabel(type), failureMessageBody(type, message)].filter(Boolean).join("：");
 const duration = (seconds: number | null | undefined) =>
   seconds == null
     ? "—"
@@ -2072,10 +2082,10 @@ function Results({
                     <Status value={t.status} reward={t.reward} />
                     <span
                       className={`failurecell ${t.failure_type || t.failure_message ? "hasfailure" : ""}`}
-                      title={[failureTypeLabel(t.failure_type), t.failure_message].filter(Boolean).join("：")}
+                      title={failureText(t.failure_type, t.failure_message)}
                     >
                       {t.failure_type && <b>{failureTypeLabel(t.failure_type)}</b>}
-                      <span>{t.failure_message || "—"}</span>
+                      <span>{failureMessageBody(t.failure_type, t.failure_message) || "—"}</span>
                     </span>
                     <span>{score(t.reward)}</span>
                     <span>
@@ -2127,7 +2137,7 @@ function TrialDetail({ trial, log }: { trial: Trial; log: string }) {
         <div className="trialfailure">
           <h3>失败原因</h3>
           <pre className="failure">
-            {[failureTypeLabel(trial.failure_type), trial.failure_message].filter(Boolean).join("：")}
+            {failureText(trial.failure_type, trial.failure_message)}
           </pre>
         </div>
       )}
