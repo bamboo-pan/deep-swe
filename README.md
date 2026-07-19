@@ -90,9 +90,14 @@ retries do not occupy active Provider connections.
 
 For new runs, the configurable mini-swe-agent/LiteLLM and Codex request retries
 are disabled to avoid multiplying the proxy retry count. Pier's whole-trial
-infrastructure retry remains a separate recovery layer. Responses are retried
-only before a successful stream is handed to the agent; an interrupted stream
-is not replayed because doing so could duplicate model output.
+infrastructure retry remains a separate recovery layer. A successful SSE stream
+is buffered by the proxy until its protocol terminal event is seen; if the
+stream ends early, the incomplete response is discarded and the original
+request is retried up to `provider_stream_max_retries` times (default: 3). The
+proxy emits SSE comments while buffering so Codex, Claude Code, and
+mini-swe-agent do not time out. Only the complete response is delivered to the
+agent, preventing duplicate tool calls; after stream retries are exhausted,
+Pier's whole-trial infrastructure retry takes over.
 
 The Live page shows RPM usage and queueing together with active Provider
 requests, concurrency waiters, and the configured retry policy. Provider `429`

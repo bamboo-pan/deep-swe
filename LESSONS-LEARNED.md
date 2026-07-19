@@ -273,6 +273,6 @@ $env:COMPOSE_BAKE = "false"
 - 槽位释放要放在嵌套 `finally` 中。即使 `upstream.aclose()` 或 `client.aclose()` 自身抛错，也必须释放活动请求计数；测试不能只覆盖正常流结束，还要覆盖等待取消和关闭异常。
 - 429 告警写入 SQLite 只是可观测性，必须 best-effort。告警记录失败只能写后端 warning，不能让本来可继续重试或已成功的模型请求变成 500。
 - 统一入口的语义必须明确：`provider_max_retries` 是“首次请求之外的重试次数”，固定间隔由 `provider_retry_interval_seconds` 控制；每次尝试重新计入 RPM，重试等待不占活动连接。
-- 请求代理只安全重试尚未交给 Agent 的建连失败或 HTTP 429/500/502/503/504。成功流已经开始后不能从头重放，否则 Agent 可能收到重复文本或重复工具调用。
-- 为避免重试倍增，新 Run 显式关闭 mini-swe-agent/LiteLLM 和 Codex 的可配置请求/流重试；Pier 的 `infrastructure_max_retries` 仍保留为完整 Trial 级兜底，两者不是同一层。Claude Code 等第三方 CLI 若有不可配置的内部行为，代理仍是应用侧唯一公开设置入口，但文档不能声称能消除第三方工具内部的全部重试。
+- 成功 SSE 流若要重发，必须先在代理层缓冲到协议终止事件，不能把半条模型输出交给 Agent 后再拼接第二条响应。`provider_stream_max_retries` 控制中断后的原请求重发次数；Responses API、Claude Messages 和 OpenAI Chat 分别用 `response.completed`、`message_stop`、`[DONE]` 判定完整，缓冲期间用 SSE comment 保活。这样三种 Agent 共用同一实现，且不会重复工具调用。
+- 为避免重试倍增，新 Run 显式关闭 mini-swe-agent/LiteLLM 和 Codex 的可配置请求/流重试；代理层的请求重试、流重试和 Pier 的完整 Trial 重试是三层独立兜底。Claude Code 等第三方 CLI 若有不可配置的内部行为，代理仍是应用侧唯一公开设置入口，但文档不能声称能消除第三方工具内部的全部重试。
 - 生产前端是构建后的哈希资源，不会对已打开的标签页热更新。服务端已切换到新 bundle 时，旧标签页仍可能显示旧设置表单；先用 `Ctrl+F5` 或重新打开页面确认，再判断是否构建/部署失败。

@@ -10,7 +10,8 @@ from app import runner
 from app import results
 from app.pier_retry_patch import global_queue
 from app.pier_retry_patch.global_queue import (
-    docker_memory_usage_percent, release_slot, try_acquire_slot,
+    docker_memory_usage_percent, release_environment_setup_slot, release_slot,
+    try_acquire_environment_setup_slot, try_acquire_slot,
 )
 from app.pier_retry_patch.transient import (
     CONTEXT_LIMIT_EXCEPTION_TYPE,
@@ -435,10 +436,13 @@ def test_verifier_infrastructure_retry_is_selective_and_bounded():
 def test_runtime_retry_and_agent_limits_live_in_settings():
     update=SettingsUpdate(
         max_parallel_tasks=18,
+        max_parallel_environment_setups=6,
         provider_rpm=30,
         provider_max_concurrency=5,
         provider_max_retries=300,
+        provider_stream_max_retries=3,
         provider_retry_interval_seconds=7,
+        codex_stream_idle_timeout_seconds=900,
         agent_timeout_seconds=7200, verifier_timeout_seconds=2400,
         infrastructure_max_retries=4, agent_max_steps=150,
     )
@@ -446,10 +450,13 @@ def test_runtime_retry_and_agent_limits_live_in_settings():
                    codex_stream_idle_timeout_seconds=900)
     assert update.agent_timeout_seconds == 7200
     assert update.max_parallel_tasks == 18
+    assert update.max_parallel_environment_setups == 6
     assert update.provider_rpm == 30
     assert update.provider_max_concurrency == 5
     assert update.provider_max_retries == 300
+    assert update.provider_stream_max_retries == 3
     assert update.provider_retry_interval_seconds == 7
+    assert update.codex_stream_idle_timeout_seconds == 900
     assert update.verifier_timeout_seconds == 2400
     assert update.infrastructure_max_retries == 4
     assert update.agent_max_steps == 150
@@ -461,6 +468,98 @@ def test_runtime_retry_and_agent_limits_live_in_settings():
     assert draft.codex_stream_idle_timeout_seconds == 900
     with pytest.raises(ValueError):
         SettingsUpdate(provider_max_retries=301)
+    with pytest.raises(ValueError):
+        SettingsUpdate(provider_stream_max_retries=21)
+
+
+def test_environment_setup_slots_are_shared_and_released():
+    init_db()
+    run_ids = []
+    original_global = None
+    original_environment = None
+    with SessionLocal() as db:
+        db.execute(delete(TrialQueueEntry))
+        global_setting = db.get(Setting, "max_parallel_tasks")
+        environment_setting = db.get(Setting, "max_parallel_environment_setups")
+        original_global = global_setting.value if global_setting else None
+        original_environment = environment_setting.value if environment_setting else None
+        if global_setting:
+            global_setting.value = "2"
+        else:
+            db.add(Setting(key="max_parallel_tasks", value="2"))
+        if environment_setting:
+            environment_setting.value = "1"
+        else:
+            db.add(Setting(key="max_parallel_environment_setups", value="1"))
+        for index in range(2):
+            run = Run(
+                status="queued",
+                job_name=f"environment-slot-{uuid.uuid4().hex}-{index}",
+                agent="codex",
+                model="gpt-5.6-sol",
+                reasoning_effort="high",
+                tasks_json='["task-a"]',
+            )
+            db.add(run)
+            db.flush()
+            run_ids.append(run.id)
+            db.add(TrialQueueEntry(
+                run_id=run.id,
+                task_name="task-a",
+                attempt=1,
+                state="queued",
+                trial_name=f"task-a__slot-{index}",
+                queue_order=index + 1,
+            ))
+        db.commit()
+
+    database = queue_database_path()
+    global_entries = []
+    first_lease = second_lease = None
+    try:
+        for run_id, trial_name in zip(run_ids, ("task-a__slot-0", "task-a__slot-1")):
+            global_entries.append(
+                try_acquire_slot(database, run_id, "task-a", trial_name, 2)
+            )
+        first_lease = try_acquire_environment_setup_slot(
+            database, run_ids[0], "task-a__slot-0", 6
+        )
+        assert isinstance(first_lease, int)
+        assert try_acquire_environment_setup_slot(
+            database, run_ids[1], "task-a__slot-1", 6
+        ) is None
+        release_environment_setup_slot(database, run_ids[0], first_lease)
+        second_lease = try_acquire_environment_setup_slot(
+            database, run_ids[1], "task-a__slot-1", 6
+        )
+        assert isinstance(second_lease, int)
+    finally:
+        if isinstance(first_lease, int):
+            release_environment_setup_slot(database, run_ids[0], first_lease)
+        if isinstance(second_lease, int):
+            release_environment_setup_slot(database, run_ids[1], second_lease)
+        for run_id, entry_id in zip(run_ids, global_entries):
+            if isinstance(entry_id, int):
+                release_slot(database, run_id, entry_id)
+        with SessionLocal() as db:
+            db.execute(delete(TrialQueueEntry))
+            for run_id in run_ids:
+                run = db.get(Run, run_id)
+                if run:
+                    db.delete(run)
+            for key, value in (
+                ("max_parallel_tasks", original_global),
+                ("max_parallel_environment_setups", original_environment),
+            ):
+                setting = db.get(Setting, key)
+                if value is None:
+                    if setting:
+                        db.delete(setting)
+                elif setting:
+                    setting.value = value
+                else:
+                    db.add(Setting(key=key, value=value))
+            db.commit()
 
 def test_requested_trial_count_and_concurrency_risk_are_separate():
     assert requested_trial_count(["task-a", "task-b", "task-c"], 2, 3) == 18
@@ -538,6 +637,8 @@ def test_run_detail_exposes_live_provider_and_infrastructure_telemetry(
         "provider_request_count": 4,
         "provider_retries_used": 1,
         "provider_max_retries": 6,
+        "provider_stream_retries_used": 2,
+        "provider_stream_max_retries": 3,
     } if (current_run, resource) == (run_id, trial_id) else {})
     with SessionLocal() as db:
         detail = results.run_detail(db.get(Run, run_id), include_patches=False)
@@ -545,6 +646,8 @@ def test_run_detail_exposes_live_provider_and_infrastructure_telemetry(
     assert trial["provider_response_code"] == 503
     assert trial["provider_request_count"] == 4
     assert trial["provider_retries_used"] == 1
+    assert trial["provider_stream_retries_used"] == 2
+    assert trial["provider_stream_max_retries"] == 3
     assert trial["infrastructure_retries_used"] == 1
     assert trial["infrastructure_retries_remaining"] == 2
 
@@ -1350,10 +1453,10 @@ def test_new_pier_job_name_uses_public_run_identity(monkeypatch):
         "verifier_timeout_seconds": 2400,
         "infrastructure_max_retries": 3,
         "agent_max_steps": 140,
+        "codex_stream_idle_timeout_seconds": 900,
     })
     row = runner.create_run(RunDraft(
         agent="codex", tasks=["actionlint-action-pinning-lint"],
-        codex_stream_idle_timeout_seconds=900,
     ))
     try:
         assert row.job_name == f"run-{row.id:06d}-codex"

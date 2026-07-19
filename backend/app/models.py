@@ -21,6 +21,9 @@ class Run(Base):
     reasoning_effort: Mapped[str] = mapped_column(String(20))
     reasoning_effort_adapter: Mapped[str | None] = mapped_column(String(80), nullable=True)
     reasoning_effort_effective: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    agent_version_mode: Mapped[str] = mapped_column(String(20), default="latest")
+    agent_version_requested: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    agent_version_source: Mapped[str | None] = mapped_column(String(30), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     job_name: Mapped[str] = mapped_column(String(160), unique=True)
@@ -68,6 +71,17 @@ class TrialQueueEntry(Base):
     )
     queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+class EnvironmentSetupLease(Base):
+    __tablename__ = "environment_setup_leases"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(Integer, index=True)
+    entry_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    trial_name: Mapped[str] = mapped_column(String(300), index=True)
+    owner_pid: Mapped[int] = mapped_column(Integer)
+    acquired_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
 
 class Baseline(Base):
     __tablename__ = "baselines"

@@ -153,7 +153,7 @@ tests/{Dockerfile,config.json,test.sh,test.patch,grader.py,base_repo/}
   - 瞬时故障分类:503/429/连接类失败重分类为 `TransientAgentInfrastructureError` 触发 pier 重试,模型/代码失败不重试;退避延迟经 `DEEPSWE_PIER_RETRY_DELAYS` 配置
   - Docker 子网固定:trial 网络按路径哈希从 `10.240.0.0/12` 池分配 /29 对(`DEEPSWE_DOCKER_NETWORK_POOL` 可改),避开 Docker 的 192.168.* fallback 池与局域网冲突
   - Run 相关字段:`retry_infrastructure_errors`、`infrastructure_max_retries`、`agent_max_steps`(原 `claude_max_turns`,现对全部 agent 生效)
-- **Provider 请求重试与时间预算**:应用配置的请求重试统一在宿主机 Provider Proxy,覆盖建连失败及 HTTP 429/500/502/503/504;次数不含首次请求,按固定间隔等待,每次尝试都重新占用 RPM,但等待期间不占活动连接槽。mini-swe-agent 与 Codex 的可配置内层重试对新 Run 关闭,避免 10 次/6 次与代理重试相乘。成功响应交给 Agent 后不重放中断流;Pier 的 `infrastructure_max_retries` 仍是完整 Trial 的独立兜底。所有代理等待仍属于 Agent 墙钟时间,计入 `agent_timeout_seconds`
+  - **Provider 请求重试与时间预算**:应用配置的请求重试统一在宿主机 Provider Proxy,覆盖建连失败及 HTTP 429/500/502/503/504;次数不含首次请求,按固定间隔等待,每次尝试都重新占用 RPM,但等待期间不占活动连接槽。另有 `provider_stream_max_retries`(默认 3):成功 SSE 流由代理先缓冲至协议终止事件,中断则丢弃半条响应并重发原请求,三种 Agent 共用同一策略;缓冲期间发送 SSE comment 保持连接活跃,完整响应才交给 Agent,避免重复工具调用。mini-swe-agent 与 Codex 的可配置内层重试对新 Run 关闭,避免 10 次/6 次与代理重试相乘。流重试耗尽后由 Pier 的 `infrastructure_max_retries` 完整 Trial 兜底。所有代理等待仍属于 Agent 墙钟时间,计入 `agent_timeout_seconds`。Codex 的 `stream_idle_timeout_ms` 现作为“Codex 下游 SSE 空闲超时”保留在高级设置中,创建 Run 时固化,不再作为创建页常用参数
 - **进程生命周期**:启动时收割上次残留非终态运行(按 PID 终止 pier 进程树,psutil 校验命令行防 PID 复用误杀;Docker 定向清理;标记 `interrupted`);退出时终止仍在运行的 pier 子进程;取消/落库共用状态锁,终态不可反向覆盖;全局 Trial 队列在 Run 终态、取消、异常退出和启动收割时同步清理,避免泄漏并发槽位
 
 ## 10.1 Docker 镜像构建与 `preparing_environment`

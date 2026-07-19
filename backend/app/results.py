@@ -1,22 +1,24 @@
 import json
 import re
 import tomllib
-from datetime import datetime
+from collections import Counter
+from datetime import UTC, datetime
 from pathlib import Path
 from statistics import mean
-from sqlalchemy import select
+import psutil
+from sqlalchemy import func, select
 from .database import SessionLocal
 from .config import settings
-from .models import Baseline, Run
+from .models import Baseline, EnvironmentSetupLease, Run
 from .official_stats import configuration_stats, load_official_stats, normalize_model_name
-from .preferences import current_secrets, jobs_path
+from .preferences import current_secrets, get_preferences, jobs_path
 from .pier_retry_patch.infrastructure_retry import read_retry_status
 from .pier_retry_patch.transient import (
     CONTEXT_LIMIT_EXCEPTION_TYPE,
     is_context_limit_failure,
     is_transient_agent_failure,
 )
-from .pricing import DEFAULT_PRICING, pricing_for_model
+from .pricing import DEFAULT_PRICING, pricing_details, pricing_for_model
 from .provider_proxy import provider_trial_status
 from .scheduler import queue_status
 from .security import redact
@@ -24,9 +26,17 @@ from .task_suite import CONTROL_TASK
 
 TIER_MULTIPLIER = {"standard": 1.0, "batch": 0.5, "priority": 2.0}
 TRIAL_TERMINAL_STATES = {"completed", "failed", "cancelled", "interrupted"}
+ENVIRONMENT_PREPARATION_PHASES = {
+    "preparing_environment",
+    "creating_build_context",
+    "waiting_for_docker",
+    "building_agent_image",
+    "starting_containers",
+}
 LIVE_TELEMETRY_FIELDS = (
     "provider_response_code", "provider_request_count", "provider_retries_used",
-    "provider_max_retries", "infrastructure_retries_used",
+    "provider_max_retries", "provider_stream_retries_used",
+    "provider_stream_max_retries", "infrastructure_retries_used",
     "infrastructure_retries_max", "infrastructure_retries_remaining",
     "infrastructure_retry_state",
 )
@@ -274,8 +284,98 @@ def estimate_cost(input_tokens: int | None, cached_tokens: int | None, output_to
 
 def _pricing_details(model: str | None) -> dict:
     """估算所用单价及其来源，供 UI/API 消费者核对估算口径。"""
-    found = pricing_for_model(model)
-    return {**(found or DEFAULT_PRICING), "source": "models.dev" if found else "default"}
+    return pricing_details(model)
+
+def _runtime_trial_commands(run: Run) -> dict[str, dict]:
+    if not run.pid or run.status not in {"queued", "preflight", "running"}:
+        return {}
+    try:
+        descendants = psutil.Process(run.pid).children(recursive=True)
+    except psutil.Error:
+        return {}
+    commands: dict[str, dict] = {}
+    for process in descendants:
+        try:
+            command = " ".join(process.cmdline())
+        except psutil.Error:
+            continue
+        match = re.search(r"--project-name\s+([^\s]+)", command, re.IGNORECASE)
+        if not match:
+            continue
+        project = match.group(1).lower()
+        normalized = f" {command.lower()} "
+        if re.search(r"\sbuild(?:\s|$)", normalized):
+            phase, label = "building_agent_image", "构建 Agent 镜像"
+        elif re.search(r"\sup(?:\s|$)", normalized):
+            phase, label = "starting_containers", "启动 Trial 容器"
+        elif re.search(r"\sexec(?:\s|$)", normalized):
+            if "/logs/verifier" in normalized or " verifier" in normalized:
+                phase, label = "verifier", "运行 Verifier"
+            else:
+                phase, label = "agent_running", "启动或运行 Agent"
+        elif re.search(r"\sdown(?:\s|$)", normalized):
+            phase, label = "cleaning_environment", "清理 Trial 容器"
+        else:
+            continue
+        commands[project] = {
+            "phase": phase,
+            "label": label,
+            "pid": process.pid,
+        }
+    return commands
+
+def _agent_build_message(agent: str | None, version: str | None) -> str:
+    selected = f" {version}" if version else ""
+    if agent == "codex":
+        return f"正在构建 Codex{selected} 镜像；首次使用会安装 Node.js 22、ripgrep 与 Codex CLI"
+    if agent == "claude-code":
+        return f"正在构建 Claude Code{selected} 镜像；首次使用会安装 curl 与 Claude Code CLI"
+    if agent == "mini-swe-agent":
+        return f"正在构建 mini-swe-agent{selected} 镜像；首次使用会安装 uv、LiteLLM 与 Agent 依赖"
+    return "正在构建 Agent 镜像；首次使用可能需要下载运行时与 Agent 依赖"
+
+def _trial_stage_detail(
+    folder: Path,
+    stage: str,
+    runtime: dict | None,
+    agent: str | None,
+    agent_version: str | None,
+) -> dict:
+    if runtime:
+        phase = runtime["phase"]
+        if phase == "building_agent_image":
+            message = _agent_build_message(agent, agent_version)
+        elif phase == "starting_containers":
+            message = "Agent 镜像已就绪，正在创建网络、代理并启动 Trial 容器"
+        elif phase == "agent_running":
+            message = "容器已启动，Agent 正在读取任务并执行"
+        elif phase == "verifier":
+            message = "Agent 已结束，正在执行 Verifier"
+        else:
+            message = runtime["label"]
+        return {"phase": phase, "label": runtime["label"], "message": message}
+    if stage == "preparing_environment":
+        if (folder / "agent-build-context" / "Dockerfile").exists():
+            return {
+                "phase": "waiting_for_docker",
+                "label": "等待 Docker",
+                "message": "构建配置已生成，正在等待 Docker 构建槽或复用本地镜像缓存",
+            }
+        return {
+            "phase": "creating_build_context",
+            "label": "生成构建配置",
+            "message": "Pier 正在生成 Agent Dockerfile、网络代理与挂载配置",
+        }
+    labels = {
+        "queued": ("等待调度", "等待全局 Trial 名额"),
+        "agent_running": ("运行 Agent", "容器已启动，Agent 正在执行任务"),
+        "preparing_verifier": ("准备 Verifier", "正在整理 Agent 补丁并准备验证环境"),
+        "verifier": ("运行 Verifier", "正在执行任务验证"),
+        "finalizing": ("整理结果", "正在汇总 Token、费用、Patch 与评分结果"),
+        "retry_wait": ("等待重试", "基础设施错误已识别，正在等待下一次 Trial 重试"),
+    }
+    label, message = labels.get(stage, (stage.replace("_", " "), ""))
+    return {"phase": stage, "label": label, "message": message}
 
 def pier_trial_prefix(task: str) -> str:
     """pier 生成 trial 目录名时把任务名截断到 32 字符并去尾部 _-。"""
@@ -324,7 +424,17 @@ def _canonical_task_name(folder: Path, data: dict, expected_tasks: list[str] | N
     matches = [task for task in (expected_tasks or []) if pier_trial_prefix(task) == prefix]
     return matches[0] if len(matches) == 1 else prefix
 
-def _trial(folder: Path, include_patch: bool = True, expected_tasks: list[str] | None = None) -> dict:
+def _trial(
+    folder: Path,
+    include_patch: bool = True,
+    expected_tasks: list[str] | None = None,
+    *,
+    runtime: dict | None = None,
+    agent_name: str | None = None,
+    agent_version: str | None = None,
+    service_tier: str = "standard",
+    model: str | None = None,
+) -> dict:
     data = _json(folder / "result.json")
     config = _json(folder / "config.json")
     retry_state = _json(folder / "retry-state.json") if not data else {}
@@ -422,10 +532,34 @@ def _trial(folder: Path, include_patch: bool = True, expected_tasks: list[str] |
         and retry_status not in TRIAL_TERMINAL_STATES
     )
     replaced = bool(data.get("deepswe_replaced") or config.get("deepswe_replaced"))
+    stage = _trial_stage(folder, data)
+    reported_cost = agent.get("cost_usd")
+    if not isinstance(reported_cost, (int, float)) or isinstance(reported_cost, bool):
+        reported_cost = None
+    estimated_cost = estimate_cost(
+        agent.get("n_input_tokens"),
+        agent.get("n_cache_tokens"),
+        agent.get("n_output_tokens"),
+        service_tier,
+        model,
+    )
+    effective_cost = reported_cost if reported_cost is not None else estimated_cost
+    cost_source = (
+        "reported" if reported_cost is not None
+        else "estimated" if estimated_cost is not None
+        else None
+    )
     return {
         "id": folder.name,
         **task_identity(task_name),
-        "status": _trial_stage(folder, data),
+        "status": stage,
+        "stage_detail": _trial_stage_detail(
+            folder,
+            stage,
+            runtime,
+            agent_name,
+            agent_version,
+        ),
         "attempt": attempt if isinstance(attempt, int) and attempt > 0 else None,
         "retrying": retrying,
         "replaced": replaced,
@@ -444,7 +578,10 @@ def _trial(folder: Path, include_patch: bool = True, expected_tasks: list[str] |
         "input_tokens": agent.get("n_input_tokens"),
         "cached_tokens": agent.get("n_cache_tokens"),
         "output_tokens": agent.get("n_output_tokens"),
-        "reported_cost_usd": agent.get("cost_usd"),
+        "reported_cost_usd": reported_cost,
+        "estimated_cost_usd": estimated_cost,
+        "cost_usd": effective_cost,
+        "cost_source": cost_source,
         "steps": data.get("n_agent_steps") or agent.get("n_agent_steps"),
         "agent_version": info.get("version"),
         "failure_type": failure_type,
@@ -557,6 +694,10 @@ def _retry_live_entries(
                 folder,
                 include_patch=include_patches,
                 expected_tasks=expected_tasks,
+                agent_name=run.agent,
+                agent_version=run.agent_version_requested,
+                service_tier=run.service_tier,
+                model=run.model,
             ),
         }
 
@@ -570,6 +711,10 @@ def _retry_live_entries(
                 folder,
                 include_patch=include_patches,
                 expected_tasks=expected_tasks,
+                agent_name=run.agent,
+                agent_version=run.agent_version_requested,
+                service_tier=run.service_tier,
+                model=run.model,
             ),
         }
         for folder in sorted(
@@ -605,7 +750,15 @@ def _retry_markers(run: Run, expected_tasks: list[str]) -> list[dict]:
     return [
         marker
         for marker in (
-            _trial(folder, include_patch=False, expected_tasks=expected_tasks)
+            _trial(
+                folder,
+                include_patch=False,
+                expected_tasks=expected_tasks,
+                agent_name=run.agent,
+                agent_version=run.agent_version_requested,
+                service_tier=run.service_tier,
+                model=run.model,
+            )
             for folder in root.iterdir()
             if folder.is_dir() and "__" in folder.name
         )
@@ -678,8 +831,53 @@ def trial_log(run: Run, trial_id: str) -> str:
             continue
     return redact("\n\n".join(chunks), current_secrets())[-300000:]
 
+def _run_duration_seconds(run: Run) -> float | None:
+    """Return wall-clock Run duration, including queue time for active Runs."""
+    start = run.created_at
+    finish = run.finished_at or datetime.now(UTC)
+    if not isinstance(start, datetime) or not isinstance(finish, datetime):
+        return None
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=UTC)
+    if finish.tzinfo is None:
+        finish = finish.replace(tzinfo=UTC)
+    return max(0.0, (finish - start).total_seconds())
+
+
+def _environment_setup_summary(run_id: int, trials: list[dict]) -> dict:
+    """Expose the shared Docker setup limit alongside this Run's waiting work."""
+    limit = max(int(get_preferences().get("max_parallel_environment_setups", 6)), 1)
+    with SessionLocal() as db:
+        leases = db.scalars(
+            select(EnvironmentSetupLease).where(
+                EnvironmentSetupLease.run_id == run_id
+            )
+        ).all()
+        global_running = int(db.scalar(
+            select(func.count(EnvironmentSetupLease.id))
+        ) or 0)
+    leased_names = {lease.trial_name for lease in leases}
+    waiting_names = {
+        trial.get("resource_name")
+        for trial in trials
+        if (trial.get("stage_detail") or {}).get("phase")
+        in ENVIRONMENT_PREPARATION_PHASES
+        and isinstance(trial.get("resource_name"), str)
+    }
+    return {
+        "limit": limit,
+        "running": len(leases),
+        "queued": len(waiting_names - leased_names),
+        "available": max(limit - global_running, 0),
+        "global_running": global_running,
+    }
+
+
 def run_detail(run: Run, include_patches: bool = True) -> dict:
     root = jobs_root_for(run) / run.job_name
+    runtime_status = _json(
+        jobs_root_for(run) / f"{run.job_name}.runtime.json"
+    )
     job = _json(root / "result.json")
     stats = job.get("stats") or {}
     expected_tasks = json.loads(run.tasks_json)
@@ -690,7 +888,20 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
         (p for p in root.iterdir() if p.is_dir() and "__" in p.name and p.name not in deleted_ids),
         key=lambda p: p.name,
     ) if root.exists() else []
-    trials = [_trial(folder, include_patch=include_patches, expected_tasks=expected_tasks) for folder in trial_folders]
+    runtime_commands = _runtime_trial_commands(run)
+    trials = [
+        _trial(
+            folder,
+            include_patch=include_patches,
+            expected_tasks=expected_tasks,
+            runtime=runtime_commands.get(folder.name.lower()),
+            agent_name=run.agent,
+            agent_version=run.agent_version_requested,
+            service_tier=run.service_tier,
+            model=run.model,
+        )
+        for folder in trial_folders
+    ]
     terminal_defaults = {
         "failed": ("failed", "RunFailed", "Run 失败，Trial 未完成"),
         "cancelled": ("cancelled", "RunCancelled", "Run 已取消，Trial 未完成"),
@@ -785,9 +996,15 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
             trials.append({
                 "id": f"{task}#{attempt}", **task_identity(task), "attempt": attempt,
                 "status": status, "reward": None, "partial": None, "f2p": None, "p2p": None,
+                "stage_detail": _trial_stage_detail(
+                    root / f"{task}#{attempt}", status, None,
+                    run.agent, run.agent_version_requested,
+                ),
                 "duration_seconds": None, "agent_duration_seconds": None,
                 "input_tokens": None, "cached_tokens": None, "output_tokens": None,
-                "reported_cost_usd": None, "steps": None, "patch": "", "patch_bytes": 0,
+                "reported_cost_usd": None, "estimated_cost_usd": None,
+                "cost_usd": None, "cost_source": None,
+                "steps": None, "patch": "", "patch_bytes": 0,
                 "failure_type": failure_type, "failure_message": failure_message,
                 "failure_summary": f"{failure_type}: {failure_message}"[:320] if failure_type and failure_message else failure_type,
                 "retrying": False, "replaced": False,
@@ -822,8 +1039,21 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
         trial["provider_request_count"] = int(provider.get("provider_request_count") or 0)
         trial["provider_retries_used"] = int(provider.get("provider_retries_used") or 0)
         trial["provider_max_retries"] = int(provider.get("provider_max_retries") or 0)
+        trial["provider_stream_retries_used"] = int(
+            provider.get("provider_stream_retries_used") or 0
+        )
+        trial["provider_stream_max_retries"] = int(
+            provider.get("provider_stream_max_retries") or 0
+        )
     completed = sum(t["status"] in TRIAL_TERMINAL_STATES for t in trials)
     passed = sum(t.get("reward") == 1 for t in trials)
+    step_values = [
+        trial.get("steps")
+        for trial in trials
+        if isinstance(trial.get("steps"), (int, float))
+        and not isinstance(trial.get("steps"), bool)
+    ]
+    total_steps = sum(step_values) if step_values else None
     remaining_tasks = {trial["task"] for trial in trials}
     passed_tasks = sum(
         any(t.get("reward") == 1 for t in trials if t["task"] == task)
@@ -855,12 +1085,65 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
         input_tokens = stats.get("n_input_tokens", run.input_tokens)
         cached_tokens = stats.get("n_cache_tokens", run.cached_tokens)
         output_tokens = stats.get("n_output_tokens", run.output_tokens)
-        reported_cost = stats.get("cost_usd", run.cost_usd)
+        reported_cost = stats.get("cost_usd")
+        if not isinstance(reported_cost, (int, float)) or isinstance(reported_cost, bool):
+            reported_values = [
+                trial["reported_cost_usd"]
+                for trial in trials
+                if trial.get("reported_cost_usd") is not None
+            ]
+            reported_cost = sum(reported_values) if reported_values else None
+    estimated_cost = estimate_cost(
+        input_tokens,
+        cached_tokens,
+        output_tokens,
+        run.service_tier,
+        run.model,
+    )
+    trial_costs = [trial["cost_usd"] for trial in trials if trial.get("cost_usd") is not None]
+    cost_usd = (
+        sum(trial_costs)
+        if trial_costs and (deleted_entries or has_targeted_retries or reported_cost is None)
+        else reported_cost if reported_cost is not None
+        else estimated_cost
+    )
+    sources = {trial.get("cost_source") for trial in trials if trial.get("cost_source")}
+    cost_source = (
+        next(iter(sources)) if len(sources) == 1
+        else "mixed" if sources
+        else "reported" if reported_cost is not None
+        else "estimated" if estimated_cost is not None
+        else None
+    )
+    preparation_counts = Counter(
+        (trial.get("stage_detail") or {}).get("phase")
+        for trial in trials
+        if trial["status"] not in TRIAL_TERMINAL_STATES
+    )
+    environment_setup = _environment_setup_summary(run.id, trials)
+    run_duration_seconds = _run_duration_seconds(run)
+    active_stage_detail = next(
+        (
+            trial.get("stage_detail")
+            for trial in trials
+            if trial["status"] not in {"queued", *TRIAL_TERMINAL_STATES}
+            and trial.get("stage_detail")
+        ),
+        None,
+    )
+    run_stage_detail = active_stage_detail or {
+        "phase": runtime_status.get("phase") or stage,
+        "label": (runtime_status.get("phase") or stage).replace("_", " "),
+        "message": runtime_status.get("message") or "",
+    }
     with SessionLocal() as db:
         baseline = db.scalar(select(Baseline).where(Baseline.run_id == run.id))
     return {
         "id": run.id, "run_code": run_code(run.id), "job_name": run.job_name, "status": run.status, "stage": stage,
         "agent": run.agent, "model": run.model, "reasoning_effort": run.reasoning_effort,
+        "agent_version_mode": run.agent_version_mode,
+        "agent_version_requested": run.agent_version_requested,
+        "agent_version_source": run.agent_version_source,
         "reasoning_effort_adapter": run.reasoning_effort_adapter,
         "reasoning_effort_effective": run.reasoning_effort_effective,
         "pier_version": run.pier_version,
@@ -878,8 +1161,23 @@ def run_detail(run: Run, include_patches: bool = True) -> dict:
         "input_tokens": input_tokens, "cached_tokens": cached_tokens, "uncached_input_tokens": max((input_tokens or 0) - (cached_tokens or 0), 0),
         "cache_write_tokens": None,  # Pier 未返回该字段，按约定存 null
         "output_tokens": output_tokens, "reported_cost_usd": reported_cost,
-        "estimated_cost_usd": estimate_cost(input_tokens, cached_tokens, output_tokens, run.service_tier, run.model),
+        "estimated_cost_usd": estimated_cost,
+        "cost_usd": cost_usd,
+        "cost_source": cost_source,
         "pricing": _pricing_details(run.model),
+        "stage_detail": run_stage_detail,
+        "preparation": {
+            "phase": run_stage_detail.get("phase"),
+            "label": run_stage_detail.get("label"),
+            "message": run_stage_detail.get("message"),
+            **environment_setup,
+            "counts": {
+                key: value for key, value in sorted(preparation_counts.items()) if key
+            },
+            "updated_at": runtime_status.get("updated_at"),
+        },
+        "duration_seconds": run_duration_seconds,
+        "total_steps": total_steps,
         "error": effective_run_error(run), "progress": {"completed": completed, "total": total, "passed": passed, "percent": round(completed / total * 100) if total else 0},
         "task_progress": {"passed": passed_tasks, "total": len(remaining_tasks)},
         "deleted_trials": len(deleted_entries),
@@ -980,11 +1278,21 @@ def aggregate_trial_results(run: Run) -> dict:
                 (input_tokens, "n_input_tokens"),
                 (cached_tokens, "n_cache_tokens"),
                 (output_tokens, "n_output_tokens"),
-                (costs, "cost_usd"),
             ):
                 value = agent.get(key)
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     values.append(value)
+            cost = agent.get("cost_usd")
+            if not isinstance(cost, (int, float)) or isinstance(cost, bool):
+                cost = estimate_cost(
+                    agent.get("n_input_tokens"),
+                    agent.get("n_cache_tokens"),
+                    agent.get("n_output_tokens"),
+                    run.service_tier,
+                    run.model,
+                )
+            if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+                costs.append(float(cost))
 
     superseded_ids = {retry_of for _trial_id, _error, retry_of in result_rows if retry_of}
     effective_errored = sum(
@@ -1083,6 +1391,21 @@ def compare_runs(run_ids: list[int], selections: list[tuple[int, str]] | None = 
                 for t in values
             ]
             estimated_costs = [value for value in estimated_costs if value is not None]
+            effective_costs = []
+            for trial in values:
+                cost = trial.get("cost_usd")
+                if cost is None:
+                    cost = trial.get("reported_cost_usd")
+                if cost is None:
+                    cost = estimate_cost(
+                        trial.get("input_tokens"),
+                        trial.get("cached_tokens"),
+                        trial.get("output_tokens"),
+                        detail["service_tier"],
+                        detail["model"],
+                    )
+                if cost is not None:
+                    effective_costs.append(cost)
             item["runs"][str(detail["id"])] = {
                 "passed": any(t["reward"] == 1 for t in values) if values else None,
                 "attempts": len(task_trials),
@@ -1094,10 +1417,10 @@ def compare_runs(run_ids: list[int], selections: list[tuple[int, str]] | None = 
                 "input_tokens": average("input_tokens"),
                 "cached_tokens": average("cached_tokens"),
                 "output_tokens": average("output_tokens"),
-                "cost_usd": average("reported_cost_usd"),
+                "cost_usd": mean(effective_costs) if effective_costs else None,
                 "steps": average("steps"),
                 "total_input_tokens": sum(t.get("input_tokens") or 0 for t in values) if values else None,
-                "total_cost_usd": sum(t.get("reported_cost_usd") or 0 for t in values) if values else None,
+                "total_cost_usd": sum(effective_costs) if effective_costs else None,
                 "total_estimated_cost_usd": sum(estimated_costs) if estimated_costs else None,
             }
         matrix.append(item)

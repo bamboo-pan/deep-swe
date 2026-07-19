@@ -218,7 +218,7 @@ def test_provider_proxy_retries_429_before_returning_stream(monkeypatch):
     monkeypatch.setattr(provider_proxy, "credential_path", lambda: None)
     monkeypatch.setattr(provider_proxy, "reserve_provider_request", lambda: 0)
     monkeypatch.setattr(provider_proxy, "record_limit_event", lambda *args: None)
-    monkeypatch.setattr(provider_proxy, "_provider_request_policy", lambda: (1, 2, 0))
+    monkeypatch.setattr(provider_proxy, "_provider_request_policy", lambda: (1, 2, 3, 0))
 
     received = False
 
@@ -264,6 +264,8 @@ def test_provider_proxy_retries_429_before_returning_stream(monkeypatch):
         "provider_request_count": 2,
         "provider_retries_used": 0,
         "provider_max_retries": 2,
+        "provider_stream_retries_used": 0,
+        "provider_stream_max_retries": 3,
         "updated_at": provider_trial_status(42, "task-a__abc")["updated_at"],
     }
     assert provider_proxy._PROVIDER_CONCURRENCY.snapshot() == (0, 0)
@@ -299,12 +301,14 @@ def test_provider_response_stats_report_failed_request_share():
         "failed_requests_last_60_seconds": 2,
         "failure_rate_last_60_seconds": 66.7,
         "response_code_counts_last_60_seconds": {"200": 1, "429": 1, "502": 1},
+        "stream_failures_last_60_seconds": 0,
     }
     assert provider_response_stats_last_60_seconds(now=1061) == {
         "completed_requests_last_60_seconds": 1,
         "failed_requests_last_60_seconds": 1,
         "failure_rate_last_60_seconds": 100.0,
         "response_code_counts_last_60_seconds": {"502": 1},
+        "stream_failures_last_60_seconds": 0,
     }
 
 
@@ -350,7 +354,7 @@ def test_limit_event_storage_failure_does_not_abort_retry(monkeypatch):
         provider_proxy, "record_limit_event",
         lambda *args: (_ for _ in ()).throw(RuntimeError("sqlite unavailable")),
     )
-    monkeypatch.setattr(provider_proxy, "_provider_request_policy", lambda: (1, 1, 0))
+    monkeypatch.setattr(provider_proxy, "_provider_request_policy", lambda: (1, 1, 3, 0))
 
     received = False
 
@@ -410,7 +414,7 @@ def test_provider_stream_close_error_still_releases_concurrency(monkeypatch):
     monkeypatch.setattr(provider_proxy, "credential_path", lambda: None)
     monkeypatch.setattr(provider_proxy, "reserve_provider_request", lambda: 0)
     monkeypatch.setattr(provider_proxy, "record_limit_event", lambda *args: None)
-    monkeypatch.setattr(provider_proxy, "_provider_request_policy", lambda: (1, 0, 0))
+    monkeypatch.setattr(provider_proxy, "_provider_request_policy", lambda: (1, 0, 0, 0))
 
     received = False
 
@@ -442,6 +446,266 @@ def test_provider_stream_close_error_still_releases_concurrency(monkeypatch):
                 pass
 
     asyncio.run(scenario())
+    assert provider_proxy._PROVIDER_CONCURRENCY.snapshot() == (0, 0)
+
+
+@pytest.mark.parametrize(
+    ("path", "partial", "complete", "raise_transport_error"),
+    [
+        (
+            "responses",
+            b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta"}\n\n',
+            b'event: response.completed\ndata: {"type":"response.completed"}\n\n',
+            True,
+        ),
+        (
+            "v1/messages",
+            b'event: content_block_delta\ndata: {"type":"content_block_delta"}\n\n',
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+            False,
+        ),
+        (
+            "chat/completions",
+            b'data: {"choices":[{"delta":{"content":"half"}}]}\n\n',
+            b'data: {"choices":[{"delta":{"content":"done"}}]}\n\ndata: [DONE]\n\n',
+            True,
+        ),
+    ],
+)
+def test_successful_sse_stream_is_retried_before_any_agent_sees_partial_output(
+    monkeypatch, path, partial, complete, raise_transport_error,
+):
+    """Responses, Claude Messages and OpenAI Chat share the same proxy policy."""
+    _reset_provider_telemetry()
+    clients = []
+
+    class FakeUpstream:
+        status_code = 200
+        headers = {"content-type": "text/event-stream; charset=utf-8"}
+
+        def __init__(self, body, fail):
+            self.body = body
+            self.fail = fail
+
+        async def aiter_raw(self):
+            yield self.body
+            if self.fail:
+                raise provider_proxy.httpx.ReadError("stream disconnected")
+
+        async def aclose(self):
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.send_count = 0
+            clients.append(self)
+
+        def build_request(self, *args, **kwargs):
+            return object()
+
+        async def send(self, request, stream=True):
+            self.send_count += 1
+            if self.send_count == 1:
+                return FakeUpstream(partial, raise_transport_error)
+            return FakeUpstream(complete, False)
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(provider_proxy.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(
+        provider_proxy, "read_credential",
+        lambda _path: SimpleNamespace(token="secret", url="http://provider.example/v1"),
+    )
+    monkeypatch.setattr(provider_proxy, "credential_path", lambda: None)
+    monkeypatch.setattr(provider_proxy, "reserve_provider_request", lambda: 0)
+    monkeypatch.setattr(provider_proxy, "record_limit_event", lambda *args: None)
+    monkeypatch.setattr(
+        provider_proxy, "_provider_request_policy", lambda: (1, 0, 3, 0)
+    )
+
+    received = False
+
+    async def receive():
+        nonlocal received
+        if received:
+            return {"type": "http.disconnect"}
+        received = True
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    request = Request({
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+        "method": "POST", "scheme": "http", "path": f"/api/provider/{path}",
+        "raw_path": f"/api/provider/{path}".encode(), "query_string": b"",
+        "headers": [
+            (b"authorization", b"Bearer secret"),
+            (RUN_ID_HEADER.encode(), b"51"),
+            (TRIAL_ID_HEADER.encode(), b"task-stream__one"),
+        ],
+        "client": ("127.0.0.1", 1), "server": ("127.0.0.1", 8765),
+    }, receive)
+
+    async def scenario():
+        response = await provider_proxy.forward_provider_request(request, path)
+        return b"".join([chunk async for chunk in response.body_iterator])
+
+    assert asyncio.run(scenario()) == complete
+    assert clients[0].send_count == 2
+    telemetry = provider_trial_status(51, "task-stream__one")
+    assert telemetry["provider_request_count"] == 2
+    assert telemetry["provider_stream_retries_used"] == 1
+    assert telemetry["provider_stream_max_retries"] == 3
+    assert provider_proxy._PROVIDER_CONCURRENCY.snapshot() == (0, 0)
+
+
+def test_stream_retry_exhaustion_raises_after_three_resends(monkeypatch):
+    _reset_provider_telemetry()
+    clients = []
+
+    class FakeUpstream:
+        status_code = 200
+        headers = {"content-type": "text/event-stream"}
+
+        async def aiter_raw(self):
+            yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta"}\n\n'
+
+        async def aclose(self):
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.send_count = 0
+            self.closed = False
+            clients.append(self)
+
+        def build_request(self, *args, **kwargs):
+            return object()
+
+        async def send(self, request, stream=True):
+            self.send_count += 1
+            return FakeUpstream()
+
+        async def aclose(self):
+            self.closed = True
+
+    monkeypatch.setattr(provider_proxy.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(
+        provider_proxy, "read_credential",
+        lambda _path: SimpleNamespace(token="secret", url="http://provider.example/v1"),
+    )
+    monkeypatch.setattr(provider_proxy, "credential_path", lambda: None)
+    monkeypatch.setattr(provider_proxy, "reserve_provider_request", lambda: 0)
+    monkeypatch.setattr(provider_proxy, "record_limit_event", lambda *args: None)
+    monkeypatch.setattr(
+        provider_proxy, "_provider_request_policy", lambda: (1, 0, 3, 0)
+    )
+
+    received = False
+
+    async def receive():
+        nonlocal received
+        if received:
+            return {"type": "http.disconnect"}
+        received = True
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    request = Request({
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+        "method": "POST", "scheme": "http", "path": "/api/provider/responses",
+        "raw_path": b"/api/provider/responses", "query_string": b"",
+        "headers": [
+            (b"authorization", b"Bearer secret"),
+            (RUN_ID_HEADER.encode(), b"52"),
+            (TRIAL_ID_HEADER.encode(), b"task-stream__exhausted"),
+        ],
+        "client": ("127.0.0.1", 1), "server": ("127.0.0.1", 8765),
+    }, receive)
+
+    async def scenario():
+        response = await provider_proxy.forward_provider_request(request, "responses")
+        with pytest.raises(
+            provider_proxy.IncompleteProviderStreamError,
+            match="terminal event",
+        ):
+            async for _chunk in response.body_iterator:
+                pass
+
+    asyncio.run(scenario())
+    assert clients[0].send_count == 4
+    assert clients[0].closed is True
+    telemetry = provider_trial_status(52, "task-stream__exhausted")
+    assert telemetry["provider_stream_retries_used"] == 3
+    assert telemetry["provider_stream_max_retries"] == 3
+    assert provider_response_stats_last_60_seconds()[
+        "stream_failures_last_60_seconds"
+    ] == 4
+    assert provider_proxy._PROVIDER_CONCURRENCY.snapshot() == (0, 0)
+
+
+def test_sse_buffering_emits_keepalive_comments(monkeypatch):
+    class FakeUpstream:
+        status_code = 200
+        headers = {"content-type": "text/event-stream"}
+
+        async def aiter_raw(self):
+            await asyncio.sleep(0.03)
+            yield b'event: response.completed\ndata: {"type":"response.completed"}\n\n'
+
+        async def aclose(self):
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def build_request(self, *args, **kwargs):
+            return object()
+
+        async def send(self, request, stream=True):
+            return FakeUpstream()
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(provider_proxy.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(
+        provider_proxy, "read_credential",
+        lambda _path: SimpleNamespace(token="secret", url="http://provider.example/v1"),
+    )
+    monkeypatch.setattr(provider_proxy, "credential_path", lambda: None)
+    monkeypatch.setattr(provider_proxy, "reserve_provider_request", lambda: 0)
+    monkeypatch.setattr(provider_proxy, "record_limit_event", lambda *args: None)
+    monkeypatch.setattr(
+        provider_proxy, "_provider_request_policy", lambda: (1, 0, 0, 0)
+    )
+    monkeypatch.setattr(provider_proxy, "SSE_KEEPALIVE_INTERVAL_SECONDS", 0.005)
+
+    received = False
+
+    async def receive():
+        nonlocal received
+        if received:
+            return {"type": "http.disconnect"}
+        received = True
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    request = Request({
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+        "method": "POST", "scheme": "http", "path": "/api/provider/responses",
+        "raw_path": b"/api/provider/responses", "query_string": b"",
+        "headers": [(b"authorization", b"Bearer secret")],
+        "client": ("127.0.0.1", 1), "server": ("127.0.0.1", 8765),
+    }, receive)
+
+    async def scenario():
+        response = await provider_proxy.forward_provider_request(request, "responses")
+        return b"".join([chunk async for chunk in response.body_iterator])
+
+    body = asyncio.run(scenario())
+    assert b": deepswe buffering provider response\n\n" in body
+    assert body.endswith(
+        b'event: response.completed\ndata: {"type":"response.completed"}\n\n'
+    )
     assert provider_proxy._PROVIDER_CONCURRENCY.snapshot() == (0, 0)
 
 

@@ -4,6 +4,7 @@ import pytest
 from app import pricing
 from app.pricing import DEFAULT_PRICING, pricing_for_model, simplify_api_payload, sync_pricing
 from app.results import estimate_cost
+from app import results
 
 def _use_providers(monkeypatch, providers):
     """用内存快照替换缓存，隔离仓库 data/model-pricing.json。"""
@@ -59,6 +60,26 @@ def test_estimate_cost_charges_cache_at_input_price_without_discount(monkeypatch
 def test_estimate_cost_returns_none_without_tokens(monkeypatch):
     _use_providers(monkeypatch, {"openai": {"cheap": {"input": 1.0, "output": 2.0}}})
     assert estimate_cost(None, None, None, "standard", "cheap") is None
+
+def test_trial_backfills_missing_reported_cost_from_tokens(tmp_path, monkeypatch):
+    _use_providers(monkeypatch, {"openai": {"cheap": {"input": 1.0, "cache_read": 0.1, "output": 2.0}}})
+    trial = tmp_path / "task__one"
+    trial.mkdir()
+    (trial / "result.json").write_text(json.dumps({
+        "agent_result": {
+            "n_input_tokens": 1_000_000,
+            "n_cache_tokens": 500_000,
+            "n_output_tokens": 1_000_000,
+        },
+        "verifier_result": {"rewards": {"reward": 1}},
+    }), encoding="utf-8")
+
+    parsed = results._trial(trial, model="cheap")
+
+    assert parsed["reported_cost_usd"] is None
+    assert parsed["estimated_cost_usd"] == pytest.approx(2.55)
+    assert parsed["cost_usd"] == pytest.approx(2.55)
+    assert parsed["cost_source"] == "estimated"
 
 def test_repo_snapshot_is_valid_and_covers_current_model(monkeypatch):
     # 仓库自带快照必须可解析，且当前默认模型 gpt-5.6-sol 的单价与历史硬编码口径一致

@@ -12,9 +12,11 @@ import uuid
 from collections import defaultdict, deque
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlparse
 import psutil
 from sqlalchemy import select, text
+from .agent_versions import agent_version_catalog, resolve_agent_version
 from .config import settings
 from .database import SessionLocal
 from .docker_cleanup import (
@@ -29,6 +31,7 @@ from .pier_retry_patch.transient import (
     CONTEXT_LIMIT_EXCEPTION_TYPE,
     is_context_limit_failure,
 )
+from .pricing import pricing_details
 from .results import (
     _json as read_json, aggregate_trial_results, effective_run_error,
     estimate_cost, jobs_root_for, pier_trial_prefix, retry_incomplete_error,
@@ -268,9 +271,35 @@ def create_runs_with_admission(draft: RunBatchDraft) -> tuple[list[Run], dict]:
     preferences = get_preferences()
     max_parallel_tasks = int(preferences["max_parallel_tasks"])
     infrastructure_max_retries = int(preferences["infrastructure_max_retries"])
+    codex_stream_idle_timeout_seconds = int(
+        draft.codex_stream_idle_timeout_seconds
+        if draft.codex_stream_idle_timeout_seconds is not None
+        else preferences["codex_stream_idle_timeout_seconds"]
+    )
     requested = requested_trial_count(
         draft.tasks, draft.attempts_per_task, len(draft.agents)
     )
+    version_preferences = preferences.get("agent_versions") or {}
+    refresh_latest = any(
+        (version_preferences.get(agent) or {}).get("mode", "latest") == "latest"
+        for agent in draft.agents
+    )
+    use_local = any(
+        (version_preferences.get(agent) or {}).get("mode", "latest") == "local"
+        for agent in draft.agents
+    )
+    version_catalog = agent_version_catalog(
+        force_refresh=refresh_latest,
+        include_local=use_local,
+    )
+    resolved_versions = {
+        agent: resolve_agent_version(
+            agent,
+            version_preferences.get(agent),
+            catalog=version_catalog,
+        )
+        for agent in draft.agents
+    }
     with _creation_lock:
         with SessionLocal() as db:
             db.execute(text("BEGIN IMMEDIATE"))
@@ -280,11 +309,15 @@ def create_runs_with_admission(draft: RunBatchDraft) -> tuple[list[Run], dict]:
             runs = []
             for agent in draft.agents:
                 mapping = _reasoning_effort_adapter(agent, draft.reasoning_effort)
+                version = resolved_versions[agent]
                 run = Run(
                     status="queued", job_name=f"pending-{uuid.uuid4().hex}",
                     jobs_dir=str(preferences["jobs_dir"]),
                     credential_file=str(preferences["credential_file"]),
                     agent=agent, model=draft.model,
+                    agent_version_mode=version["mode"],
+                    agent_version_requested=version["version"],
+                    agent_version_source=version["source"],
                     reasoning_effort=draft.reasoning_effort, reasoning_effort_adapter=mapping,
                     reasoning_effort_effective=None,  # 有效值只能来自运行后的观测，创建时未知
                     tasks_json=json.dumps(draft.tasks), attempts_per_task=draft.attempts_per_task,
@@ -296,7 +329,7 @@ def create_runs_with_admission(draft: RunBatchDraft) -> tuple[list[Run], dict]:
                     agent_max_steps=int(preferences["agent_max_steps"]),
                     codex_request_max_retries=0,
                     codex_stream_max_retries=0,
-                    codex_stream_idle_timeout_seconds=draft.codex_stream_idle_timeout_seconds,
+                    codex_stream_idle_timeout_seconds=codex_stream_idle_timeout_seconds,
                     verification=draft.verification, service_tier=draft.service_tier,
                 )
                 db.add(run)
@@ -422,7 +455,13 @@ def _ensure_task_base_images(tasks: list[str]) -> None:
                     )
                 time.sleep(TASK_IMAGE_PULL_DELAYS_SEC[attempt])
 
-def _preflight(tasks: list[str], proxy_url: str | None = None) -> None:
+def _preflight(
+    tasks: list[str],
+    proxy_url: str | None = None,
+    progress: Callable[[str, str], None] | None = None,
+) -> None:
+    notify = progress or (lambda _phase, _message: None)
+    notify("validating_tasks", "正在检查任务目录与容器脚本")
     missing = [task for task in tasks if not (settings.tasks_dir / task).is_dir()]
     if missing:
         raise RuntimeError(f"任务目录缺失: {', '.join(missing)}")
@@ -431,17 +470,45 @@ def _preflight(tasks: list[str], proxy_url: str | None = None) -> None:
         # CRLF 的 shebang 在容器内变成 /bin/bash\r，verifier 必然拿不到 reward，agent 费用全部报废
         shown = ", ".join(crlf[:5]) + (f" 等 {len(crlf)} 个" if len(crlf) > 5 else "")
         raise RuntimeError(f"任务脚本为 CRLF 行尾，容器内无法执行: {shown}；请转为 LF 后重试")
+    notify("checking_docker", "正在检查 Docker 服务与容器模式")
     ok, message = docker_available()
     if not ok:
         raise RuntimeError(f"Docker 不可用: {message}")
     if proxy_url:
+        notify("checking_provider_connectivity", "正在从 Docker 网络检查模型代理连通性")
         _docker_proxy_connectivity(proxy_url)
+    notify("preparing_task_images", "正在检查或拉取任务基础镜像")
     _ensure_task_base_images(tasks)
+    notify("preparing_local_images", "正在检查本地任务与 Verifier 镜像")
     ensure_local_task_images(
         settings.tasks_dir,
         tasks,
         log_dir=settings.tasks_dir.parent / "data" / "local-image-builds",
     )
+
+def _runtime_status_path(jobs_root: Path, job_name: str) -> Path:
+    return jobs_root / f"{job_name}.runtime.json"
+
+def _write_runtime_status(
+    jobs_root: Path,
+    job_name: str,
+    phase: str,
+    message: str,
+    **details,
+) -> None:
+    try:
+        jobs_root.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(
+            _runtime_status_path(jobs_root, job_name),
+            {
+                "phase": phase,
+                "message": message,
+                "updated_at": datetime.now(UTC).isoformat(),
+                "details": details,
+            },
+        )
+    except OSError:
+        pass
 
 def _tail_text(path: Path, limit: int = 200_000) -> str:
     try:
@@ -758,6 +825,9 @@ def _pier_process_env(
         )
     )
     preferences = get_preferences()
+    process_env["DEEPSWE_ENVIRONMENT_SETUP_LIMIT"] = str(
+        max(int(preferences.get("max_parallel_environment_setups", 6)), 1)
+    )
     process_env["DEEPSWE_DOCKER_MEMORY_PAUSE_PERCENT"] = str(
         preferences.get("docker_memory_pause_percent", 80)
     )
@@ -786,7 +856,13 @@ def _verify_global_queue_patch(run_id: int) -> None:
             text=True,
             timeout=30,
         )
-        if result.returncode != 0 or "DEEPSWE_GLOBAL_QUEUE_PATCH_OK" not in result.stdout:
+        required_markers = (
+            "DEEPSWE_GLOBAL_QUEUE_PATCH_OK",
+            "DEEPSWE_ENVIRONMENT_SETUP_PATCH_OK",
+        )
+        if result.returncode != 0 or any(
+            marker not in result.stdout for marker in required_markers
+        ):
             detail = (result.stderr or result.stdout or "Pier 未返回补丁握手标记").strip()
             raise RuntimeError(f"全局 Trial 队列补丁验证失败：{detail[:1000]}")
         _queue_patch_verified = True
@@ -803,8 +879,22 @@ def _execute(run_id: int):
             tasks, agent, model, effort, attempts, concurrency, job_name = json.loads(run.tasks_json), run.agent, run.model, run.reasoning_effort, run.attempts_per_task, run.concurrency, run.job_name
             service_tier = run.service_tier
             jobs_root = jobs_root_for(run)
+        def progress(phase: str, message: str) -> None:
+            _write_runtime_status(
+                jobs_root,
+                job_name,
+                phase,
+                message,
+                agent=agent,
+                agent_version=run.agent_version_requested,
+            )
+        progress("checking_pier", "正在检查 Pier 与全局 Trial 调度补丁")
         _verify_global_queue_patch(run_id)
-        _preflight(tasks, _provider_proxy_url())
+        _preflight(tasks, _provider_proxy_url(), progress)
+        progress(
+            "preparing_agent_configuration",
+            f"正在准备 {agent} {run.agent_version_requested or 'latest'} 的认证与运行配置",
+        )
         secret_dir, auth = _write_secret_auth(cred.token)
         command_model = f"openai/{model}" if agent == "mini-swe-agent" and "/" not in model else model
         agent_divisor, verifier_divisor = _declared_timeouts(tasks)
@@ -825,6 +915,11 @@ def _execute(run_id: int):
             trial_budget = float(get_preferences().get("trial_budget_usd") or 0)
         except (TypeError, ValueError):
             trial_budget = 0.0
+        if run.agent_version_requested:
+            args += [
+                "--agent-kwarg",
+                f"version={run.agent_version_requested}",
+            ]
         if agent == "codex":
             config = _codex_config(
                 _provider_proxy_url(), secret_dir, model, effort,
@@ -870,11 +965,24 @@ def _execute(run_id: int):
             with _lock:
                 if run_id in _cancel_requested:
                     return
+                progress(
+                    "launching_pier",
+                    "正在启动 Pier；随后会为每个 Trial 构建 Agent 镜像并启动容器",
+                )
                 proc = subprocess.Popen(
                     args, cwd=settings.tasks_dir.parent, env=process_env, stdout=log, stderr=subprocess.STDOUT,
                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
                     start_new_session=os.name != "nt")
                 _processes[run_id] = proc
+            _write_runtime_status(
+                jobs_root,
+                job_name,
+                "pier_running",
+                "Pier 已启动，正在分配 Trial 与准备容器环境",
+                agent=agent,
+                agent_version=run.agent_version_requested,
+                pid=proc.pid,
+            )
             with SessionLocal() as db:
                 run = db.get(Run, run_id); run.pid = proc.pid; db.commit()
             guard_error = _wait_with_guard(proc, jobs_root / job_name, service_tier, agent, run.agent_max_steps, model=model)
@@ -885,12 +993,30 @@ def _execute(run_id: int):
                     run.status = "cancelled"; run.error = guard_error; run.finished_at = datetime.now(UTC)
                     db.commit()
         _sync_result(run_id, proc.returncode)
+        with SessionLocal() as db:
+            finished = db.get(Run, run_id)
+            if finished:
+                _write_runtime_status(
+                    jobs_root,
+                    job_name,
+                    finished.status,
+                    "Run 已完成" if finished.status == "completed" else (finished.error or "Run 已结束"),
+                    agent=agent,
+                    agent_version=run.agent_version_requested,
+                )
     except Exception as exc:
         with _state_lock, SessionLocal() as db:
             run = db.get(Run, run_id)
             if run and run.status not in TERMINAL_STATES:
                 run.status = "failed"; run.error = redact(str(exc), current_secrets()); run.finished_at = datetime.now(UTC)
                 db.commit()
+        if jobs_root and job_name:
+            _write_runtime_status(
+                jobs_root,
+                job_name,
+                "failed",
+                redact(str(exc), current_secrets())[:1000],
+            )
     finally:
         with _lock:
             _processes.pop(run_id, None)
@@ -1125,6 +1251,8 @@ def _prepare_retry_config(
     for agent_config in matching_agents:
         kwargs = agent_config.setdefault("kwargs", {})
         agent_env = agent_config.setdefault("env", {})
+        if run.agent_version_requested:
+            kwargs["version"] = run.agent_version_requested
         if run.agent == "mini-swe-agent":
             process_env.update({
                 "OPENAI_API_KEY": credential.token,
@@ -1545,6 +1673,9 @@ def _budget_value(preferences: dict, key: str) -> float:
         return 0.0
 
 def _visible_trial_cost(trial: dict, service_tier: str, model: str | None = None) -> float:
+    effective = trial.get("cost_usd")
+    if isinstance(effective, (int, float)) and not isinstance(effective, bool):
+        return float(effective)
     reported = trial.get("reported_cost_usd")
     if isinstance(reported, (int, float)) and not isinstance(reported, bool):
         return float(reported)
@@ -1966,7 +2097,19 @@ def _sync_result(run_id: int, returncode: int):
             run.reward = None
             run.passed = None
         run.input_tokens = stats.get("n_input_tokens"); run.cached_tokens = stats.get("n_cache_tokens")
-        run.output_tokens = stats.get("n_output_tokens"); run.cost_usd = stats.get("cost_usd")
+        run.output_tokens = stats.get("n_output_tokens")
+        reported_cost = stats.get("cost_usd")
+        run.cost_usd = (
+            reported_cost
+            if isinstance(reported_cost, (int, float)) and not isinstance(reported_cost, bool)
+            else estimate_cost(
+                run.input_tokens,
+                run.cached_tokens,
+                run.output_tokens,
+                run.service_tier,
+                run.model,
+            )
+        )
         has_result = bool(metrics) if run.verification else bool(data)
         success = returncode == 0 and has_result and not stats.get("n_errored_trials")
         if run.status not in TERMINAL_STATES:
@@ -2147,7 +2290,70 @@ def shutdown_processes() -> None:
 def serialize(run: Run) -> dict:
     progress = run_trial_progress(run)
     queue = queue_status(run.id)
-    return {"id":run.id,"run_code":run_code(run.id),"job_name":run.job_name,"status":run.status,"agent":run.agent,"model":run.model,"reasoning_effort":run.reasoning_effort,"reasoning_effort_adapter":run.reasoning_effort_adapter,"reasoning_effort_effective":run.reasoning_effort_effective,"pier_version":run.pier_version,"tasks":json.loads(run.tasks_json),"attempts_per_task":run.attempts_per_task,"concurrency":run.concurrency,"queue":queue,"agent_timeout_seconds":run.agent_timeout_seconds,"verifier_timeout_seconds":run.verifier_timeout_seconds,"retry_infrastructure_errors":run.retry_infrastructure_errors,"infrastructure_max_retries":run.infrastructure_max_retries,"agent_max_steps":run.agent_max_steps,"codex_request_max_retries":run.codex_request_max_retries,"codex_stream_max_retries":run.codex_stream_max_retries,"codex_stream_idle_timeout_seconds":run.codex_stream_idle_timeout_seconds,"created_at":run.created_at,"finished_at":run.finished_at,"passed":run.passed,"reward":run.reward,"progress":progress,"task_progress":run_task_progress(run),"input_tokens":run.input_tokens,"cached_tokens":run.cached_tokens,"uncached_input_tokens":max((run.input_tokens or 0)-(run.cached_tokens or 0),0),"output_tokens":run.output_tokens,"cost_usd":run.cost_usd,"reported_cost_usd":run.cost_usd,"estimated_cost_usd":estimate_cost(run.input_tokens,run.cached_tokens,run.output_tokens,run.service_tier,run.model),"service_tier":run.service_tier,"error":effective_run_error(run)}
+    estimated_cost = estimate_cost(
+        run.input_tokens,
+        run.cached_tokens,
+        run.output_tokens,
+        run.service_tier,
+        run.model,
+    )
+    stats = (
+        read_json(jobs_root_for(run) / run.job_name / "result.json").get("stats")
+        or {}
+    )
+    reported_cost = stats.get("cost_usd")
+    if not isinstance(reported_cost, (int, float)) or isinstance(reported_cost, bool):
+        reported_cost = None
+    effective_cost = (
+        reported_cost
+        if reported_cost is not None
+        else run.cost_usd if run.cost_usd is not None
+        else estimated_cost
+    )
+    return {
+        "id": run.id,
+        "run_code": run_code(run.id),
+        "job_name": run.job_name,
+        "status": run.status,
+        "agent": run.agent,
+        "agent_version_mode": run.agent_version_mode,
+        "agent_version_requested": run.agent_version_requested,
+        "agent_version_source": run.agent_version_source,
+        "model": run.model,
+        "reasoning_effort": run.reasoning_effort,
+        "reasoning_effort_adapter": run.reasoning_effort_adapter,
+        "reasoning_effort_effective": run.reasoning_effort_effective,
+        "pier_version": run.pier_version,
+        "tasks": json.loads(run.tasks_json),
+        "attempts_per_task": run.attempts_per_task,
+        "concurrency": run.concurrency,
+        "queue": queue,
+        "agent_timeout_seconds": run.agent_timeout_seconds,
+        "verifier_timeout_seconds": run.verifier_timeout_seconds,
+        "retry_infrastructure_errors": run.retry_infrastructure_errors,
+        "infrastructure_max_retries": run.infrastructure_max_retries,
+        "agent_max_steps": run.agent_max_steps,
+        "codex_request_max_retries": run.codex_request_max_retries,
+        "codex_stream_max_retries": run.codex_stream_max_retries,
+        "codex_stream_idle_timeout_seconds": run.codex_stream_idle_timeout_seconds,
+        "created_at": run.created_at,
+        "finished_at": run.finished_at,
+        "passed": run.passed,
+        "reward": run.reward,
+        "progress": progress,
+        "task_progress": run_task_progress(run),
+        "input_tokens": run.input_tokens,
+        "cached_tokens": run.cached_tokens,
+        "uncached_input_tokens": max((run.input_tokens or 0) - (run.cached_tokens or 0), 0),
+        "output_tokens": run.output_tokens,
+        "cost_usd": effective_cost,
+        "cost_source": "reported" if reported_cost is not None else "estimated" if effective_cost is not None else None,
+        "reported_cost_usd": reported_cost,
+        "estimated_cost_usd": estimated_cost,
+        "pricing": pricing_details(run.model),
+        "service_tier": run.service_tier,
+        "error": effective_run_error(run),
+    }
 
 def list_runs() -> list[dict]:
     with SessionLocal() as db: return [serialize(r) for r in db.scalars(select(Run).order_by(Run.id.desc())).all()]

@@ -15,6 +15,9 @@ SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 RUN_COLUMNS = {
     "reasoning_effort_adapter": "VARCHAR(80)",
     "reasoning_effort_effective": "VARCHAR(20)",
+    "agent_version_mode": "VARCHAR(20) NOT NULL DEFAULT 'latest'",
+    "agent_version_requested": "VARCHAR(80)",
+    "agent_version_source": "VARCHAR(30)",
     "agent_timeout_seconds": "INTEGER NOT NULL DEFAULT 5400",
     "verifier_timeout_seconds": "INTEGER NOT NULL DEFAULT 1800",
     "retry_infrastructure_errors": "BOOLEAN NOT NULL DEFAULT 1",

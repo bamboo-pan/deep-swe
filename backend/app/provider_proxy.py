@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import sqlite3
+import tempfile
 import threading
 import time
 import uuid
@@ -39,6 +40,17 @@ COOLDOWN_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+SUCCESS_STATUS_MIN = 200
+SUCCESS_STATUS_MAX = 299
+SSE_MEDIA_TYPE = "text/event-stream"
+SSE_KEEPALIVE_INTERVAL_SECONDS = 15.0
+STREAM_BUFFER_MEMORY_BYTES = 8 * 1024 * 1024
+SSE_TERMINAL_EVENT_TYPES = {
+    "message_stop",
+    "response.completed",
+    "response.failed",
+    "response.incomplete",
+}
 RUN_ID_HEADER = "x-deepswe-run-id"
 TRIAL_ID_HEADER = "x-deepswe-trial-id"
 PROVIDER_TELEMETRY_RETENTION_SECONDS = 24 * 60 * 60
@@ -46,7 +58,12 @@ PROVIDER_TELEMETRY_RETENTION_SECONDS = 24 * 60 * 60
 _PROVIDER_TELEMETRY_LOCK = threading.Lock()
 _ACTUAL_PROVIDER_REQUESTS: deque[float] = deque()
 _PROVIDER_RESPONSE_OUTCOMES: deque[tuple[float, int]] = deque()
+_PROVIDER_STREAM_FAILURES: deque[float] = deque()
 _TRIAL_PROVIDER_TELEMETRY: dict[tuple[int, str], dict] = {}
+
+
+class IncompleteProviderStreamError(RuntimeError):
+    """A successful SSE response ended without its protocol terminal event."""
 
 
 class _ProviderConcurrencyLimiter:
@@ -81,11 +98,12 @@ class _ProviderConcurrencyLimiter:
 _PROVIDER_CONCURRENCY = _ProviderConcurrencyLimiter()
 
 
-def _provider_request_policy() -> tuple[int, int, int]:
+def _provider_request_policy() -> tuple[int, int, int, int]:
     preferences = get_preferences()
     return (
         max(int(preferences["provider_max_concurrency"]), 0),
         max(int(preferences["provider_max_retries"]), 0),
+        max(int(preferences["provider_stream_max_retries"]), 0),
         max(int(preferences["provider_retry_interval_seconds"]), 0),
     )
 
@@ -110,6 +128,8 @@ def _prune_provider_telemetry(now: float) -> None:
         _ACTUAL_PROVIDER_REQUESTS.popleft()
     while _PROVIDER_RESPONSE_OUTCOMES and _PROVIDER_RESPONSE_OUTCOMES[0][0] <= cutoff:
         _PROVIDER_RESPONSE_OUTCOMES.popleft()
+    while _PROVIDER_STREAM_FAILURES and _PROVIDER_STREAM_FAILURES[0] <= cutoff:
+        _PROVIDER_STREAM_FAILURES.popleft()
     stale_cutoff = now - PROVIDER_TELEMETRY_RETENTION_SECONDS
     stale = [
         key for key, value in _TRIAL_PROVIDER_TELEMETRY.items()
@@ -124,6 +144,9 @@ def record_actual_provider_attempt(
     attempt: int,
     max_retries: int,
     *,
+    stream_retry: bool = False,
+    stream_retry_number: int = 0,
+    stream_max_retries: int = 0,
     now: float | None = None,
 ) -> None:
     current = time.time() if now is None else float(now)
@@ -137,18 +160,29 @@ def record_actual_provider_attempt(
             "provider_request_count": 0,
             "provider_retries_used": 0,
             "provider_max_retries": max(int(max_retries), 0),
+            "provider_stream_retries_used": 0,
+            "provider_stream_max_retries": max(int(stream_max_retries), 0),
             "updated_at": current,
         })
         telemetry["provider_request_count"] += 1
-        if attempt <= 0:
+        if attempt <= 0 and not stream_retry:
             # A new Agent request supersedes the previous request's failure
             # state. Keep the lifetime request count, but make the card show
             # only the current request's response/retry state.
             telemetry["provider_response_code"] = None
             telemetry["provider_retries_used"] = 0
+            telemetry["provider_stream_retries_used"] = 0
         else:
             telemetry["provider_retries_used"] = int(attempt)
         telemetry["provider_max_retries"] = max(int(max_retries), 0)
+        if stream_retry:
+            telemetry["provider_stream_retries_used"] = min(
+                max(int(stream_retry_number), 0),
+                max(int(stream_max_retries), 0),
+            )
+        telemetry["provider_stream_max_retries"] = max(
+            int(stream_max_retries), 0
+        )
         telemetry["updated_at"] = current
 
 
@@ -169,11 +203,42 @@ def record_provider_response(
             "provider_request_count": 0,
             "provider_retries_used": 0,
             "provider_max_retries": 0,
+            "provider_stream_retries_used": 0,
+            "provider_stream_max_retries": 0,
             "updated_at": current,
         })
         telemetry["provider_response_code"] = int(status_code)
         if int(status_code) < 400:
             telemetry["provider_retries_used"] = 0
+        telemetry["updated_at"] = current
+
+
+def record_provider_stream_failure(
+    identity: tuple[int, str] | None,
+    retry_number: int,
+    max_retries: int,
+    *,
+    now: float | None = None,
+) -> None:
+    current = time.time() if now is None else float(now)
+    with _PROVIDER_TELEMETRY_LOCK:
+        _PROVIDER_STREAM_FAILURES.append(current)
+        _prune_provider_telemetry(current)
+        if identity is None:
+            return
+        telemetry = _TRIAL_PROVIDER_TELEMETRY.setdefault(identity, {
+            "provider_response_code": None,
+            "provider_request_count": 0,
+            "provider_retries_used": 0,
+            "provider_max_retries": 0,
+            "provider_stream_retries_used": 0,
+            "provider_stream_max_retries": max(int(max_retries), 0),
+            "updated_at": current,
+        })
+        telemetry["provider_stream_retries_used"] = min(
+            max(int(retry_number), 0), max(int(max_retries), 0)
+        )
+        telemetry["provider_stream_max_retries"] = max(int(max_retries), 0)
         telemetry["updated_at"] = current
 
 
@@ -203,6 +268,7 @@ def provider_response_stats_last_60_seconds(now: float | None = None) -> dict:
             1 for _timestamp, status_code in _PROVIDER_RESPONSE_OUTCOMES
             if status_code >= 400
         )
+        stream_failures = len(_PROVIDER_STREAM_FAILURES)
     return {
         "completed_requests_last_60_seconds": completed,
         "failed_requests_last_60_seconds": failed,
@@ -210,6 +276,7 @@ def provider_response_stats_last_60_seconds(now: float | None = None) -> dict:
             round(failed / completed * 100, 1) if completed else None
         ),
         "response_code_counts_last_60_seconds": response_code_counts,
+        "stream_failures_last_60_seconds": stream_failures,
     }
 
 
@@ -218,6 +285,7 @@ def _reset_provider_telemetry() -> None:
     with _PROVIDER_TELEMETRY_LOCK:
         _ACTUAL_PROVIDER_REQUESTS.clear()
         _PROVIDER_RESPONSE_OUTCOMES.clear()
+        _PROVIDER_STREAM_FAILURES.clear()
         _TRIAL_PROVIDER_TELEMETRY.clear()
 
 
@@ -226,6 +294,96 @@ async def _close_upstream_and_release(upstream) -> None:
         await upstream.aclose()
     finally:
         await _PROVIDER_CONCURRENCY.release()
+
+
+def _is_success_status(status_code: int) -> bool:
+    return SUCCESS_STATUS_MIN <= int(status_code) <= SUCCESS_STATUS_MAX
+
+
+def _is_sse_response(headers) -> bool:
+    content_type = str(headers.get("content-type") or "").lower()
+    return content_type.split(";", 1)[0].strip() == SSE_MEDIA_TYPE
+
+
+def _sse_lines_have_terminal_event(lines) -> bool:
+    event_name = ""
+    data_lines: list[str] = []
+
+    def is_terminal() -> bool:
+        if event_name in SSE_TERMINAL_EVENT_TYPES:
+            return True
+        data = "\n".join(data_lines).strip()
+        if data == "[DONE]":
+            return True
+        if not data:
+            return False
+        try:
+            payload = json.loads(data)
+        except (json.JSONDecodeError, TypeError):
+            return False
+        return (
+            isinstance(payload, dict)
+            and payload.get("type") in SSE_TERMINAL_EVENT_TYPES
+        )
+
+    for line in lines:
+        if not line:
+            if is_terminal():
+                return True
+            event_name = ""
+            data_lines = []
+            continue
+        if line.startswith(":"):
+            continue
+        field, separator, value = line.partition(":")
+        if not separator:
+            value = ""
+        elif value.startswith(" "):
+            value = value[1:]
+        if field == "event":
+            event_name = value
+        elif field == "data":
+            data_lines.append(value)
+    return is_terminal()
+
+
+def _sse_has_terminal_event(content: bytes) -> bool:
+    return _sse_lines_have_terminal_event(
+        content.decode("utf-8", errors="replace").splitlines()
+    )
+
+
+def _spool_has_sse_terminal_event(spool) -> bool:
+    spool.seek(0)
+    terminal = _sse_lines_have_terminal_event(
+        raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        for raw in spool
+    )
+    spool.seek(0)
+    return terminal
+
+
+async def _buffer_upstream_response(upstream):
+    spool = tempfile.SpooledTemporaryFile(max_size=STREAM_BUFFER_MEMORY_BYTES)
+    captured = bytearray()
+    try:
+        async for chunk in upstream.aiter_raw():
+            spool.write(chunk)
+            if len(captured) < 128_000:
+                captured.extend(chunk[:128_000 - len(captured)])
+        spool.seek(0)
+        return spool, bytes(captured)
+    except BaseException:
+        spool.close()
+        raise
+
+
+def _iter_spooled_response(spool):
+    try:
+        while chunk := spool.read(64 * 1024):
+            yield chunk
+    finally:
+        spool.close()
 
 
 async def _record_limit_event_safely(status_code: int, body: bytes) -> None:
@@ -429,7 +587,12 @@ def provider_queue_status(now: float | None = None) -> dict:
             next_release = max(sent[0] + 60.0 - current, 0.0)
         else:
             next_release = 0.0
-    max_concurrency, max_retries, retry_interval_seconds = _provider_request_policy()
+    (
+        max_concurrency,
+        max_retries,
+        stream_max_retries,
+        retry_interval_seconds,
+    ) = _provider_request_policy()
     active_requests, waiting_for_concurrency = _PROVIDER_CONCURRENCY.snapshot()
     response_stats = provider_response_stats_last_60_seconds(current)
     return {
@@ -443,10 +606,113 @@ def provider_queue_status(now: float | None = None) -> dict:
         "active_requests": active_requests,
         "waiting_for_concurrency": waiting_for_concurrency,
         "max_retries": max_retries,
+        "stream_max_retries": stream_max_retries,
         "retry_interval_seconds": retry_interval_seconds,
         "actual_requests_last_60_seconds": actual_provider_requests_last_60_seconds(current),
         **response_stats,
     }
+
+
+async def _open_provider_response(
+    *,
+    client,
+    method: str,
+    target: str,
+    headers: dict,
+    body: bytes,
+    identity: tuple[int, str] | None,
+    max_concurrency: int,
+    max_retries: int,
+    stream_max_retries: int,
+    retry_interval_seconds: int,
+    stream_retry: bool,
+    stream_retry_number: int,
+    require_success: bool,
+):
+    for attempt in range(max_retries + 1):
+        delay = await asyncio.to_thread(reserve_provider_request)
+        if delay:
+            await asyncio.sleep(delay)
+        await _PROVIDER_CONCURRENCY.acquire(max_concurrency)
+        record_actual_provider_attempt(
+            identity,
+            attempt,
+            max_retries,
+            stream_retry=stream_retry,
+            stream_retry_number=stream_retry_number,
+            stream_max_retries=stream_max_retries,
+        )
+        try:
+            upstream = await client.send(
+                client.build_request(method, target, headers=headers, content=body),
+                stream=True,
+            )
+        except httpx.HTTPError as exc:
+            await _PROVIDER_CONCURRENCY.release()
+            record_provider_response(identity, 502)
+            if attempt >= max_retries:
+                raise HTTPException(
+                    502, f"Provider proxy request failed: {exc}"
+                ) from exc
+            if retry_interval_seconds:
+                await asyncio.sleep(retry_interval_seconds)
+            continue
+        except BaseException:
+            await _PROVIDER_CONCURRENCY.release()
+            raise
+
+        response_headers = {
+            key: value for key, value in upstream.headers.items()
+            if key.lower() not in HOP_BY_HOP_HEADERS
+        }
+        record_provider_response(identity, upstream.status_code)
+        if upstream.status_code not in RETRYABLE_STATUS_CODES:
+            if require_success and not _is_success_status(upstream.status_code):
+                try:
+                    content = await upstream.aread()
+                finally:
+                    await _close_upstream_and_release(upstream)
+                return None, response_headers, (upstream.status_code, content)
+            return upstream, response_headers, None
+
+        read_error = None
+        try:
+            content = await upstream.aread()
+        except httpx.HTTPError as exc:
+            read_error = exc
+            content = b""
+        except BaseException:
+            await _close_upstream_and_release(upstream)
+            raise
+        await _close_upstream_and_release(upstream)
+        status_code = upstream.status_code
+        if status_code == 429:
+            await _record_limit_event_safely(status_code, content)
+        if attempt >= max_retries:
+            if read_error is not None and not content:
+                raise HTTPException(
+                    502, f"Provider proxy response failed: {read_error}"
+                ) from read_error
+            return None, response_headers, (status_code, content)
+        if retry_interval_seconds:
+            await asyncio.sleep(retry_interval_seconds)
+
+    raise HTTPException(502, "Provider proxy request failed after retries")
+
+
+async def _buffer_and_close_upstream(upstream):
+    spool = None
+    try:
+        spool, captured = await _buffer_upstream_response(upstream)
+    except BaseException:
+        await _close_upstream_and_release(upstream)
+        raise
+    try:
+        await _close_upstream_and_release(upstream)
+    except BaseException:
+        spool.close()
+        raise
+    return spool, captured
 
 
 async def forward_provider_request(request: Request, path: str):
@@ -456,93 +722,222 @@ async def forward_provider_request(request: Request, path: str):
         key: value for key, value in request.headers.items()
         if key.lower() not in HOP_BY_HOP_HEADERS | {RUN_ID_HEADER, TRIAL_ID_HEADER}
     }
+    # SSE completeness is validated from the raw upstream bytes. Explicitly
+    # disable content compression so all three agent protocols remain parseable.
+    headers["accept-encoding"] = "identity"
     identity = _provider_request_identity(request)
     target = _target_url(credential.url, path, request.url.query)
-    max_concurrency, max_retries, retry_interval_seconds = _provider_request_policy()
+    (
+        max_concurrency,
+        max_retries,
+        stream_max_retries,
+        retry_interval_seconds,
+    ) = _provider_request_policy()
     client = httpx.AsyncClient(timeout=httpx.Timeout(1800, connect=30), follow_redirects=False)
-    upstream = None
-    for attempt in range(max_retries + 1):
-        delay = await asyncio.to_thread(reserve_provider_request)
-        if delay:
-            await asyncio.sleep(delay)
-        await _PROVIDER_CONCURRENCY.acquire(max_concurrency)
-        record_actual_provider_attempt(identity, attempt, max_retries)
-        try:
-            upstream = await client.send(
-                client.build_request(request.method, target, headers=headers, content=body),
-                stream=True,
-            )
-        except httpx.HTTPError as exc:
-            await _PROVIDER_CONCURRENCY.release()
-            record_provider_response(identity, 502)
-            if attempt >= max_retries:
-                await client.aclose()
-                raise HTTPException(502, f"Provider proxy request failed: {exc}") from exc
-            if retry_interval_seconds:
-                await asyncio.sleep(retry_interval_seconds)
-            continue
-        except BaseException:
-            await _PROVIDER_CONCURRENCY.release()
-            await client.aclose()
-            raise
-
-        response_headers = {
-            key: value for key, value in upstream.headers.items()
-            if key.lower() not in HOP_BY_HOP_HEADERS
-        }
-        record_provider_response(identity, upstream.status_code)
-        if upstream.status_code not in RETRYABLE_STATUS_CODES:
-            break
-
-        read_error = None
-        try:
-            content = await upstream.aread()
-        except httpx.HTTPError as exc:
-            read_error = exc
-            content = b""
-        except BaseException:
-            try:
-                await _close_upstream_and_release(upstream)
-            finally:
-                await client.aclose()
-            raise
-        try:
-            await _close_upstream_and_release(upstream)
-        except BaseException:
-            await client.aclose()
-            raise
-        status_code = upstream.status_code
-        if status_code == 429:
-            await _record_limit_event_safely(status_code, content)
-        if attempt >= max_retries:
-            await client.aclose()
-            if read_error is not None and not content:
-                raise HTTPException(
-                    502, f"Provider proxy response failed: {read_error}"
-                ) from read_error
-            return Response(content, status_code, headers=response_headers)
-        upstream = None
-        if retry_interval_seconds:
-            await asyncio.sleep(retry_interval_seconds)
-
+    try:
+        upstream, response_headers, terminal_response = await _open_provider_response(
+            client=client,
+            method=request.method,
+            target=target,
+            headers=headers,
+            body=body,
+            identity=identity,
+            max_concurrency=max_concurrency,
+            max_retries=max_retries,
+            stream_max_retries=stream_max_retries,
+            retry_interval_seconds=retry_interval_seconds,
+            stream_retry=False,
+            stream_retry_number=0,
+            require_success=False,
+        )
+    except BaseException:
+        await client.aclose()
+        raise
+    if terminal_response is not None:
+        status_code, content = terminal_response
+        await client.aclose()
+        return Response(content, status_code, headers=response_headers)
     if upstream is None:
         await client.aclose()
         raise HTTPException(502, "Provider proxy request failed after retries")
 
-    async def stream():
-        captured = bytearray()
-        try:
-            async for chunk in upstream.aiter_raw():
-                if len(captured) < 128_000:
-                    captured.extend(chunk[:128_000 - len(captured)])
-                yield chunk
-        finally:
+    if not _is_success_status(upstream.status_code):
+        async def passthrough_stream():
+            captured = bytearray()
             try:
-                await _close_upstream_and_release(upstream)
+                async for chunk in upstream.aiter_raw():
+                    if len(captured) < 128_000:
+                        captured.extend(chunk[:128_000 - len(captured)])
+                    yield chunk
             finally:
-                await client.aclose()
-            if captured:
-                await _record_limit_event_safely(upstream.status_code, bytes(captured))
+                try:
+                    await _close_upstream_and_release(upstream)
+                finally:
+                    await client.aclose()
+                if captured:
+                    await _record_limit_event_safely(
+                        upstream.status_code, bytes(captured)
+                    )
+
+        return StreamingResponse(
+            passthrough_stream(),
+            status_code=upstream.status_code,
+            headers=response_headers,
+            media_type=upstream.headers.get("content-type"),
+        )
+
+    async def stream():
+        current_upstream = upstream
+        downstream_is_sse = _is_sse_response(upstream.headers)
+        last_error: Exception | None = None
+        try:
+            for stream_attempt in range(stream_max_retries + 1):
+                if stream_attempt > 0:
+                    if retry_interval_seconds:
+                        remaining = float(retry_interval_seconds)
+                        while remaining > 0:
+                            wait = min(
+                                remaining, SSE_KEEPALIVE_INTERVAL_SECONDS
+                            )
+                            await asyncio.sleep(wait)
+                            remaining -= wait
+                            if downstream_is_sse and remaining > 0:
+                                yield b": deepswe waiting to retry provider stream\n\n"
+
+                    open_task = asyncio.create_task(
+                        _open_provider_response(
+                            client=client,
+                            method=request.method,
+                            target=target,
+                            headers=headers,
+                            body=body,
+                            identity=identity,
+                            max_concurrency=max_concurrency,
+                            max_retries=max_retries,
+                            stream_max_retries=stream_max_retries,
+                            retry_interval_seconds=retry_interval_seconds,
+                            stream_retry=True,
+                            stream_retry_number=stream_attempt,
+                            require_success=True,
+                        )
+                    )
+                    try:
+                        if downstream_is_sse:
+                            while not open_task.done():
+                                done, _pending = await asyncio.wait(
+                                    {open_task},
+                                    timeout=SSE_KEEPALIVE_INTERVAL_SECONDS,
+                                )
+                                if not done:
+                                    yield b": deepswe retrying provider stream\n\n"
+                        (
+                            current_upstream,
+                            _headers,
+                            terminal_response,
+                        ) = await open_task
+                        if terminal_response is not None:
+                            status_code, _content = terminal_response
+                            raise RuntimeError(
+                                "Provider stream retry exhausted request retries "
+                                f"with HTTP {status_code}"
+                            )
+                        if current_upstream is None:
+                            raise RuntimeError(
+                                "Provider stream retry produced no response"
+                            )
+                    except asyncio.CancelledError:
+                        if not open_task.done():
+                            open_task.cancel()
+                            try:
+                                await open_task
+                            except BaseException:
+                                pass
+                        raise
+                    except Exception as exc:
+                        last_error = exc
+                        record_provider_stream_failure(
+                            identity,
+                            stream_attempt,
+                            stream_max_retries,
+                        )
+                        logger.warning(
+                            "Provider stream resend %s/%s failed for %s: %s",
+                            stream_attempt,
+                            stream_max_retries,
+                            identity,
+                            exc,
+                        )
+                        continue
+
+                if (
+                    downstream_is_sse
+                    and not _is_sse_response(current_upstream.headers)
+                ):
+                    await _close_upstream_and_release(current_upstream)
+                    last_error = RuntimeError(
+                        "Provider stream retry changed the response content type"
+                    )
+                    record_provider_stream_failure(
+                        identity,
+                        stream_attempt,
+                        stream_max_retries,
+                    )
+                    continue
+
+                is_sse = _is_sse_response(current_upstream.headers)
+                read_task = asyncio.create_task(
+                    _buffer_and_close_upstream(current_upstream)
+                )
+                try:
+                    if is_sse:
+                        while not read_task.done():
+                            done, _pending = await asyncio.wait(
+                                {read_task},
+                                timeout=SSE_KEEPALIVE_INTERVAL_SECONDS,
+                            )
+                            if not done:
+                                yield b": deepswe buffering provider response\n\n"
+                    spool, captured = await read_task
+                    if is_sse and not _spool_has_sse_terminal_event(spool):
+                        spool.close()
+                        raise IncompleteProviderStreamError(
+                            "Provider SSE stream ended before a terminal event"
+                        )
+                    if captured:
+                        await _record_limit_event_safely(
+                            current_upstream.status_code, captured
+                        )
+                    for chunk in _iter_spooled_response(spool):
+                        yield chunk
+                    return
+                except asyncio.CancelledError:
+                    if not read_task.done():
+                        read_task.cancel()
+                        try:
+                            await read_task
+                        except BaseException:
+                            pass
+                    raise
+                except Exception as exc:
+                    last_error = exc
+                    record_provider_stream_failure(
+                        identity,
+                        stream_attempt,
+                        stream_max_retries,
+                    )
+                    logger.warning(
+                        "Provider stream attempt %s/%s failed for %s: %s",
+                        stream_attempt + 1,
+                        stream_max_retries + 1,
+                        identity,
+                        exc,
+                    )
+                    continue
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("Provider stream retries produced no response")
+        finally:
+            await client.aclose()
 
     return StreamingResponse(
         stream(), status_code=upstream.status_code, headers=response_headers,

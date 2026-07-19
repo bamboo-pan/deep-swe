@@ -91,6 +91,19 @@ def pricing_for_model(model: str | None) -> dict | None:
     wanted = model.strip().lower()
     return index["exact"].get(wanted) or index["bare"].get(wanted)
 
+def pricing_details(model: str | None) -> dict:
+    """Return UI-ready pricing metadata in $/1M tokens."""
+    found = pricing_for_model(model)
+    pricing = found or DEFAULT_PRICING
+    return {
+        **pricing,
+        "source": "models.dev" if found else "default",
+        "unit": "USD / 1M tokens",
+    }
+
+def pricing_catalog(models: list[str]) -> dict[str, dict]:
+    return {model: pricing_details(model) for model in models}
+
 def pricing_meta() -> dict:
     with _lock:
         _load_locked()

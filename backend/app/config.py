@@ -13,10 +13,13 @@ class AppSettings(BaseSettings):
     default_model: str = "gpt-5.6-sol"
     default_effort: str = "high"
     max_parallel_tasks: int = 6
+    max_parallel_environment_setups: int = 6
     provider_rpm: int = 0
     provider_max_concurrency: int = 0
     provider_max_retries: int = 6
+    provider_stream_max_retries: int = 3
     provider_retry_interval_seconds: int = 4
+    codex_stream_idle_timeout_seconds: int = 600
     squid_read_timeout_seconds: int = 1800
     docker_memory_pause_percent: float = 80.0
     agent_timeout_seconds: int = 5400

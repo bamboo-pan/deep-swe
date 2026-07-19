@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete, select
+from .agent_versions import agent_version_catalog
 from .config import settings
 from .compare_analysis import (
     DEFAULT_ANALYSIS_PROMPT, CompareAnalysisInputError, CompareAnalysisProviderError,
@@ -31,7 +32,7 @@ from .docker_cleanup import (
 from .models import ACTIVE_STATES, TERMINAL_STATES, Baseline, Run, Setting
 from .official_stats import load_official_stats, official_stats_meta, sync_official_stats
 from .preferences import KEYS as PREFERENCE_KEYS, get_preferences, update_preferences
-from .pricing import pricing_meta, sync_pricing
+from .pricing import pricing_catalog, pricing_meta, sync_pricing
 from .provider_proxy import (
     forward_provider_request, latest_limit_event, provider_queue_status,
 )
@@ -56,7 +57,7 @@ from .schemas import (
     concurrency_advice,
 )
 from .security import is_safe_job_name, read_credential
-from .task_suite import DEFAULT_TASKS, DEFAULT_TASK_SUITE_NAME
+from .task_suite import DEFAULT_TASKS, DEFAULT_TASK_SUITE_NAME, TASK_PRESETS
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -108,6 +109,7 @@ def _provider_bootstrap(
     }
     return {
         "models": model_ids,
+        "model_pricing": pricing_catalog(model_ids),
         "model_efforts": model_efforts,
         "model_efforts_known": model_efforts_known,
         "model_defaults": model_defaults,
@@ -152,9 +154,12 @@ def bootstrap():
             pass
     if preferences["credential_file"] not in credential_options: credential_options.insert(0, preferences["credential_file"])
     job_options = list(dict.fromkeys([preferences["jobs_dir"], str(settings.jobs_dir)]))
-    task_choices = []
     official_stats = load_official_stats()
-    for index, task in enumerate(DEFAULT_TASKS, 1):
+    task_choice_cache = {}
+
+    def task_choice(task: str, fallback_index: int) -> dict:
+        if task in task_choice_cache:
+            return task_choice_cache[task]
         metadata = {}
         path = settings.tasks_dir / task / "task.toml"
         try:
@@ -163,7 +168,17 @@ def bootstrap():
             pass
         stats = official_stats.get(task) or {}
         task_number = task_numbers.get(task)
-        task_choices.append({"id": task, "task_number": task_number, "suite_id": f"TASK-{task_number:03d}" if task_number else f"T{index:02d}", "external_id": metadata.get("ext_id"), "title": metadata.get("display_title") or task, "language": metadata.get("language"), "category": metadata.get("category"), "available": task in available, "official_pass_rate": stats.get("pass_rate"), "official_avg_duration_seconds": stats.get("avg_duration_seconds")})
+        choice = {"id": task, "task_number": task_number, "suite_id": f"TASK-{task_number:03d}" if task_number else f"T{fallback_index:02d}", "external_id": metadata.get("ext_id"), "title": metadata.get("display_title") or task, "language": metadata.get("language"), "category": metadata.get("category"), "available": task in available, "official_pass_rate": stats.get("pass_rate"), "official_avg_duration_seconds": stats.get("avg_duration_seconds")}
+        task_choice_cache[task] = choice
+        return choice
+
+    task_presets = []
+    for preset in TASK_PRESETS:
+        task_presets.append({
+            **{key: value for key, value in preset.items() if key != "tasks"},
+            "tasks": [task_choice(task, index) for index, task in enumerate(preset["tasks"], 1)],
+        })
+    task_choices = [task_choice(task, index) for index, task in enumerate(DEFAULT_TASKS, 1)]
     provider = _provider_bootstrap(preferences, force_refresh=True)
     return {
         "defaults": {
@@ -173,6 +188,7 @@ def bootstrap():
         },
         "agents": ["mini-swe-agent", "codex", "claude-code"],
         "models": provider["models"],
+        "model_pricing": provider["model_pricing"],
         "model_efforts": provider["model_efforts"],
         "model_efforts_known": provider["model_efforts_known"],
         "model_defaults": provider["model_defaults"],
@@ -184,6 +200,7 @@ def bootstrap():
             "jobs_dirs": job_options,
         },
         "task_suite": {"name": DEFAULT_TASK_SUITE_NAME, "tasks": task_choices},
+        "task_presets": task_presets,
     }
 
 @app.get("/api/diagnostics")
@@ -409,6 +426,7 @@ def delete_run(run_id:int):
         shutil.rmtree(target, ignore_errors=True)
         (jobs_root/f"{job_name}.supervisor.log").unlink(missing_ok=True)
         (jobs_root/f"{job_name}.docker-cleanup.json").unlink(missing_ok=True)
+        (jobs_root/f"{job_name}.runtime.json").unlink(missing_ok=True)
     for retry_name in retry_names:
         retry_target = _safe_job_dir(jobs_root, retry_name)
         if retry_target:
@@ -683,6 +701,17 @@ def refresh_pricing():
         return sync_pricing()
     except Exception as exc:
         raise HTTPException(502, f"模型定价同步失败：{exc}")
+
+@app.get("/api/agents/versions")
+def read_agent_versions():
+    return agent_version_catalog()
+
+@app.post("/api/agents/versions/refresh")
+def refresh_agent_versions():
+    try:
+        return agent_version_catalog(force_refresh=True)
+    except Exception as exc:
+        raise HTTPException(502, f"Agent 版本目录刷新失败：{exc}")
 
 @app.get("/api/settings")
 def read_settings(): return get_preferences()

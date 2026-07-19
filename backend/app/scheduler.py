@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .database import SessionLocal
-from .models import ACTIVE_STATES, Run, TrialQueueEntry
+from .models import ACTIVE_STATES, EnvironmentSetupLease, Run, TrialQueueEntry
 from .preferences import get_preferences
 
 PENDING_QUEUE_STATES = ("pending", "queued")
@@ -135,6 +135,11 @@ def clear_run_queue(run_id: int, *, db: Session | None = None) -> int:
     owns_session = db is None
     session = db or SessionLocal()
     try:
+        session.execute(
+            delete(EnvironmentSetupLease).where(
+                EnvironmentSetupLease.run_id == run_id
+            )
+        )
         result = session.execute(
             delete(TrialQueueEntry).where(TrialQueueEntry.run_id == run_id)
         )
@@ -149,6 +154,11 @@ def clear_run_queue(run_id: int, *, db: Session | None = None) -> int:
 def clear_inactive_queue_entries() -> int:
     with SessionLocal() as db:
         active_run_ids = select(Run.id).where(Run.status.in_(ACTIVE_STATES))
+        db.execute(
+            delete(EnvironmentSetupLease).where(
+                EnvironmentSetupLease.run_id.not_in(active_run_ids)
+            )
+        )
         result = db.execute(
             delete(TrialQueueEntry).where(
                 TrialQueueEntry.run_id.not_in(active_run_ids)

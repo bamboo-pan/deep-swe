@@ -14,7 +14,7 @@ class RunOptions(BaseModel):
     reasoning_effort: Effort = "high"
     tasks: list[str] = Field(min_length=1)
     attempts_per_task: int = Field(1, ge=1, le=10)
-    codex_stream_idle_timeout_seconds: int = Field(600, ge=30, le=1800)
+    codex_stream_idle_timeout_seconds: int | None = Field(None, ge=30, le=1800)
     verification: bool = True
     service_tier: Literal["standard", "batch", "priority"] = "standard"
 
@@ -31,17 +31,27 @@ class RunBatchDraft(RunOptions):
             raise ValueError("Agent 不能重复")
         return value
 
+class AgentVersionPreference(BaseModel):
+    mode: Literal["latest", "local"] = "latest"
+    version: str | None = Field(None, min_length=1, max_length=80)
+
 class SettingsUpdate(BaseModel):
     credential_file: str | None = None
     jobs_dir: str | None = None
     default_agent: Agent | None = None
     default_model: str | None = None
     default_effort: Effort | None = None
+    agent_versions: dict[Agent, AgentVersionPreference] | None = None
     max_parallel_tasks: int | None = Field(None, ge=1, le=MAX_PARALLEL_TASKS)
+    max_parallel_environment_setups: int | None = Field(
+        None, ge=1, le=MAX_PARALLEL_TASKS
+    )
     provider_rpm: int | None = Field(None, ge=0, le=100000)
     provider_max_concurrency: int | None = Field(None, ge=0, le=1000)
     provider_max_retries: int | None = Field(None, ge=0, le=300)
+    provider_stream_max_retries: int | None = Field(None, ge=0, le=20)
     provider_retry_interval_seconds: int | None = Field(None, ge=0, le=3600)
+    codex_stream_idle_timeout_seconds: int | None = Field(None, ge=30, le=1800)
     squid_read_timeout_seconds: int | None = Field(None, ge=900, le=7200)
     docker_memory_pause_percent: float | None = Field(None, ge=0, le=95)
     agent_timeout_seconds: int | None = Field(None, ge=60, le=21600)

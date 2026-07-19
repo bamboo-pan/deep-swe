@@ -81,7 +81,8 @@ def test_lifespan_can_skip_startup_reap_for_side_by_side_server(monkeypatch):
 
 def test_bootstrap_has_frontier_regression_suite():
     with TestClient(app) as client:
-        suite = client.get("/api/bootstrap").json()["task_suite"]
+        payload = client.get("/api/bootstrap").json()
+        suite = payload["task_suite"]
         tasks = suite["tasks"]
         assert suite["name"] == "frontier-regression-4"
         assert [task["id"] for task in tasks] == [
@@ -91,6 +92,34 @@ def test_bootstrap_has_frontier_regression_suite():
             "sql-formatter-bigquery-pipe-formatting",
         ]
         assert all(task["suite_id"].startswith("TASK-") for task in tasks if task["available"])
+
+        presets = payload["task_presets"]
+        assert [preset["id"] for preset in presets] == [
+            "workflow-validation",
+            "degradation-regression",
+            "intelligence-ladder",
+        ]
+        assert [preset["attempts_per_task"] for preset in presets] == [1, 4, 1]
+        assert [task["id"] for task in presets[0]["tasks"]] == [
+            "test-python-slugify-workflow",
+            "test-python-summary-workflow",
+        ]
+        assert [task["id"] for task in presets[1]["tasks"]] == [task["id"] for task in tasks]
+        assert [task["id"] for task in presets[2]["tasks"]] == [
+            "sql-formatter-bigquery-pipe-formatting",
+            "task-task-graph-export",
+            "testem-per-launcher-reports",
+            "bandit-incremental-cache-control",
+            "boa-hierarchical-evaluation-cancellation",
+            "koota-composite-trait-aspects",
+        ]
+        assert presets[2]["score_guide"] == "6=S · 5=A · 4=B · 2-3=C · 0-1=D"
+        assert all(
+            task["suite_id"].startswith("TASK-")
+            for preset in presets
+            for task in preset["tasks"]
+            if task["available"]
+        )
 
 def test_bootstrap_uses_provider_model_efforts_and_validates_selection(monkeypatch):
     from app import main
@@ -564,9 +593,11 @@ def test_settings_persist_retry_runtime_limits_and_cost_guards(monkeypatch):
     })
     keys = (
         "max_parallel_tasks",
+        "max_parallel_environment_setups",
         "provider_rpm",
-        "provider_max_concurrency", "provider_max_retries",
+        "provider_max_concurrency", "provider_max_retries", "provider_stream_max_retries",
         "provider_retry_interval_seconds",
+        "codex_stream_idle_timeout_seconds",
         "agent_timeout_seconds", "verifier_timeout_seconds",
         "infrastructure_max_retries", "agent_max_steps",
         "trial_budget_usd", "run_budget_usd",
@@ -575,10 +606,13 @@ def test_settings_persist_retry_runtime_limits_and_cost_guards(monkeypatch):
         original = client.get("/api/settings").json()
         payload = {
             "max_parallel_tasks": 9,
+            "max_parallel_environment_setups": 6,
             "provider_rpm": 30,
             "provider_max_concurrency": 5,
             "provider_max_retries": 4,
+            "provider_stream_max_retries": 3,
             "provider_retry_interval_seconds": 7,
+            "codex_stream_idle_timeout_seconds": 900,
             "agent_timeout_seconds": 7200,
             "verifier_timeout_seconds": 2400,
             "infrastructure_max_retries": 2,

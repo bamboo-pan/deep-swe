@@ -6,7 +6,10 @@ import os
 import shutil
 
 from agent_install_reliability import patch_agent_install_spec
-from global_queue import release_slot, trial_task_name, try_acquire_slot
+from global_queue import (
+    release_environment_setup_slot, release_slot, trial_task_name,
+    try_acquire_environment_setup_slot, try_acquire_slot,
+)
 from infrastructure_retry import write_retry_status
 from local_image_retention import preserve_local_prebuilt_image
 from docker_build_lock import (
@@ -204,6 +207,87 @@ def _install_local_prebuilt_image_retention() -> None:
 
 
 _install_local_prebuilt_image_retention()
+
+
+def _install_environment_setup_limit() -> bool:
+    """Limit Docker environment startup across all Pier run processes."""
+    database_path = os.environ.get("DEEPSWE_GLOBAL_QUEUE_DB")
+    raw_run_id = os.environ.get("DEEPSWE_RUN_ID")
+    if not database_path or not raw_run_id:
+        return False
+    try:
+        run_id = int(raw_run_id)
+        fallback_limit = int(
+            os.environ.get("DEEPSWE_ENVIRONMENT_SETUP_LIMIT", "6")
+        )
+        poll_seconds = float(
+            os.environ.get("DEEPSWE_GLOBAL_QUEUE_POLL_SECONDS", "0.2")
+        )
+    except ValueError as exc:
+        raise RuntimeError("Invalid DeepSWE environment setup limit") from exc
+    if run_id < 1 or fallback_limit < 1 or poll_seconds <= 0:
+        raise RuntimeError("Invalid DeepSWE environment setup limit")
+
+    environment_classes = []
+    for module_name in (
+        "pier.environments.docker.docker",
+        "harbor.environments.docker.docker",
+    ):
+        try:
+            module = __import__(module_name, fromlist=["DockerEnvironment"])
+            environment_class = module.DockerEnvironment
+        except (ImportError, AttributeError):
+            continue
+        if environment_class not in environment_classes:
+            environment_classes.append(environment_class)
+
+    installed = False
+    for environment_class in environment_classes:
+        original_start = environment_class.start
+        if getattr(original_start, "_deepswe_environment_setup_limit", False):
+            installed = True
+            continue
+
+        async def start_with_environment_slot(
+            self,
+            force_build,
+            _original_start=original_start,
+        ):
+            trial_paths = getattr(self, "trial_paths", None)
+            if trial_paths is None:
+                trial_paths = getattr(self, "_trial_paths", None)
+            trial_dir = getattr(trial_paths, "trial_dir", None)
+            if trial_dir is None:
+                return await _original_start(self, force_build)
+            trial_name = trial_dir.name
+            lease_id = None
+            while lease_id is None:
+                lease_id = await asyncio.to_thread(
+                    try_acquire_environment_setup_slot,
+                    database_path,
+                    run_id,
+                    trial_name,
+                    fallback_limit,
+                )
+                if lease_id is None:
+                    await asyncio.sleep(poll_seconds)
+            try:
+                return await _original_start(self, force_build)
+            finally:
+                await asyncio.shield(asyncio.to_thread(
+                    release_environment_setup_slot,
+                    database_path,
+                    run_id,
+                    lease_id,
+                ))
+
+        start_with_environment_slot._deepswe_environment_setup_limit = True
+        environment_class.start = start_with_environment_slot
+        installed = True
+    return installed
+
+
+_ENVIRONMENT_SETUP_PATCH_INSTALLED = _install_environment_setup_limit()
 
 
 def _configured_retry_delays() -> tuple[float, ...]:
@@ -412,6 +496,8 @@ def _install_global_trial_queue() -> None:
 _install_global_trial_queue()
 
 if os.environ.get("DEEPSWE_VERIFY_GLOBAL_QUEUE_PATCH") == "1":
+    if _ENVIRONMENT_SETUP_PATCH_INSTALLED:
+        print("DEEPSWE_ENVIRONMENT_SETUP_PATCH_OK", flush=True)
     print("DEEPSWE_GLOBAL_QUEUE_PATCH_OK", flush=True)
     os._exit(0)
 

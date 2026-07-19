@@ -8,6 +8,7 @@ import {
   Box,
   CheckCircle2,
   CheckSquare2,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   ClipboardList,
@@ -45,6 +46,31 @@ type TaskChoice = {
   official_pass_rate?: number | null;
   official_avg_duration_seconds?: number | null;
 };
+type TaskPreset = {
+  id: string;
+  name: string;
+  description: string;
+  strategy: string;
+  score_guide?: string;
+  attempts_per_task: number;
+  tasks: TaskChoice[];
+};
+type ModelPricing = {
+  input: number;
+  output: number;
+  cache_read?: number;
+  cache_write?: number;
+  source: "models.dev" | "default";
+  unit: string;
+};
+type AgentVersionCatalog = {
+  checked_at?: string | null;
+  agents: Record<string, {
+    latest: string | null;
+    local_versions: string[];
+    error?: string | null;
+  }>;
+};
 type Boot = {
   defaults: {
     agent: string;
@@ -53,6 +79,7 @@ type Boot = {
   };
   agents: string[];
   models: string[];
+  model_pricing: Record<string, ModelPricing>;
   model_efforts: Record<string, string[]>;
   model_efforts_known: Record<string, boolean>;
   model_defaults: Record<string, string>;
@@ -68,9 +95,11 @@ type Boot = {
     jobs_dirs: string[];
   };
   task_suite: { name: string; tasks: TaskChoice[] };
+  task_presets?: TaskPreset[];
 };
 type ProviderPreview = {
   models: string[];
+  model_pricing: Record<string, ModelPricing>;
   model_efforts: Record<string, string[]>;
   model_efforts_known: Record<string, boolean>;
   model_defaults: Record<string, string>;
@@ -98,12 +127,14 @@ type ProviderQueueStatus = {
   active_requests: number;
   waiting_for_concurrency: number;
   max_retries: number;
+  stream_max_retries: number;
   retry_interval_seconds: number;
   actual_requests_last_60_seconds: number;
   completed_requests_last_60_seconds: number;
   failed_requests_last_60_seconds: number;
   failure_rate_last_60_seconds: number | null;
   response_code_counts_last_60_seconds: Record<string, number>;
+  stream_failures_last_60_seconds: number;
 };
 type QueueAdmission = QueueStatus & {
   requested_trials: number;
@@ -145,6 +176,14 @@ type Trial = {
   cached_tokens: number | null;
   output_tokens: number | null;
   reported_cost_usd: number | null;
+  estimated_cost_usd?: number | null;
+  cost_usd?: number | null;
+  cost_source?: "reported" | "estimated" | "mixed" | null;
+  stage_detail?: {
+    phase: string;
+    label: string;
+    message: string;
+  };
   steps: number | null;
   patch: string;
   patch_bytes: number;
@@ -158,6 +197,8 @@ type Trial = {
   provider_request_count?: number;
   provider_retries_used?: number;
   provider_max_retries?: number;
+  provider_stream_retries_used?: number;
+  provider_stream_max_retries?: number;
   infrastructure_retries_used?: number;
   infrastructure_retries_max?: number;
   infrastructure_retries_remaining?: number;
@@ -176,6 +217,12 @@ type Run = {
   reward: number | null;
   reported_cost_usd: number | null;
   estimated_cost_usd: number | null;
+  cost_usd?: number | null;
+  cost_source?: "reported" | "estimated" | "mixed" | null;
+  pricing?: ModelPricing;
+  agent_version_mode?: "latest" | "local";
+  agent_version_requested?: string | null;
+  agent_version_source?: string | null;
   created_at: string;
   tasks: string[];
   attempts_per_task: number;
@@ -192,6 +239,8 @@ type Run = {
     passed: number;
     percent?: number;
   };
+  duration_seconds?: number | null;
+  total_steps?: number | null;
   task_progress?: {
     passed: number;
     total: number;
@@ -202,6 +251,23 @@ type Run = {
   uncached_input_tokens?: number;
   output_tokens?: number;
   error?: string;
+  stage_detail?: {
+    phase: string;
+    label: string;
+    message: string;
+  };
+  preparation?: {
+    phase?: string;
+    label?: string;
+    message?: string;
+    limit?: number;
+    running?: number;
+    queued?: number;
+    available?: number;
+    global_running?: number;
+    counts: Record<string, number>;
+    updated_at?: string | null;
+  };
   provider_alert?: {
     key: string;
     kind: "provider_rate_limit";
@@ -235,11 +301,18 @@ type Prefs = {
   default_agent: string;
   default_model: string;
   default_effort: string;
+  agent_versions: Record<string, {
+    mode: "latest" | "local";
+    version: string | null;
+  }>;
   max_parallel_tasks: number;
+  max_parallel_environment_setups: number;
   provider_rpm: number;
   provider_max_concurrency: number;
   provider_max_retries: number;
+  provider_stream_max_retries: number;
   provider_retry_interval_seconds: number;
+  codex_stream_idle_timeout_seconds: number;
   squid_read_timeout_seconds: number;
   docker_memory_pause_percent: number;
   agent_timeout_seconds: number;
@@ -253,6 +326,23 @@ type Prefs = {
   run_budget_usd: number;
   trial_budget_usd: number;
 };
+const normalizePrefs = (value: Prefs): Prefs => ({
+  ...value,
+  max_parallel_environment_setups:
+    value.max_parallel_environment_setups ?? 6,
+  agent_versions: Object.fromEntries(
+    ["mini-swe-agent", "codex", "claude-code"].map((agent) => [
+      agent,
+      {
+        mode: value.agent_versions?.[agent]?.mode || "latest",
+        version: value.agent_versions?.[agent]?.version || null,
+      },
+    ]),
+  ),
+  provider_stream_max_retries: value.provider_stream_max_retries ?? 3,
+  codex_stream_idle_timeout_seconds:
+    value.codex_stream_idle_timeout_seconds ?? 600,
+});
 type DockerStorage = {
   available: boolean;
   error?: string;
@@ -389,6 +479,28 @@ const streamSse = async (
 };
 const money = (value: number | null | undefined) =>
   value == null ? "—" : `$${value.toFixed(4)}`;
+const unitMoney = (value: number | null | undefined) =>
+  value == null
+    ? "—"
+    : `$${value.toLocaleString(undefined, { maximumFractionDigits: 6 })}`;
+const pricingText = (pricing: ModelPricing | null | undefined) =>
+  pricing
+    ? `输入 ${unitMoney(pricing.input)} · 缓存 ${unitMoney(pricing.cache_read ?? pricing.input)} · 输出 ${unitMoney(pricing.output)} / 1M tokens`
+    : "暂无单价";
+const pricingOption = (
+  model: string,
+  pricing: ModelPricing | null | undefined,
+) => pricing
+  ? `${model} · I ${unitMoney(pricing.input)} / C ${unitMoney(pricing.cache_read ?? pricing.input)} / O ${unitMoney(pricing.output)}`
+  : `${model} · 单价未知`;
+function ModelPricingLine({ pricing }: { pricing?: ModelPricing | null }) {
+  return (
+    <small className="modelpricing" title={pricing?.source === "default" ? "模型未收录，使用默认兜底单价" : "单价来自 models.dev 快照"}>
+      {pricingText(pricing)}
+      {pricing?.source === "default" ? " · 默认价" : ""}
+    </small>
+  );
+}
 const number = (value: number | null | undefined) =>
   value == null ? "—" : value.toLocaleString();
 const percent = (value: number | null | undefined) =>
@@ -396,6 +508,18 @@ const percent = (value: number | null | undefined) =>
 const score = (value: number | null | undefined) =>
   value == null ? "—" : Number.isInteger(value) ? String(value) : value.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
 const statusLabel = (value: string) => value.replaceAll("_", " ").toUpperCase();
+const preparationPhaseLabel = (value: string) => ({
+  creating_build_context: "生成配置",
+  waiting_for_docker: "等待 Docker",
+  building_agent_image: "构建镜像",
+  starting_containers: "启动容器",
+  agent_running: "运行 Agent",
+  preparing_verifier: "准备 Verifier",
+  verifier: "运行 Verifier",
+  finalizing: "整理结果",
+  queued: "排队",
+  retry_wait: "等待重试",
+}[value] || value.replaceAll("_", " "));
 const failureTypeLabels: Record<string, string> = {
   AgentLimitExceeded: "执行步数已用完",
   CostLimitExceeded: "费用额度已用完",
@@ -558,6 +682,7 @@ function App() {
   const [comparison, setComparison] = useState<any>();
   const [tasks, setTasks] = useState<TaskInfo[]>([]);
   const [prefs, setPrefs] = useState<Prefs>();
+  const [agentVersions, setAgentVersions] = useState<AgentVersionCatalog>();
   const [notice, setNotice] = useState("");
   const credentialPreviewSequence = useRef(0);
   const providerAlertKey = useRef("");
@@ -579,7 +704,6 @@ function App() {
   // 自由数字输入以字符串保存，允许中途清空；提交时统一解析校验
   const [attempts, setAttempts] = useState("1");
   const [selectedTasks, setSelectedTasks] = useState<string[]>([]);
-  const [codexStreamIdleTimeout, setCodexStreamIdleTimeout] = useState("600");
   const [verification, setVerification] = useState(true);
   const [tier, setTier] = useState("standard");
   const rememberVoiceProgress = (items: Run[]) =>
@@ -795,8 +919,12 @@ function App() {
     if (tab === "compare") refreshCompareRuns();
     if (tab === "tasks" && !tasks.length)
       request<TaskInfo[]>("/api/tasks").then(setTasks);
-    if (tab === "settings" && !prefs)
-      request<Prefs>("/api/settings").then(setPrefs);
+    if (tab === "settings") {
+      if (!prefs)
+        request<Prefs>("/api/settings").then((value) => setPrefs(normalizePrefs(value)));
+      if (!agentVersions)
+        request<AgentVersionCatalog>("/api/agents/versions").then(setAgentVersions);
+    }
   }, [tab]);
   useEffect(() => {
     if (compareIds.length)
@@ -825,11 +953,8 @@ function App() {
   const start = async () => {
     if (starting) return;
     if (!selectedTasks.length) return setNotice("至少选择一个任务");
-    const codexStreamIdleTimeoutNum = parseInt(codexStreamIdleTimeout, 10);
     if (!Number.isFinite(attemptsNum) || attemptsNum < 1 || attemptsNum > 10)
       return setNotice("每题次数需为 1-10 的整数");
-    if (!Number.isFinite(codexStreamIdleTimeoutNum) || codexStreamIdleTimeoutNum < 30 || codexStreamIdleTimeoutNum > 1800)
-      return setNotice("Codex 流空闲超时需为 30-1800 秒");
     const agents = allAgents ? boot!.agents : [agent];
     const payload = {
       agents,
@@ -837,7 +962,6 @@ function App() {
       reasoning_effort: effort,
       tasks: selectedTasks,
       attempts_per_task: attemptsNum,
-      codex_stream_idle_timeout_seconds: codexStreamIdleTimeoutNum,
       verification,
       service_tier: tier,
     };
@@ -964,6 +1088,7 @@ function App() {
       setBoot({
         ...boot,
         models: preview.models,
+        model_pricing: preview.model_pricing,
         model_efforts: preview.model_efforts,
         model_efforts_known: preview.model_efforts_known,
         model_defaults: preview.model_defaults,
@@ -1003,16 +1128,27 @@ function App() {
   };
   const savePrefs = async () => {
     if (!prefs) return;
+    const invalidLocalAgent = Object.entries(prefs.agent_versions).find(
+      ([, value]) => value.mode === "local" && !value.version,
+    );
+    if (invalidLocalAgent)
+      return setNotice(`${invalidLocalAgent[0]} 选择了本地模式，但未选择版本`);
     if (!Number.isInteger(prefs.max_parallel_tasks) || prefs.max_parallel_tasks < 1 || prefs.max_parallel_tasks > 72)
       return setNotice("最大并行 Task 数需为 1-72 的整数");
+    if (!Number.isInteger(prefs.max_parallel_environment_setups) || prefs.max_parallel_environment_setups < 1 || prefs.max_parallel_environment_setups > 72)
+      return setNotice("最大并行环境准备数需要是 1-72 的整数");
     if (!Number.isInteger(prefs.provider_rpm) || prefs.provider_rpm < 0 || prefs.provider_rpm > 100000)
       return setNotice("Provider RPM 需为 0-100000 的整数，0 表示禁用");
     if (!Number.isInteger(prefs.provider_max_concurrency) || prefs.provider_max_concurrency < 0 || prefs.provider_max_concurrency > 1000)
       return setNotice("Provider 最大活动请求数需为 0-1000 的整数，0 表示禁用");
     if (!Number.isInteger(prefs.provider_max_retries) || prefs.provider_max_retries < 0 || prefs.provider_max_retries > 300)
       return setNotice("Provider 请求重试次数需为 0-300 的整数");
+    if (!Number.isInteger(prefs.provider_stream_max_retries) || prefs.provider_stream_max_retries < 0 || prefs.provider_stream_max_retries > 20)
+      return setNotice("Provider 流中断重试次数需为 0-20 的整数");
     if (!Number.isInteger(prefs.provider_retry_interval_seconds) || prefs.provider_retry_interval_seconds < 0 || prefs.provider_retry_interval_seconds > 3600)
       return setNotice("Provider 重试等待间隔需为 0-3600 秒的整数");
+    if (!Number.isInteger(prefs.codex_stream_idle_timeout_seconds) || prefs.codex_stream_idle_timeout_seconds < 30 || prefs.codex_stream_idle_timeout_seconds > 1800)
+      return setNotice("Codex 下游 SSE 空闲超时需为 30-1800 秒的整数");
     if (!Number.isInteger(prefs.squid_read_timeout_seconds) || prefs.squid_read_timeout_seconds < 900 || prefs.squid_read_timeout_seconds > 7200)
       return setNotice("Squid 长请求超时需为 900-7200 秒的整数");
     if (typeof prefs.docker_memory_pause_percent !== "number" || !Number.isFinite(prefs.docker_memory_pause_percent) || prefs.docker_memory_pause_percent < 0 || prefs.docker_memory_pause_percent > 95)
@@ -1032,7 +1168,7 @@ function App() {
         body: JSON.stringify(prefs),
       });
       const nextBoot = await request<Boot>("/api/bootstrap");
-      setPrefs(saved);
+      setPrefs(normalizePrefs(saved));
       setBoot(nextBoot);
       if (!nextBoot.models.includes(model)) {
         setModel(nextBoot.defaults.model);
@@ -1211,6 +1347,46 @@ function App() {
   };
   if (!boot)
     return <main className="loading">正在连接 DeepSWE Regression Lab…</main>;
+  const taskPresets = boot.task_presets?.length
+    ? boot.task_presets
+    : [{
+        id: "degradation-regression",
+        name: boot.task_suite.name,
+        description: "默认回归任务集",
+        strategy: "跨语言回归",
+        attempts_per_task: 1,
+        tasks: boot.task_suite.tasks,
+      }];
+  const selectedTaskKey = [...selectedTasks].sort().join("|");
+  const activeTaskPreset = taskPresets.find(
+    (preset) =>
+      preset.tasks.length === selectedTasks.length &&
+      preset.tasks.map((task) => task.id).sort().join("|") === selectedTaskKey,
+  );
+  const presetTaskChoices = new Map(
+    taskPresets.flatMap((preset) => preset.tasks.map((task) => [task.id, task] as const)),
+  );
+  const selectedTaskChoices: TaskChoice[] = selectedTasks.map((id) => {
+    const presetTask = presetTaskChoices.get(id);
+    if (presetTask) return presetTask;
+    const catalogTask = tasks.find((task) => task.id === id);
+    return {
+      id,
+      task_number: catalogTask?.task_number,
+      suite_id: catalogTask?.code || "TASK-UNKNOWN",
+      title: catalogTask?.title || id,
+      language: catalogTask?.language,
+      category: catalogTask?.category,
+      available: true,
+      official_pass_rate: catalogTask?.official_pass_rate,
+      official_avg_duration_seconds: catalogTask?.official_avg_duration_seconds,
+    };
+  });
+  const applyTaskPreset = (preset: TaskPreset) => {
+    setSelectedTasks(preset.tasks.map((task) => task.id));
+    setAttempts(String(preset.attempts_per_task));
+    setVerification(true);
+  };
   const nav = [
     ["dashboard", Gauge],
     ["new run", Play],
@@ -1359,9 +1535,10 @@ function App() {
                   onChange={(e) => selectModel(e.target.value)}
                 >
                   {boot.models.map((x) => (
-                    <option key={x}>{x}</option>
+                    <option key={x} value={x}>{pricingOption(x, boot.model_pricing[x])}</option>
                   ))}
                 </select>
+                <ModelPricingLine pricing={boot.model_pricing[model]} />
               </label>
               <label>
                 Reasoning effort
@@ -1392,20 +1569,6 @@ function App() {
                   onChange={(e) => setAttempts(e.target.value)}
                 />
               </label>
-              {(agent === "codex" || allAgents) && (
-                <>
-                  <label>
-                    Codex 流空闲超时（秒）
-                    <input
-                      type="number"
-                      min="30"
-                      max="1800"
-                      value={codexStreamIdleTimeout}
-                      onChange={(e) => setCodexStreamIdleTimeout(e.target.value)}
-                    />
-                  </label>
-                </>
-              )}
             </div>
             <div className="toggles">
               <label>
@@ -1417,28 +1580,56 @@ function App() {
                 启用 Verifier
               </label>
             </div>
+            <div className="taskpresethead">
+              <div>
+                <h3>任务预设</h3>
+                <span>固定测量口径</span>
+              </div>
+              <button className="textbutton" onClick={() => setTab("tasks")}>
+                <FileCode2 />
+                自定义选择
+              </button>
+            </div>
+            <div className="taskpresets">
+              {taskPresets.map((preset) => {
+                const missing = preset.tasks.filter((task) => !task.available).length;
+                return (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    className={activeTaskPreset?.id === preset.id ? "selected" : ""}
+                    disabled={missing > 0}
+                    onClick={() => applyTaskPreset(preset)}
+                  >
+                    <span className="taskpresetcopy">
+                      <b>{preset.name}</b>
+                      <small>{preset.description}</small>
+                    </span>
+                    <span className="taskpresetmeta">
+                      <strong>{preset.tasks.length} 题 × {preset.attempts_per_task} 次</strong>
+                      <small>{missing ? `缺少 ${missing} 题` : preset.strategy}</small>
+                      {preset.score_guide && <em>{preset.score_guide}</em>}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
             <div className="tasktitle">
               <div>
-                <h3>{boot.task_suite.name}</h3>
+                <h3>{activeTaskPreset?.name || "自定义任务"}</h3>
                 <span>{selectedTasks.length} selected</span>
               </div>
               <button disabled={!selectedTasks.length} onClick={() => setSelectedTasks([])}>清空</button>
             </div>
             {!selectedTasks.length && <div className="emptytasklink">未选择任务。<button className="textbutton" onClick={() => setTab("tasks")}>前往任务目录选择</button></div>}
-            <div className="tasks">
-              {boot.task_suite.tasks.map((t) => (
+            {!!selectedTaskChoices.length && <div className="tasks">
+              {selectedTaskChoices.map((t) => (
                 <label key={t.id} className={!t.available ? "disabled" : ""}>
                   <input
                     type="checkbox"
-                    checked={selectedTasks.includes(t.id)}
+                    checked
                     disabled={!t.available}
-                    onChange={(e) =>
-                      setSelectedTasks(
-                        e.target.checked
-                          ? [...selectedTasks, t.id]
-                          : selectedTasks.filter((x) => x !== t.id),
-                      )
-                    }
+                    onChange={() => setSelectedTasks(selectedTasks.filter((id) => id !== t.id))}
                   />
                   <span className="taskidentity">
                     <b>{t.suite_id}</b>
@@ -1454,29 +1645,7 @@ function App() {
                   <i>{t.available ? "READY" : "MISSING"}</i>
                 </label>
               ))}
-              {selectedTasks
-                .filter((id) => !boot.task_suite.tasks.some((t) => t.id === id))
-                .map((id) => {
-                  const task = tasks.find((item) => item.id === id);
-                  return (
-                  <label key={id}>
-                    <input
-                      type="checkbox"
-                      checked
-                      onChange={() =>
-                        setSelectedTasks(selectedTasks.filter((x) => x !== id))
-                      }
-                    />
-                    <span className="taskidentity">
-                      <b>{task?.code || "TASK-UNKNOWN"}</b>
-                      <span>{task?.title || id}</span>
-                      <small>目录：{id}</small>
-                    </span>
-                    <i>{task ? "READY" : "CUSTOM"}</i>
-                  </label>
-                  );
-                })}
-            </div>
+            </div>}
             <button
               className="primary"
               disabled={!selectedTasks.length || starting}
@@ -1546,6 +1715,17 @@ function App() {
             save={savePrefs}
             restore={restore}
             boot={boot}
+            agentVersions={agentVersions}
+            refreshAgentVersions={async () => {
+              setNotice("正在刷新 Agent 最新版本与本地缓存…");
+              try {
+                const value = await request<AgentVersionCatalog>("/api/agents/versions/refresh", { method: "POST" });
+                setAgentVersions(value);
+                setNotice("Agent 版本目录已刷新");
+              } catch (error) {
+                setNotice(`Agent 版本目录刷新失败：${String(error)}`);
+              }
+            }}
             notify={setNotice}
             voiceEnabled={voiceEnabled}
             voiceSupported={voiceProgressSupported}
@@ -1597,7 +1777,11 @@ function Dashboard({
       <section className="metrics">
         {" "}
         <Metric label="最近 Reward" value={latest?.reward ?? "—"} />
-        <Metric label="报告费用" value={money(latest?.reported_cost_usd)} />
+        <Metric
+          label="费用"
+          value={money(latest?.cost_usd)}
+          hint={latest?.cost_source === "estimated" ? "Token 估算" : undefined}
+        />
         <Metric label="Agent" value={latest?.agent || "—"} />
         <Metric label="任务数" value={latest?.tasks?.length ?? "—"} />
         <Metric
@@ -1615,6 +1799,8 @@ function ProviderQueue({ status }: { status?: ProviderQueueStatus }) {
     return <section className="panel providerqueue loading">正在读取 Provider 请求队列…</section>;
   }
   const rpmSaturated = status.enabled && status.available_now === 0;
+  const streamMaxRetries = status.stream_max_retries ?? 0;
+  const streamFailures = status.stream_failures_last_60_seconds ?? 0;
   const concurrencySaturated = status.max_concurrency > 0 && status.active_requests >= status.max_concurrency;
   const state = status.waiting_for_concurrency > 0
     ? `并发已满 · ${status.waiting_for_concurrency} 个请求等待`
@@ -1663,6 +1849,9 @@ function ProviderQueue({ status }: { status?: ProviderQueueStatus }) {
         <span><small>当前可用</small><b>{status.available_now ?? "∞"}</b></span>
         <span><small>下次放行</small><b>{status.next_release_seconds > 0 ? `${Math.ceil(status.next_release_seconds)}s` : "NOW"}</b></span>
         <span><small>失败重试</small><b>{status.max_retries} × {status.retry_interval_seconds}s</b></span>
+        <span title={`成功响应流中断后最多重新发送原请求 ${streamMaxRetries} 次；过去 60 秒检测到 ${streamFailures} 次流失败`}>
+          <small>流中断重试</small><b>{streamMaxRetries} 次</b>
+        </span>
       </div>
       {status.enabled && (
         <div className="providerqueuebar" aria-label={`过去 60 秒已使用 ${status.sent_last_60_seconds}/${status.rpm}`}>
@@ -1725,13 +1914,15 @@ function Live({
             <Status value={detail.status} passed={detail.passed} />
             <h2>{detail.run_code || `RUN-${String(detail.id).padStart(6, "0")}`}</h2>
             <p>
-              {detail.agent} · {detail.model} · {detail.reasoning_effort} ·
+              {detail.agent}{detail.agent_version_requested ? ` ${detail.agent_version_requested}` : ""} · {detail.model} · {detail.reasoning_effort} ·
               创建时全局上限 {detail.concurrency}
             </p>
+            <ModelPricingLine pricing={detail.pricing} />
             <p className="queueusage">
               全局运行 {scheduler?.running ?? 0}/{scheduler?.limit ?? "—"} ·
               全局排队 {scheduler?.queued ?? 0} · 当前 Run 运行 {detail.queue?.running ?? 0} ·
-              当前 Run 排队 {detail.queue?.queued ?? 0}
+              当前 Run 排队 {detail.queue?.queued ?? 0} · 全局环境准备 {detail.preparation?.global_running ?? 0}/{detail.preparation?.limit ?? "—"} ·
+              当前 Run 准备 {detail.preparation?.running ?? 0} · 当前 Run 准备排队 {detail.preparation?.queued ?? 0}
             </p>
             <code className="technicalid">Pier Job：{detail.job_name}</code>
           </div>
@@ -1756,8 +1947,24 @@ function Live({
             {detail.progress?.completed || 0}/{detail.progress?.total || 0}{" "}
             complete
           </b>
-          <span>当前阶段：{detail.stage}</span>
+          <span>当前阶段：{detail.stage_detail?.label || detail.stage}</span>
         </div>
+        {detail.preparation?.message && (
+          <div className="preparationstatus">
+            <span className="preparationpulse" aria-hidden="true" />
+            <div>
+              <b>{detail.preparation.label || "准备运行环境"}</b>
+              <span>{detail.preparation.message}</span>
+            </div>
+            <small className="preparationqueue">
+              并行环境准备 {detail.preparation.global_running ?? 0}/{detail.preparation.limit ?? "—"} · 当前 Run {detail.preparation.running ?? 0} · 排队 {detail.preparation.queued ?? 0}
+              {Object.keys(detail.preparation.counts || {}).length > 0 && " · "}
+              {Object.entries(detail.preparation.counts || {})
+                .map(([phase, count]) => `${preparationPhaseLabel(phase)} ${count}`)
+                .join(" · ")}
+            </small>
+          </div>
+        )}
       </section>
       <section className="trialgrid">
         {detail.trials?.map((t) => (
@@ -1770,6 +1977,12 @@ function Live({
             <small className="identitycode">{t.trial_code}</small>
             <b>{t.task_title || t.task}</b>
             <code>{t.task_slug || t.task}</code>
+            {!terminal.has(t.status) && t.stage_detail?.message && (
+              <span className="trialstage">
+                <b>{t.stage_detail.label}</b>
+                <small>{t.stage_detail.message}</small>
+              </span>
+            )}
             <span className="trialtelemetry">
               <span>
                 <small>响应码</small>
@@ -1786,6 +1999,10 @@ function Live({
               <span title={`实际上游请求 ${t.provider_request_count ?? 0} 次；这里累计 Provider Proxy 执行的请求级重试`}>
                 <small>请求重试</small>
                 <b>{t.provider_retries_used ?? 0} 次</b>
+              </span>
+              <span title="成功响应流会先由 Provider Proxy 完整接收；中断时丢弃半条响应并重新发送原请求">
+                <small>流重试</small>
+                <b>{t.provider_stream_retries_used ?? 0}/{t.provider_stream_max_retries ?? 0}</b>
               </span>
               <span title="Pier 因已识别的基础设施错误重新执行整条 Trial 的次数">
                 <small>基础设施重试</small>
@@ -1971,13 +2188,25 @@ function Results({
               />
               <Metric label="Output" value={number(detail.output_tokens)} />
               <Metric
-                label="估算费用"
-                value={money(detail.estimated_cost_usd)}
+                label="费用"
+                value={money(detail.cost_usd)}
+                hint={
+                  detail.cost_source === "estimated"
+                    ? "原始 trajectory 未报告费用，已按 Token 与单价补算"
+                    : detail.cost_source === "mixed"
+                      ? "报告费用与 Token 估算混合汇总"
+                      : "Agent / Provider 报告费用"
+                }
               />
+              <Metric label="总步数" value={number(detail.total_steps)} />
+              <Metric label="总耗时" value={duration(detail.duration_seconds)} />
             </section>
             <section className="runmeta">
               <span><b>Agent</b>{detail.agent}</span>
-              <span><b>模型</b>{detail.model}</span>
+              <span className="runmodelprice">
+                <b>模型</b>{detail.model}
+                <small>{pricingText(detail.pricing)}</small>
+              </span>
               <span><b>思考强度</b>{detail.reasoning_effort}</span>
               <span><b>创建时全局上限</b>{detail.concurrency}</span>
             </section>
@@ -2097,7 +2326,10 @@ function Results({
                       <span><i>C</i>{number(t.cached_tokens)}</span>
                       <span><i>O</i>{number(t.output_tokens)}</span>
                     </span>
-                    <span>{money(t.reported_cost_usd)}</span>
+                    <span title={t.cost_source === "estimated" ? "原始 trajectory 未报告费用，按 Token 补算" : "Agent / Provider 报告费用"}>
+                      {money(t.cost_usd)}
+                      {t.cost_source === "estimated" ? " *" : ""}
+                    </span>
                     <span>{t.steps ?? "—"}</span>
                   </div>
                 ))}
@@ -2130,7 +2362,11 @@ function TrialDetail({ trial, log }: { trial: Trial; log: string }) {
         <Metric label="Partial" value={score(trial.partial)} />
         <Metric label="Input / Cache" value={`${number(trial.input_tokens)} / ${number(trial.cached_tokens)}`} />
         <Metric label="Output" value={number(trial.output_tokens)} />
-        <Metric label="Cost" value={money(trial.reported_cost_usd)} />
+        <Metric
+          label="Cost"
+          value={money(trial.cost_usd)}
+          hint={trial.cost_source === "estimated" ? "按 Token 补算" : undefined}
+        />
         <Metric label="Patch" value={`${number(trial.patch_bytes)} B`} />
       </div>
       {(trial.failure_type || trial.failure_message) && (
@@ -2487,7 +2723,7 @@ function Compare({
             <b>已选 {selected.length}</b>
             <small className="compareanalysismodel">
               {analysisConfig
-                ? `分析模型 ${analysisConfig.model} · ${analysisConfig.reasoning_effort} · ${analysisConfig.timeout_seconds}s`
+                ? `分析模型 ${analysisConfig.model} · ${pricingText(boot.model_pricing[analysisConfig.model])} · ${analysisConfig.reasoning_effort} · ${analysisConfig.timeout_seconds}s`
                 : "正在读取分析配置"}
             </small>
             <button
@@ -2536,7 +2772,7 @@ function Compare({
         <div className="comparefilters">
           <label>Task<select value={taskFilter} onChange={(e)=>setTaskFilter(e.target.value)}><option value="all">全部任务</option>{taskNames.map(x=><option key={x} value={x}>{x}</option>)}</select></label>
           <label>Agent<select value={agentFilter} onChange={(e)=>setAgentFilter(e.target.value)}><option value="all">全部 Agent</option>{[...new Set(runs.map(x=>x.agent))].map(x=><option key={x}>{x}</option>)}</select></label>
-          <label>模型<select value={modelFilter} onChange={(e)=>setModelFilter(e.target.value)}><option value="all">全部模型</option>{[...new Set(runs.map(x=>x.model))].map(x=><option key={x}>{x}</option>)}</select></label>
+          <label>模型<select value={modelFilter} onChange={(e)=>setModelFilter(e.target.value)}><option value="all">全部模型</option>{[...new Set(runs.map(x=>x.model))].map(x=><option key={x} value={x}>{pricingOption(x, boot.model_pricing[x])}</option>)}</select></label>
           <label>思考强度<select value={effortFilter} onChange={(e)=>setEffortFilter(e.target.value)}><option value="all">全部强度</option>{[...new Set(runs.map(x=>x.reasoning_effort))].map(x=><option key={x}>{x}</option>)}</select></label>
           <label>状态<select value={statusFilter} onChange={(e)=>setStatusFilter(e.target.value)}><option value="all">全部状态</option>{trialStatuses.map(status=><option key={status} value={status}>{statusLabel(status)}</option>)}</select></label>
         </div>
@@ -2620,8 +2856,11 @@ function Compare({
                           setPromptError("");
                         }}
                       >
-                        {analysisModels.map((model) => <option key={model}>{model}</option>)}
+                        {analysisModels.map((model) => (
+                          <option key={model} value={model}>{pricingOption(model, boot.model_pricing[model])}</option>
+                        ))}
                       </select>
+                      <ModelPricingLine pricing={boot.model_pricing[analysisModelDraft]} />
                     </label>
                     <label>
                       思考强度
@@ -2845,7 +3084,7 @@ function Compare({
                       const passTone = comparisonTone(value.pass_rate, baseline?.pass_rate, true);
                       return (
                         <React.Fragment key={run.id}>
-                          <span className="localcell"><b>{run.agent}</b><small>{run.model} · {run.reasoning_effort}</small><em className={`comparisonbadge ${passTone}`}>{comparisonLabel(passTone)}</em></span>
+                          <span className="localcell"><b>{run.agent}</b><small>{run.model} · {run.reasoning_effort}</small><small className="modelpricing compact">{pricingText(run.pricing)}</small><em className={`comparisonbadge ${passTone}`}>{comparisonLabel(passTone)}</em></span>
                           <span className={`localcell comparevalue ${passTone}`}>{percent(value.pass_rate)}</span>
                           <span className={`localcell comparevalue ${comparisonTone(value.duration_seconds, baseline?.avg_duration_seconds, false)}`}>{duration(value.duration_seconds)}</span>
                           <span className="localcell comparetokens">
@@ -3094,6 +3333,8 @@ function Settings({
   save,
   restore,
   boot,
+  agentVersions,
+  refreshAgentVersions,
   notify,
   voiceEnabled,
   voiceSupported,
@@ -3105,6 +3346,8 @@ function Settings({
   save: () => void;
   restore: (f: File) => void;
   boot: Boot;
+  agentVersions?: AgentVersionCatalog;
+  refreshAgentVersions: () => Promise<void>;
   notify: (message: string) => void;
   voiceEnabled: boolean;
   voiceSupported: boolean;
@@ -3121,6 +3364,19 @@ function Settings({
       default_effort: supported.includes(prefs.default_effort)
         ? prefs.default_effort
         : boot.model_defaults[nextModel] || supported[0],
+    });
+  };
+  const updateAgentVersion = (
+    agent: string,
+    next: { mode?: "latest" | "local"; version?: string | null },
+  ) => {
+    const current = prefs.agent_versions[agent] || { mode: "latest", version: null };
+    setPrefs({
+      ...prefs,
+      agent_versions: {
+        ...prefs.agent_versions,
+        [agent]: { ...current, ...next },
+      },
     });
   };
   return (
@@ -3187,6 +3443,22 @@ function Settings({
                 }
               />
             </label>
+            <label title="限制所有 Run 同时执行 Docker build、网络创建和容器启动的环境数量；环境启动完成后立即释放名额，不限制已经运行的 Agent。">
+              最大并行环境准备数
+              <input
+                type="number"
+                min="1"
+                max="72"
+                step="1"
+                value={prefs.max_parallel_environment_setups}
+                onChange={(e) =>
+                  setPrefs({
+                    ...prefs,
+                    max_parallel_environment_setups: +e.target.value,
+                  })
+                }
+              />
+            </label>
             <label title="所有 Agent 模型请求共用滚动 60 秒窗口；窗口未满时立即放行，达到 RPM 后等待最早请求移出窗口。0 表示禁用限速。">
               Provider RPM（0 禁用）
               <input
@@ -3223,6 +3495,19 @@ function Settings({
                 value={prefs.provider_max_retries}
                 onChange={(e) =>
                   setPrefs({ ...prefs, provider_max_retries: +e.target.value })
+                }
+              />
+            </label>
+            <label title="HTTP 成功响应流在终止事件前中断时，丢弃未交给 Agent 的半条响应并重新发送原请求；耗尽后由 Pier 按基础设施策略重启 Trial。三种 Agent 共用。">
+              Provider 流中断重试次数
+              <input
+                type="number"
+                min={0}
+                max={20}
+                step={1}
+                value={prefs.provider_stream_max_retries}
+                onChange={(e) =>
+                  setPrefs({ ...prefs, provider_stream_max_retries: +e.target.value })
                 }
               />
             </label>
@@ -3296,9 +3581,10 @@ function Settings({
                 onChange={(e) => selectDefaultModel(e.target.value)}
               >
                 {boot.models.map((x) => (
-                  <option key={x}>{x}</option>
+                  <option key={x} value={x}>{pricingOption(x, boot.model_pricing[x])}</option>
                 ))}
               </select>
+              <ModelPricingLine pricing={boot.model_pricing[prefs.default_model]} />
             </label>
             <label>
               默认 Effort
@@ -3313,6 +3599,88 @@ function Settings({
                 ))}
               </select>
             </label>
+          </div>
+        </section>
+
+        <section className="settingsgroup agentversionsettings">
+          <div className="settingsgrouphead">
+            <div>
+              <span className="settingsscope newrun">仅后续 Run</span>
+              <h3>Agent 镜像版本</h3>
+            </div>
+            <p>
+              自动模式会在创建 Run 时查询 registry，并把最新版本冻结到本次运行；固定本地版本只允许选择 Docker BuildKit 中已有的精确版本。
+            </p>
+          </div>
+          <div className="agentversiontoolbar">
+            <span>
+              {agentVersions?.checked_at
+                ? `远端版本检查：${new Date(agentVersions.checked_at).toLocaleString()}`
+                : "正在读取 Agent 版本目录…"}
+            </span>
+            <button type="button" className="secondary" onClick={refreshAgentVersions}>
+              <RefreshCw />
+              刷新版本目录
+            </button>
+          </div>
+          <div className="agentversionlist">
+            {boot.agents.map((agentName) => {
+              const catalog = agentVersions?.agents[agentName];
+              const localVersions = catalog?.local_versions || [];
+              const selection = prefs.agent_versions[agentName] || { mode: "latest", version: null };
+              const selectedLocal = selection.version && localVersions.includes(selection.version)
+                ? selection.version
+                : localVersions[0] || "";
+              return (
+                <div className="agentversionrow" key={agentName}>
+                  <div className="agentversionidentity">
+                    <b>{agentName}</b>
+                    <span>最新 {catalog?.latest || "未知"}</span>
+                    <small>本地缓存 {localVersions.length ? localVersions.join("、") : "暂无精确版本"}</small>
+                  </div>
+                  <div className="agentversioncontrols">
+                    <div className="segmented" role="radiogroup" aria-label={`${agentName} 版本策略`}>
+                      <label className={selection.mode === "latest" ? "selected" : ""}>
+                        <input
+                          type="radio"
+                          name={`agent-version-${agentName}`}
+                          checked={selection.mode === "latest"}
+                          onChange={() => updateAgentVersion(agentName, { mode: "latest" })}
+                        />
+                        自动最新
+                      </label>
+                      <label className={selection.mode === "local" ? "selected" : ""}>
+                        <input
+                          type="radio"
+                          name={`agent-version-${agentName}`}
+                          checked={selection.mode === "local"}
+                          disabled={!localVersions.length}
+                          onChange={() => updateAgentVersion(agentName, {
+                            mode: "local",
+                            version: selectedLocal,
+                          })}
+                        />
+                        使用本地
+                      </label>
+                    </div>
+                    <select
+                      value={selectedLocal}
+                      disabled={selection.mode !== "local" || !localVersions.length}
+                      onChange={(event) => updateAgentVersion(agentName, {
+                        mode: "local",
+                        version: event.target.value,
+                      })}
+                      aria-label={`${agentName} 本地版本`}
+                    >
+                      {!localVersions.length && <option value="">无本地版本</option>}
+                      {localVersions.map((version) => (
+                        <option key={version} value={version}>{version}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </section>
 
@@ -3433,8 +3801,37 @@ function Settings({
           </div>
         </section>
 
+        <details className="settingsgroup settingsadvanced">
+          <summary className="settingsadvancedsummary">
+            <div>
+              <span className="settingsscope newrun">仅后续 Run</span>
+              <h3>高级设置</h3>
+              <p>低频客户端兼容参数。展开后修改，保存时与其他运行设置一并生效。</p>
+            </div>
+            <ChevronDown aria-hidden="true" />
+          </summary>
+          <div className="formgrid settingsadvancedbody">
+            <label title="Codex 等待本地 Provider Proxy 下游 SSE 连接的空闲上限。Provider 上游响应流由代理缓冲和重试，此值不再直接衡量上游 Token 输出间隔。">
+              Codex 下游 SSE 空闲超时（秒）
+              <input
+                type="number"
+                min={30}
+                max={1800}
+                step={1}
+                value={prefs.codex_stream_idle_timeout_seconds}
+                onChange={(e) =>
+                  setPrefs({
+                    ...prefs,
+                    codex_stream_idle_timeout_seconds: +e.target.value,
+                  })
+                }
+              />
+            </label>
+          </div>
+        </details>
+
         <div className="settingssavebar">
-          <p>上方三组设置统一在保存后生效。</p>
+          <p>上方设置统一在保存后生效。</p>
           <button className="primary" onClick={save}>
             <Save />
             保存设置

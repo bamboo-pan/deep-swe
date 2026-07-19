@@ -15,6 +15,7 @@ from pathlib import Path
 
 ACTIVE_RUN_STATES = ("queued", "preflight", "running")
 MAX_PARALLEL_TASKS = 72
+DEFAULT_ENVIRONMENT_SETUP_LIMIT = 6
 _MEMORY_CACHE_TTL_SECONDS = 5.0
 _memory_cache_lock = threading.Lock()
 _memory_cache: tuple[float, float | None] = (0.0, None)
@@ -116,6 +117,25 @@ def _connect(database_path: str | Path) -> sqlite3.Connection:
     return connection
 
 
+def _ensure_environment_setup_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS environment_setup_leases (
+            id INTEGER PRIMARY KEY,
+            run_id INTEGER NOT NULL,
+            entry_id INTEGER NOT NULL UNIQUE,
+            trial_name VARCHAR(300) NOT NULL,
+            owner_pid INTEGER NOT NULL,
+            acquired_at DATETIME NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS ix_environment_setup_leases_run_id "
+        "ON environment_setup_leases (run_id)"
+    )
+
+
 def _timestamp() -> str:
     return datetime.now(UTC).isoformat(" ")
 
@@ -123,6 +143,24 @@ def _timestamp() -> str:
 def _global_limit(connection: sqlite3.Connection, fallback_limit: int) -> int:
     row = connection.execute(
         "SELECT value FROM settings WHERE key = 'max_parallel_tasks'"
+    ).fetchone()
+    if row is not None:
+        try:
+            value = json.loads(row["value"])
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return min(value, MAX_PARALLEL_TASKS)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return min(max(int(fallback_limit), 1), MAX_PARALLEL_TASKS)
+
+
+def _environment_setup_limit(
+    connection: sqlite3.Connection,
+    fallback_limit: int,
+) -> int:
+    row = connection.execute(
+        "SELECT value FROM settings "
+        "WHERE key = 'max_parallel_environment_setups'"
     ).fetchone()
     if row is not None:
         try:
@@ -292,7 +330,12 @@ def release_slot(database_path: str | Path, run_id: int, entry_id: int) -> None:
     for attempt in range(20):
         connection = _connect(database_path)
         try:
+            _ensure_environment_setup_table(connection)
             connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM environment_setup_leases WHERE entry_id = ?",
+                (entry_id,),
+            )
             connection.execute(
                 "DELETE FROM trial_queue_entries WHERE id = ? AND run_id = ?",
                 (entry_id, run_id),
@@ -331,6 +374,112 @@ def release_slot(database_path: str | Path, run_id: int, entry_id: int) -> None:
             connection.rollback()
             if attempt == 19 or (
                 "locked" not in str(exc).lower() and "busy" not in str(exc).lower()
+            ):
+                raise
+            time.sleep(0.05)
+        finally:
+            connection.close()
+
+
+def try_acquire_environment_setup_slot(
+    database_path: str | Path,
+    run_id: int,
+    trial_name: str,
+    fallback_limit: int = DEFAULT_ENVIRONMENT_SETUP_LIMIT,
+) -> int | None:
+    """Acquire a cross-process slot for one Docker environment startup."""
+    connection = _connect(database_path)
+    try:
+        _ensure_environment_setup_table(connection)
+        connection.execute("BEGIN IMMEDIATE")
+        _active_run_status(connection, run_id)
+        connection.execute(
+            """
+            DELETE FROM environment_setup_leases
+            WHERE NOT EXISTS (
+                SELECT 1 FROM trial_queue_entries AS queue
+                WHERE queue.id = environment_setup_leases.entry_id
+                  AND queue.run_id = environment_setup_leases.run_id
+                  AND queue.state = 'running'
+            )
+            """
+        )
+        entry = connection.execute(
+            """
+            SELECT id FROM trial_queue_entries
+            WHERE run_id = ? AND trial_name = ? AND state = 'running'
+            ORDER BY id
+            LIMIT 1
+            """,
+            (run_id, trial_name),
+        ).fetchone()
+        if entry is None:
+            connection.rollback()
+            raise GlobalQueueCancelled(
+                f"Trial {trial_name} no longer owns a global execution slot"
+            )
+        entry_id = int(entry["id"])
+        existing = connection.execute(
+            "SELECT id FROM environment_setup_leases WHERE entry_id = ?",
+            (entry_id,),
+        ).fetchone()
+        if existing is not None:
+            connection.commit()
+            return int(existing["id"])
+
+        limit = _environment_setup_limit(connection, fallback_limit)
+        active = int(connection.execute(
+            "SELECT COUNT(*) FROM environment_setup_leases"
+        ).fetchone()[0])
+        if active >= limit:
+            connection.commit()
+            return None
+        cursor = connection.execute(
+            """
+            INSERT INTO environment_setup_leases
+                (run_id, entry_id, trial_name, owner_pid, acquired_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (run_id, entry_id, trial_name, os.getpid(), _timestamp()),
+        )
+        connection.commit()
+        return int(cursor.lastrowid)
+    except sqlite3.OperationalError as exc:
+        connection.rollback()
+        if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+            return None
+        raise
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def release_environment_setup_slot(
+    database_path: str | Path,
+    run_id: int,
+    lease_id: int,
+) -> None:
+    for attempt in range(20):
+        connection = _connect(database_path)
+        try:
+            _ensure_environment_setup_table(connection)
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                DELETE FROM environment_setup_leases
+                WHERE id = ? AND run_id = ?
+                """,
+                (lease_id, run_id),
+            )
+            connection.commit()
+            return
+        except sqlite3.OperationalError as exc:
+            connection.rollback()
+            if attempt == 19 or (
+                "locked" not in str(exc).lower()
+                and "busy" not in str(exc).lower()
             ):
                 raise
             time.sleep(0.05)

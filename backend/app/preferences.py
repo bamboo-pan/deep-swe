@@ -8,7 +8,7 @@ from .schemas import MAX_PARALLEL_AGENT_COUNT, MAX_PARALLEL_TASKS, SettingsUpdat
 from .security import read_credential
 
 CURRENT_KEYS = (
-    "credential_file", "jobs_dir", "default_agent", "default_model", "default_effort", "max_parallel_tasks", "provider_rpm", "provider_max_concurrency", "provider_max_retries", "provider_retry_interval_seconds", "squid_read_timeout_seconds", "docker_memory_pause_percent",
+    "credential_file", "jobs_dir", "default_agent", "default_model", "default_effort", "agent_versions", "max_parallel_tasks", "max_parallel_environment_setups", "provider_rpm", "provider_max_concurrency", "provider_max_retries", "provider_stream_max_retries", "provider_retry_interval_seconds", "codex_stream_idle_timeout_seconds", "squid_read_timeout_seconds", "docker_memory_pause_percent",
     "agent_timeout_seconds", "verifier_timeout_seconds", "infrastructure_max_retries", "agent_max_steps",
     "docker_cleanup_after_run", "docker_cleanup_on_delete", "docker_cache_retention_hours", "docker_cache_warning_gb",
     "run_budget_usd", "trial_budget_usd",
@@ -29,11 +29,18 @@ def _defaults() -> dict:
         "default_agent": settings.default_agent,
         "default_model": settings.default_model,
         "default_effort": settings.default_effort,
+        "agent_versions": {
+            agent: {"mode": "latest", "version": None}
+            for agent in ("mini-swe-agent", "codex", "claude-code")
+        },
         "max_parallel_tasks": settings.max_parallel_tasks,
+        "max_parallel_environment_setups": settings.max_parallel_environment_setups,
         "provider_rpm": settings.provider_rpm,
         "provider_max_concurrency": settings.provider_max_concurrency,
         "provider_max_retries": settings.provider_max_retries,
+        "provider_stream_max_retries": settings.provider_stream_max_retries,
         "provider_retry_interval_seconds": settings.provider_retry_interval_seconds,
+        "codex_stream_idle_timeout_seconds": settings.codex_stream_idle_timeout_seconds,
         "squid_read_timeout_seconds": settings.squid_read_timeout_seconds,
         "docker_memory_pause_percent": settings.docker_memory_pause_percent,
         "agent_timeout_seconds": settings.agent_timeout_seconds,
@@ -70,6 +77,25 @@ def get_preferences() -> dict:
             )
     values["credential_file"] = str(values["credential_file"])
     values["jobs_dir"] = str(values["jobs_dir"])
+    configured_versions = values.get("agent_versions")
+    if not isinstance(configured_versions, dict):
+        configured_versions = {}
+    values["agent_versions"] = {
+        agent: {
+            "mode": (
+                configured_versions.get(agent, {}).get("mode")
+                if isinstance(configured_versions.get(agent), dict)
+                and configured_versions[agent].get("mode") in {"latest", "local"}
+                else "latest"
+            ),
+            "version": (
+                configured_versions.get(agent, {}).get("version")
+                if isinstance(configured_versions.get(agent), dict)
+                else None
+            ),
+        }
+        for agent in ("mini-swe-agent", "codex", "claude-code")
+    }
     return values
 
 def update_preferences(payload: SettingsUpdate) -> dict:
